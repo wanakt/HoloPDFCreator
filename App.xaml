@@ -1,0 +1,194 @@
+<Application x:Class="HoloPDFCreator.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <SolidColorBrush x:Key="BgMain"      Color="#1E1E2E"/>
+            <SolidColorBrush x:Key="BgSide"      Color="#181825"/>
+            <SolidColorBrush x:Key="BgSurface"   Color="#313244"/>
+            <SolidColorBrush x:Key="BgSurface2"  Color="#45475A"/>
+            <SolidColorBrush x:Key="AccentBlue"  Color="#89B4FA"/>
+            <SolidColorBrush x:Key="AccentGreen" Color="#A6E3A1"/>
+            <SolidColorBrush x:Key="TextPrimary"  Color="#CDD6F4"/>
+            <SolidColorBrush x:Key="TextSecondary" Color="#A6ADC8"/>
+            <SolidColorBrush x:Key="DangerRed"   Color="#F38BA8"/>
+
+            <Style x:Key="PrimaryButton" TargetType="Button">
+                <Setter Property="Background"   Value="#89B4FA"/>
+                <Setter Property="Foreground"   Value="#1E1E2E"/>
+                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="Padding"      Value="14,7"/>
+                <Setter Property="FontSize"     Value="13"/>
+                <Setter Property="FontWeight"   Value="SemiBold"/>
+                <Setter Property="Cursor"       Value="Hand"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border Background="{TemplateBinding Background}"
+                                    CornerRadius="6"
+                                    Padding="{TemplateBinding Padding}">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#74C7EC"/>
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter Property="Background" Value="#89DCEB"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Background" Value="#45475A"/>
+                                    <Setter Property="Foreground" Value="#585B70"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <Style x:Key="SecondaryButton" TargetType="Button">
+                <Setter Property="Background"      Value="#313244"/>
+                <Setter Property="Foreground"      Value="#CDD6F4"/>
+                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="Padding"         Value="14,7"/>
+                <Setter Property="FontSize"        Value="13"/>
+                <Setter Property="Cursor"          Value="Hand"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border Background="{TemplateBinding Background}"
+                                    CornerRadius="6"
+                                    Padding="{TemplateBinding Padding}">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#45475A"/>
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter Property="Background" Value="#585B70"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Background" Value="#313244"/>
+                                    <Setter Property="Foreground" Value="#585B70"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <Style x:Key="NavButton" TargetType="Button">
+                <Setter Property="Background"            Value="Transparent"/>
+                <Setter Property="Foreground"            Value="#A6ADC8"/>
+                <Setter Property="BorderThickness"       Value="0"/>
+                <Setter Property="Padding"               Value="16,12"/>
+                <Setter Property="FontSize"              Value="14"/>
+                <Setter Property="Cursor"                Value="Hand"/>
+                <Setter Property="HorizontalContentAlignment" Value="Left"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="Bd"
+                                    Background="{TemplateBinding Background}"
+                                    CornerRadius="8"
+                                    Padding="{TemplateBinding Padding}"
+                                    Margin="8,2">
+                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                  VerticalAlignment="Center"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#2A2A3E"/>
+                                    <Setter Property="Foreground" Value="#CDD6F4"/>
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter Property="Background" Value="#313244"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <Style x:Key="NavButtonActive" TargetType="Button" BasedOn="{StaticResource NavButton}">
+                <Setter Property="Background" Value="#2A2A3E"/>
+                <Setter Property="Foreground" Value="#89B4FA"/>
+            </Style>
+
+            <Style TargetType="TextBox">
+                <Setter Property="Background"   Value="#313244"/>
+                <Setter Property="Foreground"   Value="#CDD6F4"/>
+                <Setter Property="BorderBrush"  Value="#45475A"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="Padding"      Value="8,6"/>
+                <Setter Property="FontSize"     Value="13"/>
+                <Setter Property="CaretBrush"   Value="#89B4FA"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="TextBox">
+                            <Border Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="6"
+                                    Padding="{TemplateBinding Padding}">
+                                <ScrollViewer x:Name="PART_ContentHost"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsFocused" Value="True">
+                                    <Setter Property="BorderBrush" Value="#89B4FA"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <Style TargetType="Slider">
+                <Setter Property="Foreground" Value="#89B4FA"/>
+            </Style>
+
+            <Style TargetType="Button">
+                <Setter Property="Background"      Value="Transparent"/>
+                <Setter Property="BorderBrush"     Value="Transparent"/>
+                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="Cursor"          Value="Hand"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="4"
+                                    Padding="{TemplateBinding Padding}">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#2A2A3E"/>
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter Property="Background" Value="#313244"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.35"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <Style TargetType="Label">
+                <Setter Property="Foreground" Value="#A6ADC8"/>
+                <Setter Property="FontSize"   Value="12"/>
+            </Style>
+
+            <Style TargetType="ScrollBar">
+                <Setter Property="Background" Value="#181825"/>
+                <Setter Property="Width"      Value="8"/>
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

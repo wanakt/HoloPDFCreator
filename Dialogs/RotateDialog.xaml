@@ -1,0 +1,123 @@
+<Window x:Class="HoloPDFCreator.Dialogs.RotateDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="페이지 회전"
+        Width="400" Height="460"
+        Background="#1E1E2E"
+        Foreground="#CDD6F4"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False">
+
+    <Window.Resources>
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+            <Setter Property="FontSize"   Value="13"/>
+        </Style>
+        <Style TargetType="RadioButton">
+            <Setter Property="Foreground"              Value="#CDD6F4"/>
+            <Setter Property="FontSize"                Value="13"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="Cursor"                  Value="Hand"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="24,20,24,20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>  <!-- Angle -->
+            <RowDefinition Height="20"/>
+            <RowDefinition Height="1"/>     <!-- Separator -->
+            <RowDefinition Height="16"/>
+            <RowDefinition Height="Auto"/>  <!-- Scope label -->
+            <RowDefinition Height="10"/>
+            <RowDefinition Height="*"/>     <!-- Scope radio buttons -->
+            <RowDefinition Height="16"/>
+            <RowDefinition Height="Auto"/>  <!-- Action buttons -->
+        </Grid.RowDefinitions>
+
+        <!-- ── Angle selection ── -->
+        <StackPanel Grid.Row="0">
+            <TextBlock Text="회전 방향" Foreground="#A6ADC8" FontSize="12" Margin="0,0,0,12"/>
+            <RadioButton x:Name="Rb90CW" GroupName="Angle" IsChecked="True" Margin="0,0,0,10">
+                <TextBlock Text="↻  90°  (시계 방향)"/>
+            </RadioButton>
+            <RadioButton x:Name="Rb90CCW" GroupName="Angle" Margin="0,0,0,10">
+                <TextBlock Text="↺  90°  (반시계 방향)"/>
+            </RadioButton>
+            <RadioButton x:Name="Rb180" GroupName="Angle">
+                <TextBlock Text="↻  180°"/>
+            </RadioButton>
+        </StackPanel>
+
+        <!-- ── Separator ── -->
+        <Border Grid.Row="2" Background="#313244"/>
+
+        <!-- ── Scope header ── -->
+        <TextBlock Grid.Row="4" Text="적용 범위" Foreground="#A6ADC8" FontSize="12"/>
+
+        <!-- ── Scope radio buttons ── -->
+        <StackPanel Grid.Row="6" VerticalAlignment="Top">
+
+            <RadioButton x:Name="RbCurrent" GroupName="Scope" IsChecked="True" Margin="0,0,0,10">
+                <TextBlock x:Name="RbCurrentLabel" Text="현재 페이지"/>
+            </RadioButton>
+
+            <RadioButton x:Name="RbAll" GroupName="Scope" Margin="0,0,0,10">
+                <TextBlock Text="모든 페이지"/>
+            </RadioButton>
+
+            <RadioButton x:Name="RbRange" GroupName="Scope" Margin="0,0,0,6"
+                         Checked="RbRange_Checked" Unchecked="RbRange_Unchecked">
+                <TextBlock Text="페이지 범위"/>
+            </RadioButton>
+
+            <!-- Range input row -->
+            <Grid x:Name="RangePanel" IsEnabled="False" Margin="22,0,0,10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="64"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="64"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="p." Foreground="#A6ADC8" FontSize="12"
+                           VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBox   x:Name="RangeFrom" Grid.Column="1" Text="1"
+                           VerticalContentAlignment="Center"
+                           IsEnabled="{Binding IsEnabled, ElementName=RangePanel}"
+                           PreviewTextInput="RangeBox_PreviewTextInput"/>
+                <TextBlock Grid.Column="2" Text=" – " Foreground="#A6ADC8"
+                           VerticalAlignment="Center" Margin="6,0"/>
+                <TextBox   x:Name="RangeTo" Grid.Column="3" Text="1"
+                           VerticalContentAlignment="Center"
+                           IsEnabled="{Binding IsEnabled, ElementName=RangePanel}"
+                           PreviewTextInput="RangeBox_PreviewTextInput"/>
+                <TextBlock x:Name="TotalHint" Grid.Column="4" Foreground="#585B70"
+                           FontSize="11" VerticalAlignment="Center" Margin="6,0,0,0"/>
+            </Grid>
+
+            <RadioButton x:Name="RbEven" GroupName="Scope" Margin="0,0,0,10">
+                <TextBlock Text="짝수 페이지  (2, 4, 6 …)"/>
+            </RadioButton>
+
+            <RadioButton x:Name="RbOdd" GroupName="Scope">
+                <TextBlock Text="홀수 페이지  (1, 3, 5 …)"/>
+            </RadioButton>
+
+        </StackPanel>
+
+        <!-- ── Action buttons ── -->
+        <Grid Grid.Row="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <Button Grid.Column="1" Content="취소" MinWidth="84"
+                    Style="{StaticResource SecondaryButton}" Click="Cancel_Click"/>
+            <Button Grid.Column="3" Content="적용" MinWidth="84"
+                    Style="{StaticResource PrimaryButton}"  Click="Apply_Click"/>
+        </Grid>
+    </Grid>
+</Window>

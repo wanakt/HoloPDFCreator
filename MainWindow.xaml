@@ -1,0 +1,116 @@
+<Window x:Class="HoloPDFCreator.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="HoloPDF Creator"
+        Height="780" Width="1280"
+        MinHeight="600" MinWidth="900"
+        WindowStartupLocation="CenterScreen"
+        Background="#1E1E2E">
+
+    <Window.Resources>
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="220"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Sidebar -->
+        <Border Grid.Column="0"
+                Background="#181825"
+                BorderBrush="#313244"
+                BorderThickness="0,0,1,0">
+            <DockPanel>
+
+                <!-- App Title -->
+                <StackPanel DockPanel.Dock="Top" Margin="16,24,16,16">
+                    <TextBlock Text="HoloPDF"
+                               FontSize="22" FontWeight="Bold"
+                               Foreground="#89B4FA"/>
+                    <TextBlock Text="Creator"
+                               FontSize="22" FontWeight="Bold"
+                               Foreground="#CDD6F4"/>
+                    <Rectangle Height="1" Fill="#313244" Margin="0,16,0,0"/>
+                </StackPanel>
+
+                <!-- NAVIGATION label -->
+                <TextBlock DockPanel.Dock="Top"
+                           Text="NAVIGATION"
+                           FontSize="10" FontWeight="SemiBold"
+                           Foreground="#585B70"
+                           Margin="24,0,16,8"/>
+
+                <!-- Nav Buttons -->
+                <StackPanel DockPanel.Dock="Top">
+                    <Button x:Name="BtnNavPdfReader"
+                            Style="{StaticResource NavButtonActive}"
+                            Click="BtnNavPdfReader_Click">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#x1F4C4;" FontSize="16" Margin="0,0,10,0"/>
+                            <TextBlock Text="PDF Reader" FontSize="14"/>
+                        </StackPanel>
+                    </Button>
+
+                    <Button x:Name="BtnNavImageAdjuster"
+                            Style="{StaticResource NavButton}"
+                            Click="BtnNavImageAdjuster_Click">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#x1F5BC;" FontSize="16" Margin="0,0,10,0"/>
+                            <TextBlock Text="Image Adjuster" FontSize="14"/>
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+
+                <!-- Bookmark section header -->
+                <Rectangle DockPanel.Dock="Top"
+                           Height="1" Fill="#313244"
+                           Margin="16,12,16,0"/>
+                <DockPanel DockPanel.Dock="Top" Margin="16,8,8,4">
+                    <TextBlock Text="BOOKMARKS"
+                               FontSize="10" FontWeight="SemiBold"
+                               Foreground="#585B70"
+                               VerticalAlignment="Center"
+                               Margin="8,0,0,0"/>
+                    <Button x:Name="BtnClearBookmarks"
+                            DockPanel.Dock="Right"
+                            Content="Clear all"
+                            FontSize="10"
+                            Padding="6,2"
+                            Background="Transparent"
+                            BorderBrush="Transparent"
+                            Foreground="#45475A"
+                            Cursor="Hand"
+                            HorizontalAlignment="Right"
+                            Click="BtnClearBookmarks_Click"
+                            ToolTip="Remove all bookmarks"/>
+                </DockPanel>
+
+                <!-- Version at bottom -->
+                <TextBlock DockPanel.Dock="Bottom"
+                           Text="v1.0.0"
+                           FontSize="11"
+                           Foreground="#45475A"
+                           HorizontalAlignment="Center"
+                           Margin="0,8,0,16"/>
+
+                <!-- Bookmark list – fills remaining space -->
+                <ScrollViewer x:Name="BookmarkScrollViewer"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel x:Name="BookmarkListPanel" Margin="8,0,8,8"/>
+                </ScrollViewer>
+
+            </DockPanel>
+        </Border>
+
+        <!-- Content Frame -->
+        <Frame x:Name="ContentFrame"
+               Grid.Column="1"
+               NavigationUIVisibility="Hidden"
+               Background="#1E1E2E"/>
+    </Grid>
+</Window>

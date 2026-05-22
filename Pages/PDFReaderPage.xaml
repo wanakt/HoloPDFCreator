@@ -1,0 +1,327 @@
+<Page x:Class="HoloPDFCreator.Pages.PDFReaderPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Background="#1E1E2E"
+      Title="PDF Reader"
+      PreviewKeyDown="Page_PreviewKeyDown">
+
+    <Page.Resources>
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+        </Style>
+        <Style TargetType="Separator">
+            <Setter Property="Background" Value="#45475A"/>
+            <Setter Property="Margin"     Value="4,0"/>
+            <Setter Property="Width"      Value="1"/>
+        </Style>
+        <Style TargetType="ContextMenu">
+            <Setter Property="Background"   Value="#2A2A3E"/>
+            <Setter Property="BorderBrush"  Value="#45475A"/>
+            <Setter Property="BorderThickness" Value="1"/>
+        </Style>
+        <Style TargetType="MenuItem">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+        </Style>
+    </Page.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- ══════════════ TOOLBAR ══════════════ -->
+        <Border Grid.Row="0"
+                Background="#181825"
+                BorderBrush="#313244"
+                BorderThickness="0,0,0,1"
+                Padding="12,8">
+            <WrapPanel Orientation="Horizontal" VerticalAlignment="Center">
+
+                <!-- File Operations -->
+                <Button Content="Open PDF"
+                        Style="{StaticResource PrimaryButton}"
+                        Click="OpenPdf_Click"
+                        Margin="0,0,6,0"/>
+
+                <Button Content="New PDF"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="NewPdf_Click"
+                        Margin="0,0,6,0"/>
+
+                <Button x:Name="BtnSave"
+                        Content="Save"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="SavePdf_Click"
+                        IsEnabled="False"
+                        Margin="0,0,12,0"/>
+
+                <Separator/>
+
+                <!-- Page Navigation -->
+                <Button Content="&#x25C4;"
+                        x:Name="BtnPrev"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="PrevPage_Click"
+                        IsEnabled="False"
+                        Margin="6,0,4,0"
+                        Padding="10,7"/>
+
+                <Border Background="#313244" CornerRadius="6" Padding="12,6" Margin="2,0">
+                    <TextBlock x:Name="TxtPageInfo"
+                               Text="No document"
+                               FontSize="13"
+                               VerticalAlignment="Center"/>
+                </Border>
+
+                <Button Content="&#x25BA;"
+                        x:Name="BtnNext"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="NextPage_Click"
+                        IsEnabled="False"
+                        Margin="4,0,12,0"
+                        Padding="10,7"/>
+
+                <Separator/>
+
+                <!-- Zoom -->
+                <Button Content="&#x2212;"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="ZoomOut_Click"
+                        Margin="6,0,4,0"
+                        Padding="10,7"/>
+
+                <Border Background="#313244" CornerRadius="6" Padding="10,6" Margin="2,0">
+                    <TextBlock x:Name="TxtZoom"
+                               Text="100%"
+                               FontSize="13"
+                               VerticalAlignment="Center"/>
+                </Border>
+
+                <Button Content="&#x2B;"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="ZoomIn_Click"
+                        Margin="4,0,4,0"
+                        Padding="10,7"/>
+
+                <Button Content="Fit"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="ZoomFit_Click"
+                        Margin="4,0,0,0"/>
+
+                <Separator/>
+
+                <!-- Memos Toggle -->
+                <Button x:Name="BtnToggleMemos"
+                        Content="Memos"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="ToggleMemos_Click"
+                        Margin="6,0,0,0"/>
+
+                <Separator/>
+
+                <!-- Drawing Tools -->
+                <Button x:Name="BtnDrawLine"
+                        Content="Line"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="DrawTool_Click" Tag="Line"
+                        Margin="6,0,4,0"/>
+                <Button x:Name="BtnDrawBox"
+                        Content="Box"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="DrawTool_Click" Tag="Box"
+                        Margin="0,0,4,0"/>
+                <Button x:Name="BtnDrawCircle"
+                        Content="Circle"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="DrawTool_Click" Tag="Circle"
+                        Margin="0,0,0,0"/>
+
+                <Separator/>
+
+                <!-- Rotate -->
+                <Button x:Name="BtnRotate"
+                        Content="Rotate"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="RotatePage_Click"
+                        IsEnabled="False"
+                        Margin="6,0,0,0"/>
+
+                <!-- Status -->
+                <Border Background="#313244" CornerRadius="6" Padding="12,6" Margin="16,0,0,0">
+                    <TextBlock x:Name="TxtStatus"
+                               Text="Ready"
+                               FontSize="12"
+                               Foreground="#A6ADC8"
+                               VerticalAlignment="Center"/>
+                </Border>
+            </WrapPanel>
+        </Border>
+
+        <!-- ══════════════ MAIN CONTENT ══════════════ -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition x:Name="MemoPanelCol" Width="0"/>
+            </Grid.ColumnDefinitions>
+
+            <Grid Grid.Column="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <ScrollViewer x:Name="PdfScrollViewer"
+                              Grid.Column="0"
+                              Background="#1E1E2E"
+                              HorizontalScrollBarVisibility="Auto"
+                              VerticalScrollBarVisibility="Hidden"
+                              Padding="20"
+                              PreviewMouseWheel="PdfScrollViewer_PreviewMouseWheel"
+                              ScrollChanged="PdfScrollViewer_ScrollChanged">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Top">
+
+                    <!-- Drop zone -->
+                    <Border x:Name="DropZone"
+                            Width="600" Height="400"
+                            Background="#181825"
+                            BorderBrush="#313244"
+                            BorderThickness="2"
+                            CornerRadius="16"
+                            AllowDrop="True"
+                            Drop="DropZone_Drop">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                            <TextBlock Text="&#x1F4C4;"
+                                       FontSize="64"
+                                       HorizontalAlignment="Center"
+                                       Margin="0,0,0,16"/>
+                            <TextBlock Text="Drop a PDF here or click Open"
+                                       FontSize="18"
+                                       Foreground="#585B70"
+                                       HorizontalAlignment="Center"/>
+                            <TextBlock Text="Supports .pdf files"
+                                       FontSize="13"
+                                       Foreground="#45475A"
+                                       HorizontalAlignment="Center"
+                                       Margin="0,8,0,0"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Previous page previews (dynamic count fills viewport) -->
+                    <StackPanel x:Name="PrevPagesPanel"/>
+
+                    <!-- PDF Page Display -->
+                    <Border x:Name="PdfPageBorder"
+                            Visibility="Collapsed"
+                            Background="White">
+                        <Grid>
+                            <Image x:Name="PdfPageImage"
+                                   Stretch="None"
+                                   RenderOptions.BitmapScalingMode="HighQuality"/>
+
+                            <Canvas x:Name="AnnotationCanvas"
+                                    IsHitTestVisible="False"
+                                    Background="Transparent"/>
+
+                            <Canvas x:Name="MemoCanvas"
+                                    IsHitTestVisible="False"
+                                    Background="Transparent"/>
+
+                            <Canvas x:Name="DrawingCanvas"
+                                    Background="Transparent"
+                                    IsHitTestVisible="False"/>
+
+                            <Canvas x:Name="TextOverlayCanvas"
+                                    Background="Transparent"
+                                    Cursor="Arrow"
+                                    Focusable="True"
+                                    KeyDown="TextOverlayCanvas_KeyDown"
+                                    MouseLeftButtonDown="TextOverlayCanvas_MouseDown"
+                                    MouseMove="TextOverlayCanvas_MouseMove"
+                                    MouseLeftButtonUp="TextOverlayCanvas_MouseUp"
+                                    MouseLeave="TextOverlayCanvas_MouseLeave"
+                                    ContextMenuOpening="TextOverlayCanvas_ContextMenuOpening">
+                                <Canvas.ContextMenu>
+                                    <ContextMenu/>
+                                </Canvas.ContextMenu>
+                            </Canvas>
+                        </Grid>
+                    </Border>
+
+                    <!-- Next page previews (dynamic count fills viewport) -->
+                    <StackPanel x:Name="NextPagesPanel"/>
+
+                </StackPanel>
+                </ScrollViewer>
+
+                <ScrollBar x:Name="GlobalScrollBar"
+                           Grid.Column="1"
+                           Orientation="Vertical"
+                           Minimum="0"
+                           Maximum="1"
+                           Value="0"
+                           ViewportSize="1"
+                           IsEnabled="False"
+                           Scroll="GlobalScrollBar_Scroll"/>
+            </Grid>
+
+            <!-- ══════════════ MEMO PANEL ══════════════ -->
+            <Border Grid.Column="1"
+                    Background="#181825"
+                    BorderBrush="#313244"
+                    BorderThickness="1,0,0,0"
+                    ClipToBounds="True">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Header + Search -->
+                    <Border Grid.Row="0"
+                            Padding="10,8"
+                            Background="#1E1E2E"
+                            BorderBrush="#313244"
+                            BorderThickness="0,0,0,1">
+                        <StackPanel>
+                            <TextBlock Text="Memos"
+                                       FontSize="13"
+                                       FontWeight="SemiBold"
+                                       Foreground="#CDD6F4"
+                                       Margin="0,0,0,6"/>
+                            <Grid>
+                                <TextBox x:Name="MemoSearchBox"
+                                         TextChanged="MemoSearch_TextChanged"/>
+                                <TextBlock Text="Search…"
+                                           IsHitTestVisible="False"
+                                           Foreground="#585B70"
+                                           FontSize="13"
+                                           Margin="10,0,0,0"
+                                           VerticalAlignment="Center">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding Text, ElementName=MemoSearchBox}" Value="">
+                                                    <Setter Property="Visibility" Value="Visible"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Memo List -->
+                    <ScrollViewer Grid.Row="1"
+                                  VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel x:Name="MemoListPanel" Background="Transparent"/>
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+</Page>
