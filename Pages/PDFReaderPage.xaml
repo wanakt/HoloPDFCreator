@@ -39,23 +39,38 @@
                 Padding="12,8">
             <WrapPanel Orientation="Horizontal" VerticalAlignment="Center">
 
-                <!-- File Operations -->
-                <Button Content="Open PDF"
-                        Style="{StaticResource PrimaryButton}"
-                        Click="OpenPdf_Click"
-                        Margin="0,0,6,0"/>
-
-                <Button Content="New PDF"
+                <!-- File Button + ContextMenu -->
+                <Button x:Name="BtnFile"
+                        Content="📁 File ▾"
                         Style="{StaticResource SecondaryButton}"
-                        Click="NewPdf_Click"
-                        Margin="0,0,6,0"/>
-
-                <Button x:Name="BtnSave"
-                        Content="Save"
-                        Style="{StaticResource SecondaryButton}"
-                        Click="SavePdf_Click"
-                        IsEnabled="False"
-                        Margin="0,0,12,0"/>
+                        Padding="18,10"
+                        FontSize="15"
+                        Click="BtnFile_Click"
+                        Margin="0,0,12,0">
+                    <Button.ContextMenu>
+                        <ContextMenu x:Name="FileContextMenu"
+                                     Placement="Bottom">
+                            <ContextMenu.Resources>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.MenuBrushKey}"          Color="#252538"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.MenuTextBrushKey}"      Color="#CDD6F4"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}"     Color="#45475A"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#CDD6F4"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.GrayTextBrushKey}"      Color="#585B70"/>
+                            </ContextMenu.Resources>
+                            <MenuItem Header="Open Images…" Click="OpenImages_Click"/>
+                            <MenuItem Header="Open PDF…"    Click="OpenPdf_Click"/>
+                            <Separator/>
+                            <MenuItem x:Name="MenuItemSave"
+                                      Header="Save"
+                                      IsEnabled="False"
+                                      Click="MenuSave_Click"/>
+                            <MenuItem x:Name="MenuItemSaveAs"
+                                      Header="Save As…"
+                                      IsEnabled="False"
+                                      Click="MenuSaveAs_Click"/>
+                        </ContextMenu>
+                    </Button.ContextMenu>
+                </Button>
 
                 <Separator/>
 
@@ -123,20 +138,55 @@
 
                 <!-- Drawing Tools -->
                 <Button x:Name="BtnDrawLine"
-                        Content="Line"
                         Style="{StaticResource SecondaryButton}"
                         Click="DrawTool_Click" Tag="Line"
-                        Margin="6,0,4,0"/>
+                        Padding="10,8"
+                        Margin="6,0,4,0">
+                    <Button.ToolTip>
+                        <ToolTip Content="Line (Shift: horizontal/vertical)"/>
+                    </Button.ToolTip>
+                    <Viewbox Width="18" Height="18">
+                        <Canvas Width="24" Height="24">
+                            <Line X1="3" Y1="21" X2="21" Y2="3"
+                                  Stroke="#CDD6F4" StrokeThickness="2.5"
+                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                        </Canvas>
+                    </Viewbox>
+                </Button>
                 <Button x:Name="BtnDrawBox"
-                        Content="Box"
                         Style="{StaticResource SecondaryButton}"
                         Click="DrawTool_Click" Tag="Box"
-                        Margin="0,0,4,0"/>
+                        Padding="10,8"
+                        Margin="0,0,4,0">
+                    <Button.ToolTip>
+                        <ToolTip Content="Box (Shift: square)"/>
+                    </Button.ToolTip>
+                    <Viewbox Width="18" Height="18">
+                        <Canvas Width="24" Height="24">
+                            <Rectangle Canvas.Left="3" Canvas.Top="3"
+                                       Width="18" Height="18"
+                                       Stroke="#CDD6F4" StrokeThickness="2.5"
+                                       Fill="Transparent"/>
+                        </Canvas>
+                    </Viewbox>
+                </Button>
                 <Button x:Name="BtnDrawCircle"
-                        Content="Circle"
                         Style="{StaticResource SecondaryButton}"
                         Click="DrawTool_Click" Tag="Circle"
-                        Margin="0,0,0,0"/>
+                        Padding="10,8"
+                        Margin="0,0,0,0">
+                    <Button.ToolTip>
+                        <ToolTip Content="Circle (Shift: perfect circle)"/>
+                    </Button.ToolTip>
+                    <Viewbox Width="18" Height="18">
+                        <Canvas Width="24" Height="24">
+                            <Ellipse Canvas.Left="3" Canvas.Top="3"
+                                     Width="18" Height="18"
+                                     Stroke="#CDD6F4" StrokeThickness="2.5"
+                                     Fill="Transparent"/>
+                        </Canvas>
+                    </Viewbox>
+                </Button>
 
                 <Separator/>
 
@@ -168,12 +218,46 @@
 
             <Grid Grid.Column="0">
                 <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="150"/>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
 
+                <!-- ══════════════ THUMBNAIL PANEL ══════════════ -->
+                <Border Grid.Column="0"
+                        Background="#181825"
+                        BorderBrush="#313244"
+                        BorderThickness="0,0,1,0">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0"
+                                Background="#13131F"
+                                BorderBrush="#313244"
+                                BorderThickness="0,0,0,1"
+                                Padding="8,6">
+                            <TextBlock Text="Pages"
+                                       FontSize="11" FontWeight="SemiBold"
+                                       Foreground="#89B4FA"/>
+                        </Border>
+                        <ScrollViewer x:Name="ThumbScrollViewer"
+                                      Grid.Row="1"
+                                      VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled"
+                                      Background="#181825">
+                            <StackPanel x:Name="ThumbPanel" Margin="4,4,4,4">
+                                <TextBlock Text="Open a PDF to see pages"
+                                           FontSize="10" Foreground="#45475A"
+                                           TextWrapping="Wrap" Margin="4,8"/>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Grid>
+                </Border>
+
                 <ScrollViewer x:Name="PdfScrollViewer"
-                              Grid.Column="0"
+                              Grid.Column="1"
                               Background="#1E1E2E"
                               HorizontalScrollBarVisibility="Auto"
                               VerticalScrollBarVisibility="Hidden"
@@ -256,7 +340,7 @@
                 </ScrollViewer>
 
                 <ScrollBar x:Name="GlobalScrollBar"
-                           Grid.Column="1"
+                           Grid.Column="2"
                            Orientation="Vertical"
                            Minimum="0"
                            Maximum="1"

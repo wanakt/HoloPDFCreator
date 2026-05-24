@@ -1,0 +1,57 @@
+<Window x:Class="HoloPDFCreator.Dialogs.ProgressWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Processing"
+        Width="420" Height="170"
+        Background="#1E1E2E"
+        Foreground="#CDD6F4"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False"
+        Closing="Window_Closing">
+
+    <Grid Margin="24,20,24,20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="8"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="14"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Title -->
+        <TextBlock x:Name="TxtTitle"
+                   Grid.Row="0"
+                   Text="Processing…"
+                   FontSize="14" FontWeight="SemiBold"
+                   Foreground="#89B4FA"/>
+
+        <!-- Step label -->
+        <TextBlock x:Name="TxtStep"
+                   Grid.Row="2"
+                   Text=""
+                   FontSize="12"
+                   Foreground="#A6ADC8"
+                   TextTrimming="CharacterEllipsis"/>
+
+        <!-- Progress bar -->
+        <ProgressBar x:Name="PbProgress"
+                     Grid.Row="4"
+                     Height="10"
+                     Minimum="0" Maximum="100" Value="0"
+                     Background="#313244"
+                     Foreground="#89B4FA"
+                     BorderThickness="0"/>
+
+        <!-- Cancel -->
+        <Button x:Name="BtnCancel"
+                Grid.Row="6"
+                Content="Cancel"
+                Width="90" Height="28"
+                HorizontalAlignment="Right"
+                Style="{StaticResource SecondaryButton}"
+                Click="Cancel_Click"/>
+    </Grid>
+</Window>

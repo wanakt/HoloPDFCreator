@@ -11,6 +11,7 @@ namespace HoloPDFCreator;
 
 public partial class MainWindow : Window
 {
+    private readonly AdjustedImageStore _adjustedStore     = new();
     private readonly PDFReaderPage     _pdfReaderPage     = new();
     private readonly ImageAdjusterPage _imageAdjusterPage = new();
 
@@ -43,6 +44,8 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _pdfReaderPage.AdjustedStore     = _adjustedStore;
+        _imageAdjusterPage.AdjustedStore = _adjustedStore;
         ContentFrame.Navigate(_pdfReaderPage);
         BookmarkService.Instance.Changed += (_, _) => RefreshBookmarkPanel();
         RefreshBookmarkPanel();
@@ -55,15 +58,19 @@ public partial class MainWindow : Window
         ContentFrame.Navigate(_pdfReaderPage);
         BtnNavPdfReader.Style     = (Style)FindResource("NavButtonActive");
         BtnNavImageAdjuster.Style = (Style)FindResource("NavButton");
+        _ = _pdfReaderPage.RefreshWithAdjustedImagesAsync();
     }
 
     private void BtnNavPdfReader_Click(object sender, RoutedEventArgs e) => SwitchToPdfReader();
 
-    private void BtnNavImageAdjuster_Click(object sender, RoutedEventArgs e)
+    private async void BtnNavImageAdjuster_Click(object sender, RoutedEventArgs e)
     {
         ContentFrame.Navigate(_imageAdjusterPage);
         BtnNavImageAdjuster.Style = (Style)FindResource("NavButtonActive");
         BtnNavPdfReader.Style     = (Style)FindResource("NavButton");
+
+        if (_pdfReaderPage.CurrentFilePath is string pdfPath)
+            await _imageAdjusterPage.LoadFromPdfAsync(pdfPath, _pdfReaderPage.CurrentPage);
     }
 
     // ─── Bookmark panel ───────────────────────────────────────────────────────

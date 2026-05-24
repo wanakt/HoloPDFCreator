@@ -1,0 +1,197 @@
+<Window x:Class="HoloPDFCreator.Dialogs.ImageOrderWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Open Images"
+        Width="720" Height="540"
+        MinWidth="500" MinHeight="360"
+        Background="#1E1E2E"
+        Foreground="#CDD6F4"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False">
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <TextBlock Grid.Row="0"
+                   Text="Select and order image files"
+                   FontSize="14" FontWeight="SemiBold"
+                   Foreground="#89B4FA"
+                   Margin="0,0,0,12"/>
+
+        <!-- Sort toolbar -->
+        <Grid Grid.Row="1" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBlock Text="Sort:" Foreground="#A6ADC8" FontSize="12"
+                           VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <Button x:Name="BtnSortName" Content="By Name"
+                        Style="{StaticResource SecondaryButton}"
+                        Padding="12,6" FontSize="12"
+                        Click="SortName_Click" Margin="0,0,6,0"/>
+                <Button x:Name="BtnSortDate" Content="By Date"
+                        Style="{StaticResource SecondaryButton}"
+                        Padding="12,6" FontSize="12"
+                        Click="SortDate_Click" Margin="0,0,6,0"/>
+                <Button x:Name="BtnSortSize" Content="By Size"
+                        Style="{StaticResource SecondaryButton}"
+                        Padding="12,6" FontSize="12"
+                        Click="SortSize_Click"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- List + reorder buttons -->
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Column headers -->
+            <Grid Grid.Column="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <Border Grid.Row="0"
+                        Background="#13131F"
+                        BorderBrush="#313244"
+                        BorderThickness="1,1,1,0"
+                        CornerRadius="6,6,0,0"
+                        Padding="12,6">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="150"/>
+                            <ColumnDefinition Width="80"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="File Name"
+                                   FontSize="11" FontWeight="SemiBold"
+                                   Foreground="#89B4FA"/>
+                        <TextBlock Grid.Column="1" Text="Modified"
+                                   FontSize="11" FontWeight="SemiBold"
+                                   Foreground="#89B4FA"/>
+                        <TextBlock Grid.Column="2" Text="Size"
+                                   FontSize="11" FontWeight="SemiBold"
+                                   Foreground="#89B4FA"
+                                   TextAlignment="Right"/>
+                    </Grid>
+                </Border>
+
+                <Border Grid.Row="1"
+                        Background="#181825"
+                        BorderBrush="#313244"
+                        BorderThickness="1,0,1,1"
+                        CornerRadius="0,0,6,6">
+                    <ListBox x:Name="FileListBox"
+                             Background="Transparent"
+                             BorderThickness="0"
+                             SelectionMode="Single"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             VirtualizingPanel.IsVirtualizing="False">
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="ListBoxItem">
+                                <Setter Property="Padding"    Value="12,6"/>
+                                <Setter Property="Background" Value="Transparent"/>
+                                <Setter Property="Foreground" Value="#CDD6F4"/>
+                                <Setter Property="BorderThickness" Value="0"/>
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                <Style.Triggers>
+                                    <Trigger Property="IsSelected" Value="True">
+                                        <Setter Property="Background" Value="#45475A"/>
+                                    </Trigger>
+                                    <MultiTrigger>
+                                        <MultiTrigger.Conditions>
+                                            <Condition Property="IsMouseOver" Value="True"/>
+                                            <Condition Property="IsSelected"  Value="False"/>
+                                        </MultiTrigger.Conditions>
+                                        <Setter Property="Background" Value="#313244"/>
+                                    </MultiTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="150"/>
+                                        <ColumnDefinition Width="80"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0"
+                                               Text="{Binding Name}"
+                                               FontSize="12"
+                                               TextTrimming="CharacterEllipsis"
+                                               Foreground="#CDD6F4"/>
+                                    <TextBlock Grid.Column="1"
+                                               Text="{Binding DateStr}"
+                                               FontSize="11"
+                                               Foreground="#A6ADC8"/>
+                                    <TextBlock Grid.Column="2"
+                                               Text="{Binding SizeStr}"
+                                               FontSize="11"
+                                               Foreground="#A6ADC8"
+                                               TextAlignment="Right"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Border>
+            </Grid>
+
+            <!-- Move Up/Down buttons -->
+            <StackPanel Grid.Column="1" Margin="10,0,0,0"
+                        VerticalAlignment="Center">
+                <Button x:Name="BtnMoveUp"
+                        Content="▲ Up"
+                        Style="{StaticResource SecondaryButton}"
+                        Padding="14,8" FontSize="12"
+                        MinWidth="80"
+                        Click="MoveUp_Click"
+                        Margin="0,0,0,8"/>
+                <Button x:Name="BtnMoveDown"
+                        Content="▼ Down"
+                        Style="{StaticResource SecondaryButton}"
+                        Padding="14,8" FontSize="12"
+                        MinWidth="80"
+                        Click="MoveDown_Click"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- Footer: count + OK/Cancel -->
+        <Grid Grid.Row="3" Margin="0,14,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock x:Name="TxtCount"
+                       Grid.Column="0"
+                       FontSize="12"
+                       Foreground="#A6ADC8"
+                       VerticalAlignment="Center"/>
+
+            <Button Grid.Column="1"
+                    Content="Open"
+                    Style="{StaticResource PrimaryButton}"
+                    Padding="22,9" FontSize="13"
+                    Click="OK_Click"
+                    Margin="0,0,8,0"/>
+            <Button Grid.Column="2"
+                    Content="Cancel"
+                    Style="{StaticResource SecondaryButton}"
+                    Padding="22,9" FontSize="13"
+                    Click="Cancel_Click"/>
+        </Grid>
+    </Grid>
+</Window>

@@ -79,6 +79,16 @@ public partial class PDFReaderPage : Page
     private double _scrollBarDragTarget;
     private const  double PageGap = 16; // px gap between pages in the StackPanel
 
+    // ─── Thumbnail panel ──────────────────────────────────────────────────────
+    private record ThumbEntry(System.Windows.Controls.Image Img, Border Container);
+    private readonly List<ThumbEntry> _thumbItems = new();
+    private CancellationTokenSource _thumbCts = new();
+    private static readonly SolidColorBrush ThumbBrushNormal   = Frozen(0x1E, 0x1E, 0x2E);
+    private static readonly SolidColorBrush ThumbBrushSelected = Frozen(0x31, 0x32, 0x44);
+    private static readonly SolidColorBrush ThumbBrushHover    = Frozen(0x28, 0x28, 0x3C);
+    private static SolidColorBrush Frozen(byte r, byte g, byte b)
+    { var br = new SolidColorBrush(Color.FromRgb(r, g, b)); br.Freeze(); return br; }
+
     private static readonly (Color Color, string Name)[] HighlightPresets =
     {
         (Color.FromRgb(0xFF, 0xEE, 0x00), "Yellow"),
@@ -114,12 +124,152 @@ public partial class PDFReaderPage : Page
         // DrawingCanvas stays below TextOverlayCanvas; it only captures input during active draw mode.
     }
 
-    public string? CurrentFilePath => _currentFilePath;
-    public uint    CurrentPage     => _currentPage;
+    // ─── Image mode (images loaded as a temp PDF) ────────────────────────────
+    private List<string> _imageFiles     = new();
+    private string?      _tempImagePdfPath;
+    public bool IsImageMode => _imageFiles.Count > 0;
+    public IReadOnlyList<string> ImageFiles => _imageFiles;
+
+    public string?             CurrentFilePath => _currentFilePath;
+    public uint               CurrentPage     => _currentPage;
+    public AdjustedImageStore? AdjustedStore  { get; set; }
+
+    // Re-render the current page and update thumbnails with any adjusted-image overrides.
+    public async Task RefreshWithAdjustedImagesAsync()
+    {
+        if (_renderDocument == null) return;
+        if (AdjustedStore == null || !AdjustedStore.HasAny) return;
+        await RenderCurrentPageAsync();
+        RefreshAdjustedThumbnails();
+    }
+
+    private void RefreshAdjustedThumbnails()
+    {
+        if (AdjustedStore == null) return;
+        for (int i = 0; i < _thumbItems.Count; i++)
+        {
+            var overrideImg = AdjustedStore.Get(i);
+            if (overrideImg != null)
+                _thumbItems[i].Img.Source = overrideImg;
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  File Operations
     // ═══════════════════════════════════════════════════════════════════════════
+
+    private void BtnFile_Click(object sender, RoutedEventArgs e)
+    {
+        var cm = BtnFile.ContextMenu;
+        cm.PlacementTarget = BtnFile;
+        cm.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+        cm.IsOpen = true;
+    }
+
+    private void OpenImages_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFileDialog
+        {
+            Filter      = "Image Files|*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.tif;*.gif|All Files|*.*",
+            Title       = "Open Images",
+            Multiselect = true
+        };
+        if (dlg.ShowDialog() != true || dlg.FileNames.Length == 0) return;
+
+        var win = new ImageOrderWindow(dlg.FileNames) { Owner = Window.GetWindow(this) };
+        if (win.ShowDialog() != true || win.OrderedPaths.Count == 0) return;
+
+        _ = LoadImagesAsync(win.OrderedPaths);
+    }
+
+    private async Task LoadImagesAsync(IEnumerable<string> paths)
+    {
+        _imageFiles = paths.ToList();
+        if (_imageFiles.Count == 0) return;
+
+        CleanupTempImagePdf();
+        AdjustedStore?.Clear();
+
+        string tmpPath = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            System.IO.Path.GetRandomFileName() + ".pdf");
+        _tempImagePdfPath = tmpPath;
+
+        var win = new HoloPDFCreator.Dialogs.ProgressWindow("이미지 → PDF 변환 중")
+        {
+            Owner = Window.GetWindow(this)
+        };
+        win.Show();
+
+        int total = _imageFiles.Count;
+        bool succeeded = false;
+
+        try
+        {
+            await Task.Run(() =>
+            {
+                var doc = new PdfDocument();
+                for (int i = 0; i < total; i++)
+                {
+                    if (win.IsCancelled) return;
+
+                    var imgPath = _imageFiles[i];
+                    Dispatcher.Invoke(() =>
+                        win.Update(i, total, $"({i + 1} / {total})  {System.IO.Path.GetFileName(imgPath)}"));
+
+                    using var xImg = XImage.FromFile(imgPath);
+                    double dpiX = xImg.HorizontalResolution > 0 ? xImg.HorizontalResolution : 96.0;
+                    double dpiY = xImg.VerticalResolution   > 0 ? xImg.VerticalResolution   : 96.0;
+                    double ptW  = xImg.PixelWidth  * 72.0 / dpiX;
+                    double ptH  = xImg.PixelHeight * 72.0 / dpiY;
+                    var page    = doc.AddPage();
+                    page.Width  = XUnit.FromPoint(ptW);
+                    page.Height = XUnit.FromPoint(ptH);
+                    using var gfx = XGraphics.FromPdfPage(page);
+                    gfx.DrawImage(xImg, 0, 0, ptW, ptH);
+                }
+
+                if (!win.IsCancelled)
+                {
+                    Dispatcher.Invoke(() => win.Update(total, total, "PDF 파일 저장 중…"));
+                    doc.Save(tmpPath);
+                    succeeded = true;
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            win.Close();
+            _imageFiles.Clear();
+            _tempImagePdfPath = null;
+            MessageBox.Show($"이미지를 PDF로 변환하는 중 오류가 발생했습니다:\n{ex.Message}",
+                            "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            SetStatus("이미지 로드 실패.");
+            return;
+        }
+
+        win.Close();
+
+        if (!succeeded)
+        {
+            _imageFiles.Clear();
+            _tempImagePdfPath = null;
+            try { System.IO.File.Delete(tmpPath); } catch { }
+            SetStatus("변환이 취소되었습니다.");
+            return;
+        }
+
+        await LoadPdfAsync(tmpPath);
+    }
+
+    private void CleanupTempImagePdf()
+    {
+        if (_tempImagePdfPath != null)
+        {
+            try { File.Delete(_tempImagePdfPath); } catch { }
+            _tempImagePdfPath = null;
+        }
+    }
 
     private async void OpenPdf_Click(object sender, RoutedEventArgs e)
     {
@@ -138,6 +288,11 @@ public partial class PDFReaderPage : Page
 
     private async Task LoadPdfAsync(string filePath)
     {
+        if (filePath != _tempImagePdfPath)
+        {
+            _imageFiles.Clear();
+            CleanupTempImagePdf();
+        }
         SetStatus("Loading…");
         try
         {
@@ -170,12 +325,14 @@ public partial class PDFReaderPage : Page
 
             DropZone.Visibility      = Visibility.Collapsed;
             PdfPageBorder.Visibility = Visibility.Visible;
-            BtnSave.IsEnabled   = true;
+            MenuItemSave.IsEnabled   = filePath != _tempImagePdfPath;
+            MenuItemSaveAs.IsEnabled = true;
             BtnRotate.IsEnabled = true;
             UpdateNavButtons();
 
             await RenderCurrentPageAsync();
             SetStatus($"Opened: {System.IO.Path.GetFileName(filePath)}");
+            StartThumbnailGeneration();
         }
         catch (Exception ex)
         {
@@ -189,76 +346,61 @@ public partial class PDFReaderPage : Page
     //  PDF Creation
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private async void NewPdf_Click(object sender, RoutedEventArgs e)
-    {
-        var dlg = new SaveFileDialog
-        {
-            Filter   = "PDF Files (*.pdf)|*.pdf",
-            Title    = "Create New PDF",
-            FileName = "NewDocument"
-        };
-        if (dlg.ShowDialog() != true) return;
-
-        try
-        {
-            using var doc = new PdfDocument();
-            doc.Info.Title   = System.IO.Path.GetFileNameWithoutExtension(dlg.FileName);
-            doc.Info.Creator = "HoloPDF Creator";
-            doc.AddPage().Size = PdfSharp.PageSize.A4;
-            doc.Save(dlg.FileName);
-            await LoadPdfAsync(dlg.FileName);
-            SetStatus("New PDF created.");
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show($"Could not create PDF:\n{ex.Message}", "Error",
-                            MessageBoxButton.OK, MessageBoxImage.Error);
-        }
-    }
-
     // ═══════════════════════════════════════════════════════════════════════════
     //  Save
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private async void SavePdf_Click(object sender, RoutedEventArgs e)
+    private async void MenuSave_Click(object sender, RoutedEventArgs e)
+    {
+        if (_editDocument is null || _currentFilePath is null) return;
+        await SaveToPathAsync(_currentFilePath);
+    }
+
+    private async void MenuSaveAs_Click(object sender, RoutedEventArgs e)
     {
         if (_editDocument is null || _currentFilePath is null) return;
 
         var dlg = new SaveFileDialog
         {
             Filter   = "PDF Files (*.pdf)|*.pdf",
-            Title    = "Save PDF",
+            Title    = "Save As",
             FileName = System.IO.Path.GetFileNameWithoutExtension(_currentFilePath)
         };
         if (dlg.ShowDialog() != true) return;
+
+        await SaveToPathAsync(dlg.FileName);
+    }
+
+    private async Task SaveToPathAsync(string outputPath)
+    {
+        if (_editDocument is null || _currentFilePath is null) return;
 
         string? tmpPath = null;
         try
         {
             EmbedAnnotationsAndMemos();
 
-            // Write to a temp file first, then move — avoids locking the currently-open file.
+            // Write to temp first to avoid locking the open file.
             tmpPath = System.IO.Path.Combine(
-                System.IO.Path.GetDirectoryName(dlg.FileName)!,
+                System.IO.Path.GetDirectoryName(outputPath)!,
                 System.IO.Path.GetRandomFileName() + ".pdf");
 
             _editDocument.Save(tmpPath);
 
-            // Release in-memory document references before replacing the target file.
             _editDocument.Dispose();
-            _editDocument  = null;
+            _editDocument   = null;
             _renderDocument = null;
 
-            File.Move(tmpPath, dlg.FileName, overwrite: true);
+            File.Move(tmpPath, outputPath, overwrite: true);
             tmpPath = null;
 
-            if (!dlg.FileName.Equals(_currentFilePath, StringComparison.OrdinalIgnoreCase))
+            if (!outputPath.Equals(_currentFilePath, StringComparison.OrdinalIgnoreCase))
             {
-                AnnotationService.Instance.RenameFile(_currentFilePath, dlg.FileName);
-                DrawingService.Instance.RenameFile(_currentFilePath, dlg.FileName);
+                AnnotationService.Instance.RenameFile(_currentFilePath, outputPath);
+                DrawingService.Instance.RenameFile(_currentFilePath, outputPath);
             }
 
-            await LoadPdfAsync(dlg.FileName);
+            await LoadPdfAsync(outputPath);
             SetStatus("Saved.");
         }
         catch (Exception ex)
@@ -547,40 +689,48 @@ public partial class PDFReaderPage : Page
 
         try
         {
-            using var pdfPage = _renderDocument.GetPage(_currentPage);
-            using var stream  = new InMemoryRandomAccessStream();
+            BitmapSource displaySrc;
 
+            // PDF mode (includes images-as-temp-PDF)
+            using var pdfPage = _renderDocument!.GetPage(_currentPage);
+            using var stream  = new InMemoryRandomAccessStream();
             var opts = new WinPdf.PdfPageRenderOptions
             {
                 DestinationWidth = (uint)(RenderBaseWidth * _zoomLevel)
             };
-
             await pdfPage.RenderToStreamAsync(stream, opts);
             stream.Seek(0);
-
             var ms = new MemoryStream();
             await stream.AsStream().CopyToAsync(ms);
             ms.Position = 0;
+            var pdfBmp = new BitmapImage();
+            pdfBmp.BeginInit();
+            pdfBmp.StreamSource = ms;
+            pdfBmp.CacheOption  = BitmapCacheOption.OnLoad;
+            pdfBmp.EndInit();
+            pdfBmp.Freeze();
+            displaySrc = pdfBmp;
 
-            var bmp = new BitmapImage();
-            bmp.BeginInit();
-            bmp.StreamSource = ms;
-            bmp.CacheOption  = BitmapCacheOption.OnLoad;
-            bmp.EndInit();
-            bmp.Freeze();
+            var overrideImg = AdjustedStore?.Get((int)_currentPage);
+            var finalSrc    = overrideImg ?? displaySrc;
 
-            PdfPageImage.Source = bmp;
+            PdfPageImage.Source  = finalSrc;
+            PdfPageImage.Width   = double.NaN;
+            PdfPageImage.Height  = double.NaN;
+            PdfPageImage.Stretch = Stretch.None;
 
             // Clear stale previews while new page renders.
             PrevPagesPanel.Children.Clear();
             NextPagesPanel.Children.Clear();
 
-            if (_currentFilePath is not null)
-                await PopulateTextOverlayAsync(_currentFilePath, (int)_currentPage,
-                                              bmp.PixelWidth, bmp.PixelHeight);
+            int dispW = displaySrc.PixelWidth;
+            int dispH = displaySrc.PixelHeight;
+
+            if (_currentFilePath is not null && _renderDocument is not null)
+                await PopulateTextOverlayAsync(_currentFilePath, (int)_currentPage, dispW, dispH);
 
             // Pre-render prev pages (await so PrevPagesPanel.ActualHeight is ready for scroll offset).
-            await RenderPrevPagesAsync(bmp.PixelHeight);
+            await RenderPrevPagesAsync(dispH);
 
             // Place scroll so current page top is at viewport top.
             await Dispatcher.InvokeAsync(() =>
@@ -593,12 +743,13 @@ public partial class PDFReaderPage : Page
 
             // Pre-render next pages for smooth scrolling (intentional fire-and-forget).
 #pragma warning disable CS4014
-            RenderNextPagesAsync(bmp.PixelHeight);
+            RenderNextPagesAsync(dispH);
 #pragma warning restore CS4014
 
             SetStatus(_pageWords.Count > 0
                 ? $"Page {_currentPage + 1} / {_totalPages}  ·  Drag or click to select"
                 : $"Page {_currentPage + 1} / {_totalPages}");
+            UpdateThumbnailHighlight();
         }
         catch (Exception ex)
         {
@@ -620,6 +771,7 @@ public partial class PDFReaderPage : Page
     // Render a single page from the document into an Image element.
     private async Task<System.Windows.Controls.Image> RenderPageImageAsync(uint pageIndex)
     {
+        BitmapSource pageSrc;
         using var pdfPage = _renderDocument!.GetPage(pageIndex);
         using var stream  = new InMemoryRandomAccessStream();
         var opts = new WinPdf.PdfPageRenderOptions { DestinationWidth = (uint)(RenderBaseWidth * _zoomLevel) };
@@ -634,7 +786,16 @@ public partial class PDFReaderPage : Page
         bmp.CacheOption  = BitmapCacheOption.OnLoad;
         bmp.EndInit();
         bmp.Freeze();
-        var img = new System.Windows.Controls.Image { Source = bmp, Stretch = System.Windows.Media.Stretch.None };
+        pageSrc = bmp;
+
+        var overrideImg2 = AdjustedStore?.Get((int)pageIndex);
+        var finalSrc2    = overrideImg2 ?? pageSrc;
+
+        var img = new System.Windows.Controls.Image
+        {
+            Source  = finalSrc2,
+            Stretch = System.Windows.Media.Stretch.None
+        };
         RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
         return img;
     }
@@ -643,7 +804,8 @@ public partial class PDFReaderPage : Page
     private async Task RenderPrevPagesAsync(double pageH)
     {
         PrevPagesPanel.Children.Clear();
-        if (_renderDocument is null || _currentPage == 0) return;
+        if (_renderDocument is null) return;
+        if (_currentPage == 0) return;
 
         int nPrev = Math.Min(SidePageCount(pageH), (int)_currentPage);
         try
@@ -667,7 +829,8 @@ public partial class PDFReaderPage : Page
     private async Task RenderNextPagesAsync(double pageH)
     {
         NextPagesPanel.Children.Clear();
-        if (_renderDocument is null || _currentPage + 1 >= _totalPages) return;
+        if (_renderDocument is null) return;
+        if (_currentPage + 1 >= _totalPages) return;
 
         int nNext = Math.Min(SidePageCount(pageH), (int)(_totalPages - 1 - _currentPage));
         try
@@ -2428,7 +2591,7 @@ public partial class PDFReaderPage : Page
         if (!_isDrawing || _rubberBand is null) return;
 
         var pos = e.GetPosition(DrawingCanvas);
-        UpdateRubberBand(pos);
+        UpdateRubberBand(ApplyShiftConstraint(_drawStart, pos));
         e.Handled = true;
     }
 
@@ -2438,16 +2601,16 @@ public partial class PDFReaderPage : Page
         _isDrawing = false;
         DrawingCanvas.ReleaseMouseCapture();
 
-        var pos = e.GetPosition(DrawingCanvas);
+        var rawPos = e.GetPosition(DrawingCanvas);
         if (_rubberBand != null)
             DrawingCanvas.Children.Remove(_rubberBand);
         _rubberBand = null;
 
-        double dx = Math.Abs(pos.X - _drawStart.X);
-        double dy = Math.Abs(pos.Y - _drawStart.Y);
+        double rawDx = Math.Abs(rawPos.X - _drawStart.X);
+        double rawDy = Math.Abs(rawPos.Y - _drawStart.Y);
 
         // Tiny click (no drag) → try to select an existing shape instead of drawing.
-        if (dx < 4 && dy < 4)
+        if (rawDx < 4 && rawDy < 4)
         {
             var hit = HitTestDrawingShape(_drawStart);
             if (hit != null)
@@ -2459,6 +2622,8 @@ public partial class PDFReaderPage : Page
             e.Handled = true;
             return;
         }
+
+        var pos = ApplyShiftConstraint(_drawStart, rawPos);
 
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) { e.Handled = true; return; }
 
@@ -2494,7 +2659,6 @@ public partial class PDFReaderPage : Page
 
         if (_rubberBand is System.Windows.Shapes.Line ln)
         {
-            // X1/Y1/X2/Y2 are canvas-absolute (Canvas.Left/Top not set on rubber-band Line).
             ln.X1 = _drawStart.X; ln.Y1 = _drawStart.Y;
             ln.X2 = pos.X;        ln.Y2 = pos.Y;
         }
@@ -2506,6 +2670,30 @@ public partial class PDFReaderPage : Page
             Canvas.SetTop(_rubberBand,  y);
             _rubberBand.Width  = Math.Max(Math.Abs(pos.X - _drawStart.X), 1);
             _rubberBand.Height = Math.Max(Math.Abs(pos.Y - _drawStart.Y), 1);
+        }
+    }
+
+    private Point ApplyShiftConstraint(Point start, Point current)
+    {
+        bool shift = Keyboard.IsKeyDown(Key.LeftShift) || Keyboard.IsKeyDown(Key.RightShift);
+        if (!shift) return current;
+
+        double dx = current.X - start.X;
+        double dy = current.Y - start.Y;
+
+        if (_drawMode == DrawMode.Line)
+        {
+            // Snap to the dominant axis (horizontal or vertical).
+            return Math.Abs(dx) >= Math.Abs(dy)
+                ? new Point(current.X, start.Y)   // horizontal
+                : new Point(start.X,  current.Y);  // vertical
+        }
+        else
+        {
+            // Force equal width and height so Box becomes square, Circle becomes circle.
+            double size = Math.Max(Math.Abs(dx), Math.Abs(dy));
+            return new Point(start.X + Math.Sign(dx) * size,
+                             start.Y + Math.Sign(dy) * size);
         }
     }
 
@@ -2874,12 +3062,9 @@ public partial class PDFReaderPage : Page
 
     private async void RotatePage_Click(object sender, RoutedEventArgs e)
     {
-        if (_editDocument is null || _totalPages == 0) { SetStatus("Open a PDF first."); return; }
+        if (_totalPages == 0) return;
 
-        var dlg = new RotateDialog((int)_totalPages, (int)_currentPage)
-        {
-            Owner = Window.GetWindow(this)
-        };
+        var dlg = new RotateDialog((int)_totalPages, (int)_currentPage) { Owner = Window.GetWindow(this) };
         if (dlg.ShowDialog() != true) return;
         if (dlg.Angle == 0) { SetStatus("회전 각도가 0°입니다. 적용하지 않습니다."); return; }
 
@@ -2892,6 +3077,8 @@ public partial class PDFReaderPage : Page
             RotateScope.Odd   => Enumerable.Range(0, (int)_totalPages).Where(i => i % 2 == 0),
             _                 => new[] { (int)_currentPage },
         };
+
+        if (_editDocument is null) { SetStatus("Open a PDF first."); return; }
 
         foreach (int pi in targets)
         {
@@ -2936,5 +3123,128 @@ public partial class PDFReaderPage : Page
         {
             _pageTransitioning = false;
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Thumbnail panel
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void StartThumbnailGeneration()
+    {
+        _thumbCts.Cancel();
+        _thumbCts = new CancellationTokenSource();
+        _thumbItems.Clear();
+        ThumbPanel.Children.Clear();
+
+        if (_renderDocument == null) return;
+        if (_totalPages == 0) return;
+
+        // Add placeholder containers immediately so the panel shows all pages at once.
+        for (uint i = 0; i < _totalPages; i++)
+        {
+            uint capturedPage = i;
+
+            var imgEl = new System.Windows.Controls.Image
+            {
+                Width   = 118,
+                Height  = 90,
+                Stretch = Stretch.Uniform
+            };
+            RenderOptions.SetBitmapScalingMode(imgEl, BitmapScalingMode.HighQuality);
+
+            var numBlock = new TextBlock
+            {
+                Text              = $"{i + 1}",
+                FontSize          = 10,
+                Foreground        = new SolidColorBrush(Color.FromRgb(0x9A, 0x9D, 0xB2)),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin            = new Thickness(0, 2, 0, 0)
+            };
+
+            var stack = new StackPanel { Margin = new Thickness(0) };
+            stack.Children.Add(imgEl);
+            stack.Children.Add(numBlock);
+
+            bool isCurrent = (capturedPage == _currentPage);
+            var container = new Border
+            {
+                Background   = isCurrent ? ThumbBrushSelected : ThumbBrushNormal,
+                CornerRadius = new CornerRadius(4),
+                Padding      = new Thickness(4),
+                Margin       = new Thickness(0, 0, 0, 4),
+                Cursor       = Cursors.Hand,
+                Child        = stack
+            };
+
+            container.MouseEnter += (_, _) =>
+            {
+                if (capturedPage != _currentPage) container.Background = ThumbBrushHover;
+            };
+            container.MouseLeave += (_, _) =>
+            {
+                container.Background = capturedPage == _currentPage ? ThumbBrushSelected : ThumbBrushNormal;
+            };
+            container.MouseLeftButtonUp += async (_, _) =>
+            {
+                if (capturedPage == _currentPage) return;
+                _currentPage = capturedPage;
+                UpdateNavButtons();
+                await RenderCurrentPageAsync();
+            };
+
+            _thumbItems.Add(new ThumbEntry(imgEl, container));
+            ThumbPanel.Children.Add(container);
+        }
+
+        // Highlight initial page and render thumbnails in background.
+        UpdateThumbnailHighlight();
+        _ = RenderThumbnailsAsync(_thumbCts.Token);
+    }
+
+    private async Task RenderThumbnailsAsync(CancellationToken ct)
+    {
+        for (int i = 0; i < (int)_totalPages; i++)
+        {
+            if (ct.IsCancellationRequested) return;
+
+            try
+            {
+                BitmapSource thumbSrc;
+
+                if (_renderDocument == null) return;
+                using var pdfPage = _renderDocument.GetPage((uint)i);
+                using var stream  = new InMemoryRandomAccessStream();
+                await pdfPage.RenderToStreamAsync(stream,
+                    new WinPdf.PdfPageRenderOptions { DestinationWidth = 160 });
+                stream.Seek(0);
+                var ms = new MemoryStream();
+                await stream.AsStream().CopyToAsync(ms);
+                ms.Position = 0;
+                var pdfThumb = new BitmapImage();
+                pdfThumb.BeginInit();
+                pdfThumb.StreamSource = ms;
+                pdfThumb.CacheOption  = BitmapCacheOption.OnLoad;
+                pdfThumb.EndInit();
+                pdfThumb.Freeze();
+                thumbSrc = pdfThumb;
+
+                if (!ct.IsCancellationRequested && i < _thumbItems.Count)
+                    _thumbItems[i].Img.Source = thumbSrc;
+            }
+            catch { /* skip on render error */ }
+
+            // Yield between pages to keep UI responsive.
+            await Task.Yield();
+        }
+    }
+
+    private void UpdateThumbnailHighlight()
+    {
+        for (int i = 0; i < _thumbItems.Count; i++)
+            _thumbItems[i].Container.Background =
+                i == (int)_currentPage ? ThumbBrushSelected : ThumbBrushNormal;
+
+        if (_currentPage < _thumbItems.Count)
+            _thumbItems[(int)_currentPage].Container.BringIntoView();
     }
 }
