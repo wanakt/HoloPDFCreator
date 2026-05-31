@@ -17,6 +17,13 @@ public partial class MainWindow : Window
         _pdfReaderPage.AdjustedStore = _adjustedStore;
         _ocrPage.AdjustedStore       = _adjustedStore;
         ContentFrame.Navigate(_pdfReaderPage);
+
+        Loaded += async (_, _) =>
+        {
+            var args = Environment.GetCommandLineArgs();
+            if (args.Length > 1 && System.IO.File.Exists(args[1]))
+                await _pdfReaderPage.LoadPdfAsync(args[1]);
+        };
     }
 
     // ─── Page navigation ─────────────────────────────────────────────────────

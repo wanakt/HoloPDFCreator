@@ -59,7 +59,6 @@
                             </ContextMenu.Resources>
                             <MenuItem Header="Open Images…" Click="OpenImages_Click"/>
                             <MenuItem Header="Open PDF…"    Click="OpenPdf_Click"/>
-                            <MenuItem x:Name="MenuRecentFiles" Header="최근 파일"/>
                             <Separator/>
                             <MenuItem x:Name="MenuItemSave"
                                       Header="Save"
@@ -69,6 +68,39 @@
                                       Header="Save As…"
                                       IsEnabled="False"
                                       Click="MenuSaveAs_Click"/>
+                            <Separator x:Name="RecentFilesSeparator" Visibility="Collapsed"/>
+                        </ContextMenu>
+                    </Button.ContextMenu>
+                </Button>
+
+                <!-- View Button + ContextMenu -->
+                <Button x:Name="BtnView"
+                        Content="🗗 View ▾"
+                        Style="{StaticResource SecondaryButton}"
+                        Padding="18,10"
+                        FontSize="15"
+                        Click="BtnView_Click"
+                        Margin="0,0,12,0">
+                    <Button.ContextMenu>
+                        <ContextMenu x:Name="ViewContextMenu">
+                            <ContextMenu.Resources>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.MenuBrushKey}"          Color="#252538"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.MenuTextBrushKey}"      Color="#CDD6F4"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}"     Color="#45475A"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#CDD6F4"/>
+                            </ContextMenu.Resources>
+                            <MenuItem x:Name="MenuViewBookmarks"
+                                      Header="Bookmarks"
+                                      IsCheckable="True" IsChecked="False"
+                                      Click="MenuViewBookmarks_Click"/>
+                            <MenuItem x:Name="MenuViewPages"
+                                      Header="Pages"
+                                      IsCheckable="True" IsChecked="False"
+                                      Click="MenuViewPages_Click"/>
+                            <MenuItem x:Name="MenuViewAdjust"
+                                      Header="Image Adjust"
+                                      IsCheckable="True" IsChecked="False"
+                                      Click="MenuViewAdjust_Click"/>
                         </ContextMenu>
                     </Button.ContextMenu>
                 </Button>
@@ -125,15 +157,6 @@
                         Style="{StaticResource SecondaryButton}"
                         Click="ZoomFit_Click"
                         Margin="4,0,0,0"/>
-
-                <Separator/>
-
-                <!-- Adjust Toggle -->
-                <Button x:Name="BtnToggleAdjust"
-                        Content="Image Adjust"
-                        Style="{StaticResource SecondaryButton}"
-                        Click="ToggleAdjust_Click"
-                        Margin="6,0,0,0"/>
 
                 <Separator/>
 
@@ -265,8 +288,9 @@
 
             <Grid Grid.Column="0">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="240"/>
-                    <ColumnDefinition Width="150"/>
+                    <ColumnDefinition x:Name="BookmarkPanelCol"  Width="0"/>
+                    <ColumnDefinition x:Name="PagesPanelCol"     Width="0" MinWidth="0"/>
+                    <ColumnDefinition x:Name="PagesSplitterCol"  Width="0"/>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
@@ -285,11 +309,23 @@
                                 Background="#13131F"
                                 BorderBrush="#313244"
                                 BorderThickness="0,0,0,1"
-                                Padding="8,6">
-                            <TextBlock Text="Bookmarks"
-                                       FontSize="11" FontWeight="SemiBold"
-                                       Foreground="#89B4FA"
-                                       VerticalAlignment="Center"/>
+                                Padding="8,4,4,4">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Bookmarks"
+                                           FontSize="11" FontWeight="SemiBold"
+                                           Foreground="#89B4FA"
+                                           VerticalAlignment="Center"/>
+                                <Button Grid.Column="1"
+                                        Content="✕" FontSize="10"
+                                        Padding="4,2"
+                                        ToolTip="Hide Bookmarks"
+                                        Style="{StaticResource SecondaryButton}"
+                                        Click="BtnHideBookmarks_Click"/>
+                            </Grid>
                         </Border>
                         <ScrollViewer x:Name="BookmarkScrollViewer"
                                       Grid.Row="1"
@@ -332,32 +368,37 @@
                                            Foreground="#89B4FA"
                                            VerticalAlignment="Center"/>
                                 <Button Grid.Column="1"
-                                        x:Name="BtnThumbDeletePages"
-                                        Content="🗑"
-                                        FontSize="11"
-                                        Padding="4,1"
-                                        IsEnabled="False"
-                                        ToolTip="Delete selected pages (Delete)"
+                                        Content="✕" FontSize="10"
+                                        Padding="4,2"
+                                        ToolTip="Hide Pages"
                                         Style="{StaticResource SecondaryButton}"
-                                        Click="BtnThumbDeletePages_Click"/>
+                                        Click="BtnHidePages_Click"/>
                             </Grid>
                         </Border>
                         <ScrollViewer x:Name="ThumbScrollViewer"
                                       Grid.Row="1"
                                       VerticalScrollBarVisibility="Auto"
                                       HorizontalScrollBarVisibility="Disabled"
-                                      Background="#181825">
-                            <StackPanel x:Name="ThumbPanel" Margin="4,4,4,4">
+                                      Background="#181825"
+                                      AllowDrop="True">
+                            <WrapPanel x:Name="ThumbPanel" Orientation="Horizontal" Margin="4,4,4,4">
                                 <TextBlock Text="Open a PDF to see pages"
                                            FontSize="10" Foreground="#45475A"
                                            TextWrapping="Wrap" Margin="4,8"/>
-                            </StackPanel>
+                            </WrapPanel>
                         </ScrollViewer>
                     </Grid>
                 </Border>
 
+                <GridSplitter Grid.Column="2"
+                              Width="5"
+                              HorizontalAlignment="Stretch"
+                              VerticalAlignment="Stretch"
+                              Background="#2A2A3E"
+                              Cursor="SizeWE"/>
+
                 <ScrollViewer x:Name="PdfScrollViewer"
-                              Grid.Column="2"
+                              Grid.Column="3"
                               Background="#1E1E2E"
                               HorizontalScrollBarVisibility="Auto"
                               VerticalScrollBarVisibility="Hidden"
@@ -440,7 +481,7 @@
                 </ScrollViewer>
 
                 <ScrollBar x:Name="GlobalScrollBar"
-                           Grid.Column="3"
+                           Grid.Column="4"
                            Orientation="Vertical"
                            Minimum="0"
                            Maximum="1"
@@ -456,12 +497,47 @@
                     BorderBrush="#313244"
                     BorderThickness="1,0,0,0"
                     ClipToBounds="True">
-                <ScrollViewer VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Disabled">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <Border Grid.Row="0"
+                            Background="#13131F"
+                            BorderBrush="#313244"
+                            BorderThickness="0,0,0,1"
+                            Padding="12,4,4,4">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="Image Adjust"
+                                       FontSize="11" FontWeight="SemiBold"
+                                       Foreground="#89B4FA"
+                                       VerticalAlignment="Center"/>
+                            <Button Grid.Column="1"
+                                    Content="✕" FontSize="10"
+                                    Padding="4,2"
+                                    ToolTip="Hide Image Adjust"
+                                    Style="{StaticResource SecondaryButton}"
+                                    Click="BtnHideAdjust_Click"/>
+                        </Grid>
+                    </Border>
+                    <ScrollViewer Grid.Row="1"
+                                  VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled">
                     <StackPanel Margin="12,10,12,12">
-                        <TextBlock Text="Image Adjust"
-                                   FontSize="13" FontWeight="SemiBold"
-                                   Foreground="#CDD6F4" Margin="0,0,0,10"/>
+
+                        <!-- Auto Level -->
+                        <CheckBox x:Name="ChkAutoLevel"
+                                  Content="Auto Level"
+                                  FontSize="12" Foreground="#CDD6F4"
+                                  Checked="AdjAutoLevel_Changed"
+                                  Unchecked="AdjAutoLevel_Changed"
+                                  Margin="0,0,0,8"/>
+
+                        <Rectangle Height="1" Fill="#45475A" Margin="0,0,0,8"/>
 
                         <!-- Brightness -->
                         <TextBlock Text="Brightness" FontSize="11" Foreground="#A6ADC8" Margin="0,0,0,2"/>
@@ -505,8 +581,8 @@
                                 <ColumnDefinition Width="36"/>
                             </Grid.ColumnDefinitions>
                             <Slider x:Name="SliderStroke" Grid.Column="0"
-                                    Minimum="0" Maximum="10" Value="0"
-                                    TickFrequency="0.1" IsSnapToTickEnabled="False"
+                                    Minimum="0" Maximum="2" Value="0"
+                                    TickFrequency="0.05" IsSnapToTickEnabled="True"
                                     ValueChanged="AdjSlider_ValueChanged"
                                     VerticalAlignment="Center"/>
                             <TextBlock x:Name="LblStroke" Grid.Column="1"
@@ -514,30 +590,61 @@
                                        VerticalAlignment="Center" TextAlignment="Right"/>
                         </Grid>
 
-                        <!-- Sharpen -->
-                        <TextBlock Text="Sharpen" FontSize="11" Foreground="#A6ADC8" Margin="0,0,0,2"/>
-                        <Grid Margin="0,0,0,10">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="36"/>
-                            </Grid.ColumnDefinitions>
-                            <Slider x:Name="SliderSharpen" Grid.Column="0"
-                                    Minimum="0" Maximum="5" Value="0"
-                                    TickFrequency="0.5" IsSnapToTickEnabled="False"
-                                    ValueChanged="AdjSlider_ValueChanged"
-                                    VerticalAlignment="Center"/>
-                            <TextBlock x:Name="LblSharpen" Grid.Column="1"
-                                       Text="0.0" FontSize="11" Foreground="#89B4FA"
-                                       VerticalAlignment="Center" TextAlignment="Right"/>
-                        </Grid>
+                        <Rectangle Height="1" Fill="#45475A" Margin="0,0,0,8"/>
 
-                        <!-- Auto Level -->
-                        <CheckBox x:Name="ChkAutoLevel"
-                                  Content="Auto Level"
-                                  FontSize="12" Foreground="#CDD6F4"
-                                  Checked="AdjAutoLevel_Changed"
-                                  Unchecked="AdjAutoLevel_Changed"
-                                  Margin="0,0,0,10"/>
+                        <!-- Unsharp Mask box -->
+                        <Border BorderBrush="#45475A" BorderThickness="1"
+                                CornerRadius="4" Padding="8,6,8,6" Margin="0,0,0,8">
+                            <StackPanel>
+                                <TextBlock Text="Unsharp Mask" FontSize="11" FontWeight="SemiBold"
+                                           Foreground="#A6ADC8" Margin="0,0,0,6"/>
+                                <TextBlock Text="Amount" FontSize="10" Foreground="#7C7F93" Margin="0,0,0,2"/>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="36"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Slider x:Name="SliderUsmAmount" Grid.Column="0"
+                                            Minimum="0" Maximum="3" Value="0"
+                                            TickFrequency="0.1" IsSnapToTickEnabled="False"
+                                            ValueChanged="AdjSlider_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="LblUsmAmount" Grid.Column="1"
+                                               Text="0.0" FontSize="11" Foreground="#89B4FA"
+                                               VerticalAlignment="Center" TextAlignment="Right"/>
+                                </Grid>
+                                <TextBlock Text="Radius" FontSize="10" Foreground="#7C7F93" Margin="0,0,0,2"/>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="36"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Slider x:Name="SliderUsmRadius" Grid.Column="0"
+                                            Minimum="1" Maximum="10" Value="1"
+                                            TickFrequency="1" IsSnapToTickEnabled="True"
+                                            ValueChanged="AdjSlider_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="LblUsmRadius" Grid.Column="1"
+                                               Text="1" FontSize="11" Foreground="#89B4FA"
+                                               VerticalAlignment="Center" TextAlignment="Right"/>
+                                </Grid>
+                                <TextBlock Text="Threshold" FontSize="10" Foreground="#7C7F93" Margin="0,0,0,2"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="36"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Slider x:Name="SliderUsmThreshold" Grid.Column="0"
+                                            Minimum="0" Maximum="30" Value="0"
+                                            TickFrequency="1" IsSnapToTickEnabled="True"
+                                            ValueChanged="AdjSlider_ValueChanged"
+                                            VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="LblUsmThreshold" Grid.Column="1"
+                                               Text="0" FontSize="11" Foreground="#89B4FA"
+                                               VerticalAlignment="Center" TextAlignment="Right"/>
+                                </Grid>
+                            </StackPanel>
+                        </Border>
 
                         <!-- Reset -->
                         <Button Content="Reset"
@@ -560,6 +667,28 @@
                         <Grid Margin="0,0,0,6">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="6"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="BtnAdjApplyOdd"
+                                    Grid.Column="0"
+                                    Content="Apply Odd"
+                                    Style="{StaticResource SecondaryButton}"
+                                    FontSize="11" Padding="4,5"
+                                    IsEnabled="{Binding IsEnabled, ElementName=BtnAdjApplyAll}"
+                                    Click="AdjApplyOdd_Click"/>
+                            <Button x:Name="BtnAdjApplyEven"
+                                    Grid.Column="2"
+                                    Content="Apply Even"
+                                    Style="{StaticResource SecondaryButton}"
+                                    FontSize="11" Padding="4,5"
+                                    IsEnabled="{Binding IsEnabled, ElementName=BtnAdjApplyAll}"
+                                    Click="AdjApplyEven_Click"/>
+                        </Grid>
+
+                        <Grid Margin="0,0,0,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="8"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
@@ -577,16 +706,9 @@
                                     Click="AdjApplyRange_Click"/>
                         </Grid>
 
-                        <Rectangle Height="1" Fill="#313244" Margin="0,6,0,10"/>
-
-                        <Button x:Name="BtnAdjSavePdf"
-                                Content="Save as PDF…"
-                                Style="{StaticResource SecondaryButton}"
-                                FontSize="12" Padding="8,6"
-                                IsEnabled="False"
-                                Click="AdjSavePdf_Click"/>
                     </StackPanel>
-                </ScrollViewer>
+                    </ScrollViewer>
+                </Grid>
             </Border>
 
             <!-- ══════════════ MEMO PANEL ══════════════ -->

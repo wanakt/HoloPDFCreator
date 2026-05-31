@@ -69,8 +69,9 @@ public partial class PDFReaderPage : Page
 
     // ─── Adjust panel state ───────────────────────────────────────────────────
     private bool _suppressAdjSlider;
-    private CancellationTokenSource _liveAdjCts = new();
-    private record AdjSettings(double Brightness, double Contrast, double Stroke, double Sharpen, bool AutoLevel);
+    private bool _adjPanelReady;
+    private System.Windows.Threading.DispatcherTimer? _adjDebounceTimer;
+    private record AdjSettings(double Brightness, double Contrast, double Stroke, double UsmAmount, double UsmRadius, double UsmThreshold, bool AutoLevel);
     private readonly Dictionary<int, AdjSettings> _adjSettings = new();
 
     // ─── Memo state ───────────────────────────────────────────────────────────
@@ -117,6 +118,10 @@ public partial class PDFReaderPage : Page
     private bool    _thumbDragInitiated;
     private int     _thumbDropIndex      = -1;
     private Border? _thumbDropLine;
+    // Maps page index in _editDocument → original image file path (image-only pages).
+    // Used so ReorderThumbPagesAsync can re-draw image pages from source files instead
+    // of copying PDF pages (PDFsharp-WPF AddPage silently drops image XObjects).
+    private readonly Dictionary<int, string> _pageImagePaths = new();
     private static readonly SolidColorBrush ThumbBrushNormal     = Frozen(0x1E, 0x1E, 0x2E);
     private static readonly SolidColorBrush ThumbBrushSelected   = Frozen(0x31, 0x32, 0x44);
     private static readonly SolidColorBrush ThumbBrushHover      = Frozen(0x28, 0x28, 0x3C);
@@ -148,6 +153,7 @@ public partial class PDFReaderPage : Page
     public PDFReaderPage()
     {
         InitializeComponent();
+        _adjPanelReady = true;
         PdfPageBorder.Effect = new System.Windows.Media.Effects.DropShadowEffect
         {
             Color       = System.Windows.Media.Colors.Black,
@@ -161,10 +167,10 @@ public partial class PDFReaderPage : Page
         BookmarkService.Instance.Changed += (_, _) => Dispatcher.Invoke(RefreshBookmarkPanel);
         RefreshBookmarkPanel();
 
-        ThumbPanel.AllowDrop = true;
-        ThumbPanel.DragOver  += ThumbPanel_DragOver;
-        ThumbPanel.DragLeave += ThumbPanel_DragLeave;
-        ThumbPanel.Drop      += ThumbPanel_Drop;
+        ThumbScrollViewer.AllowDrop = true;
+        ThumbScrollViewer.DragOver  += ThumbPanel_DragOver;
+        ThumbScrollViewer.DragLeave += ThumbPanel_DragLeave;
+        ThumbScrollViewer.Drop      += ThumbPanel_Drop;
 
         BookmarkPanel.AllowDrop  = true;
         BookmarkPanel.DragOver  += BmScrollViewer_DragOver;
@@ -250,24 +256,33 @@ public partial class PDFReaderPage : Page
 
     private void RefreshRecentFilesMenu()
     {
-        MenuRecentFiles.Items.Clear();
+        var cm = BtnFile.ContextMenu;
+
+        // Remove previously injected recent-file items.
+        for (int i = cm.Items.Count - 1; i >= 0; i--)
+            if (cm.Items[i] is MenuItem mi && mi.Tag is string) cm.Items.RemoveAt(i);
+
         var recents = RecentFilesService.Load()
                           .Where(File.Exists)
+                          .Take(5)
                           .ToList();
 
-        MenuRecentFiles.IsEnabled = recents.Count > 0;
+        RecentFilesSeparator.Visibility = recents.Count > 0
+            ? Visibility.Visible : Visibility.Collapsed;
 
-        foreach (var path in recents)
+        // Insert recent items after RecentFilesSeparator.
+        int sepIndex = cm.Items.IndexOf(RecentFilesSeparator);
+        for (int i = 0; i < recents.Count; i++)
         {
+            string path = recents[i];
             var item = new MenuItem
             {
-                Header     = System.IO.Path.GetFileName(path),
-                ToolTip    = path,
-                Tag        = path,
-                Foreground = System.Windows.Media.Brushes.Black,
+                Header  = $"_{i + 1}  {System.IO.Path.GetFileName(path)}",
+                Tag     = path,
+                ToolTip = path,
             };
             item.Click += (_, _) => _ = LoadPdfAsync((string)((MenuItem)item).Tag);
-            MenuRecentFiles.Items.Add(item);
+            cm.Items.Insert(sepIndex + 1 + i, item);
         }
     }
 
@@ -365,6 +380,10 @@ public partial class PDFReaderPage : Page
         }
 
         await LoadPdfAsync(tmpPath);
+
+        // LoadPdfAsync cleared _pageImagePaths; now restore image-path mapping.
+        for (int i = 0; i < _imageFiles.Count; i++)
+            _pageImagePaths[i] = _imageFiles[i];
     }
 
     private void CleanupTempImagePdf()
@@ -391,13 +410,14 @@ public partial class PDFReaderPage : Page
         if (pdf is not null) await LoadPdfAsync(pdf);
     }
 
-    private async Task LoadPdfAsync(string filePath)
+    public async Task LoadPdfAsync(string filePath)
     {
         if (filePath != _tempImagePdfPath)
         {
             _imageFiles.Clear();
             CleanupTempImagePdf();
         }
+        _pageImagePaths.Clear();
         // A new PDF load invalidates any prior edit-temp (rotation etc.).
         // Don't clean up if _tempEditedPath IS the file being loaded (that would delete it mid-load).
         if (filePath != _tempEditedPath)
@@ -1270,9 +1290,15 @@ public partial class PDFReaderPage : Page
     //  Rendering + Text Overlay
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private async Task RenderCurrentPageAsync()
+    private async Task RenderCurrentPageAsync(bool preserveScroll = false)
     {
         if (_renderDocument is null) return;
+
+        // Capture local scroll offset (relative to page top) before layout changes.
+        double savedLocalOffset = preserveScroll
+            ? Math.Max(0, PdfScrollViewer.VerticalOffset - PrevPagesPanel.ActualHeight)
+            : 0;
+
         LoadAdjSettingsForPage((int)_currentPage);
         SetStatus("Rendering…");
 
@@ -1300,13 +1326,24 @@ public partial class PDFReaderPage : Page
             pdfBmp.Freeze();
             displaySrc = pdfBmp;
 
-            var overrideImg = AdjustedStore?.Get((int)_currentPage);
-            var finalSrc    = overrideImg ?? displaySrc;
+            BitmapSource finalSrc = displaySrc;
+            if (_adjSettings.TryGetValue((int)_currentPage, out var adjS))
+            {
+                using var drawBmp = BitmapSourceToDrawingBitmap(displaySrc);
+                var adjusted = AdjApplySettingsFrom(drawBmp, adjS);
+                finalSrc = BitmapToBitmapImage(adjusted);
+                adjusted.Dispose();
+                AdjustedStore?.Set((int)_currentPage, (BitmapImage)finalSrc);
+            }
+            else
+            {
+                AdjustedStore?.Remove((int)_currentPage);
+            }
 
             PdfPageImage.Source  = finalSrc;
-            PdfPageImage.Width   = double.NaN;
+            PdfPageImage.Width   = RenderBaseWidth * _zoomLevel;
             PdfPageImage.Height  = double.NaN;
-            PdfPageImage.Stretch = Stretch.None;
+            PdfPageImage.Stretch = Stretch.Uniform;
 
             // Clear stale previews while new page renders.
             PrevPagesPanel.Children.Clear();
@@ -1321,11 +1358,11 @@ public partial class PDFReaderPage : Page
             // Pre-render prev pages (await so PrevPagesPanel.ActualHeight is ready for scroll offset).
             await RenderPrevPagesAsync(dispH);
 
-            // Place scroll so current page top is at viewport top.
+            // Place scroll: preserve position for adjust re-renders, go to page top otherwise.
             await Dispatcher.InvokeAsync(() =>
             {
                 double prevH = PrevPagesPanel.ActualHeight;
-                PdfScrollViewer.ScrollToVerticalOffset(prevH);
+                PdfScrollViewer.ScrollToVerticalOffset(prevH + savedLocalOffset);
                 if (!_pageTransitioning)
                     UpdateGlobalScrollBar();
             }, System.Windows.Threading.DispatcherPriority.Render);
@@ -1383,7 +1420,9 @@ public partial class PDFReaderPage : Page
         var img = new System.Windows.Controls.Image
         {
             Source  = finalSrc2,
-            Stretch = System.Windows.Media.Stretch.None
+            Width   = RenderBaseWidth * _zoomLevel,
+            Height  = double.NaN,
+            Stretch = System.Windows.Media.Stretch.Uniform
         };
         RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
         return img;
@@ -2775,24 +2814,71 @@ public partial class PDFReaderPage : Page
     {
         bool open = AdjustPanelCol.Width.Value < 1;
         AdjustPanelCol.Width = open ? new GridLength(240) : new GridLength(0);
-        BtnToggleAdjust.Style = (Style)FindResource(open ? "PrimaryButton" : "SecondaryButton");
         if (open) UpdateAdjustButtons();
     }
+
+    // ─── View menu & panel close buttons ─────────────────────────────────────
+
+    private void BtnView_Click(object sender, RoutedEventArgs e)
+    {
+        ViewContextMenu.PlacementTarget = BtnView;
+        ViewContextMenu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+        ViewContextMenu.IsOpen = true;
+    }
+
+    private void SetBookmarkPanel(bool visible)
+    {
+        BookmarkPanelCol.Width       = visible ? new GridLength(240) : new GridLength(0);
+        MenuViewBookmarks.IsChecked  = visible;
+    }
+
+    private void SetPagesPanel(bool visible)
+    {
+        PagesPanelCol.Width    = visible ? new GridLength(150) : new GridLength(0);
+        PagesSplitterCol.Width = visible ? new GridLength(5)   : new GridLength(0);
+        MenuViewPages.IsChecked = visible;
+    }
+
+    private void SetAdjustPanel(bool visible)
+    {
+        AdjustPanelCol.Width       = visible ? new GridLength(240) : new GridLength(0);
+        MenuViewAdjust.IsChecked   = visible;
+        if (visible) UpdateAdjustButtons();
+    }
+
+    private void MenuViewBookmarks_Click(object sender, RoutedEventArgs e)
+        => SetBookmarkPanel(MenuViewBookmarks.IsChecked);
+
+    private void MenuViewPages_Click(object sender, RoutedEventArgs e)
+        => SetPagesPanel(MenuViewPages.IsChecked);
+
+    private void MenuViewAdjust_Click(object sender, RoutedEventArgs e)
+        => SetAdjustPanel(MenuViewAdjust.IsChecked);
+
+    private void BtnHideBookmarks_Click(object sender, RoutedEventArgs e)
+        => SetBookmarkPanel(false);
+
+    private void BtnHidePages_Click(object sender, RoutedEventArgs e)
+        => SetPagesPanel(false);
+
+    private void BtnHideAdjust_Click(object sender, RoutedEventArgs e)
+        => SetAdjustPanel(false);
 
     private void UpdateAdjustButtons()
     {
         bool hasPdf = _renderDocument != null;
         BtnAdjApplyAll.IsEnabled = hasPdf;
-        BtnAdjSavePdf.IsEnabled  = hasPdf && AdjustedStore != null && AdjustedStore.HasAny;
     }
 
     private void AdjSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
-        if (_suppressAdjSlider) return;
-        LblBrightness.Text = ((int)SliderBrightness.Value).ToString();
-        LblContrast.Text   = ((int)SliderContrast.Value).ToString();
-        LblStroke.Text     = SliderStroke.Value.ToString("F1");
-        LblSharpen.Text    = SliderSharpen.Value.ToString("F1");
+        if (_suppressAdjSlider || !_adjPanelReady) return;
+        LblBrightness.Text  = ((int)SliderBrightness.Value).ToString();
+        LblContrast.Text    = ((int)SliderContrast.Value).ToString();
+        LblStroke.Text      = SliderStroke.Value.ToString("F1");
+        LblUsmAmount.Text   = SliderUsmAmount.Value.ToString("F1");
+        LblUsmRadius.Text   = ((int)SliderUsmRadius.Value).ToString();
+        LblUsmThreshold.Text = ((int)SliderUsmThreshold.Value).ToString();
         SaveCurrentAdjSettings();
         TriggerLiveAdjust();
     }
@@ -2810,7 +2896,8 @@ public partial class PDFReaderPage : Page
     {
         _adjSettings[page] = new AdjSettings(
             SliderBrightness.Value, SliderContrast.Value,
-            SliderStroke.Value, SliderSharpen.Value,
+            SliderStroke.Value, SliderUsmAmount.Value,
+            SliderUsmRadius.Value, SliderUsmThreshold.Value,
             ChkAutoLevel.IsChecked == true);
     }
 
@@ -2819,53 +2906,59 @@ public partial class PDFReaderPage : Page
         _suppressAdjSlider = true;
         if (page >= 0 && _adjSettings.TryGetValue(page, out var s))
         {
-            SliderBrightness.Value = s.Brightness;
-            SliderContrast.Value   = s.Contrast;
-            SliderStroke.Value     = s.Stroke;
-            SliderSharpen.Value    = s.Sharpen;
-            ChkAutoLevel.IsChecked = s.AutoLevel;
+            SliderBrightness.Value   = s.Brightness;
+            SliderContrast.Value     = s.Contrast;
+            SliderStroke.Value       = s.Stroke;
+            SliderUsmAmount.Value    = s.UsmAmount;
+            SliderUsmRadius.Value    = s.UsmRadius;
+            SliderUsmThreshold.Value = s.UsmThreshold;
+            ChkAutoLevel.IsChecked   = s.AutoLevel;
         }
         else
         {
-            SliderBrightness.Value = 0;
-            SliderContrast.Value   = 0;
-            SliderStroke.Value     = 0;
-            SliderSharpen.Value    = 0;
-            ChkAutoLevel.IsChecked = false;
+            SliderBrightness.Value   = 0;
+            SliderContrast.Value     = 0;
+            SliderStroke.Value       = 0;
+            SliderUsmAmount.Value    = 0;
+            SliderUsmRadius.Value    = 1;
+            SliderUsmThreshold.Value = 0;
+            ChkAutoLevel.IsChecked   = false;
         }
         _suppressAdjSlider = false;
-        LblBrightness.Text = ((int)SliderBrightness.Value).ToString();
-        LblContrast.Text   = ((int)SliderContrast.Value).ToString();
-        LblStroke.Text     = SliderStroke.Value.ToString("F1");
-        LblSharpen.Text    = SliderSharpen.Value.ToString("F1");
+        LblBrightness.Text   = ((int)SliderBrightness.Value).ToString();
+        LblContrast.Text     = ((int)SliderContrast.Value).ToString();
+        LblStroke.Text       = SliderStroke.Value.ToString("F1");
+        LblUsmAmount.Text    = SliderUsmAmount.Value.ToString("F1");
+        LblUsmRadius.Text    = ((int)SliderUsmRadius.Value).ToString();
+        LblUsmThreshold.Text = ((int)SliderUsmThreshold.Value).ToString();
     }
 
     private void TriggerLiveAdjust()
     {
-        if (_renderDocument == null || AdjustedStore == null) return;
-        _liveAdjCts.Cancel();
-        _liveAdjCts = new CancellationTokenSource();
-        var ct = _liveAdjCts.Token;
-        _ = Task.Delay(350, ct).ContinueWith(
-            _ => Dispatcher.InvokeAsync(() => _ = ApplyAdjustToCurrentAsync()),
-            ct, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
+        if (_renderDocument == null) return;
+        _adjDebounceTimer?.Stop();
+        _adjDebounceTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(350)
+        };
+        _adjDebounceTimer.Tick += async (_, _) =>
+        {
+            _adjDebounceTimer!.Stop();
+            await ApplyAdjustToCurrentAsync();
+        };
+        _adjDebounceTimer.Start();
     }
 
     private async Task ApplyAdjustToCurrentAsync()
     {
-        if (_renderDocument == null || AdjustedStore == null) return;
-        var bmp = await RenderPageToBitmapAsync((int)_currentPage);
-        if (bmp == null) return;
-        var adjusted = AdjApplySettings(bmp);
-        bmp.Dispose();
-        var wpfImg = BitmapToBitmapImage(adjusted);
-        adjusted.Dispose();
-        AdjustedStore.Set((int)_currentPage, wpfImg);
-        // Set image directly — avoids re-rendering from PDF which causes flickering
-        PdfPageImage.Source = wpfImg;
-        if ((int)_currentPage < _thumbItems.Count)
-            _thumbItems[(int)_currentPage].Img.Source = wpfImg;
-        BtnAdjSavePdf.IsEnabled = true;
+        if (_renderDocument == null) return;
+        await RenderCurrentPageAsync(preserveScroll: true);
+        if ((int)_currentPage < _thumbItems.Count && AdjustedStore != null)
+        {
+            var img = AdjustedStore.Get((int)_currentPage);
+            if (img != null) _thumbItems[(int)_currentPage].Img.Source = img;
+        }
+
     }
 
     private void AdjReset_Click(object sender, RoutedEventArgs e)
@@ -2874,16 +2967,20 @@ public partial class PDFReaderPage : Page
         AdjustedStore?.Remove((int)_currentPage);
 
         _suppressAdjSlider = true;
-        SliderBrightness.Value = 0;
-        SliderContrast.Value   = 0;
-        SliderStroke.Value     = 0;
-        SliderSharpen.Value    = 0;
-        ChkAutoLevel.IsChecked = false;
+        SliderBrightness.Value   = 0;
+        SliderContrast.Value     = 0;
+        SliderStroke.Value       = 0;
+        SliderUsmAmount.Value    = 0;
+        SliderUsmRadius.Value    = 1;
+        SliderUsmThreshold.Value = 0;
+        ChkAutoLevel.IsChecked   = false;
         _suppressAdjSlider = false;
-        LblBrightness.Text = "0";
-        LblContrast.Text   = "0";
-        LblStroke.Text     = "0.0";
-        LblSharpen.Text    = "0.0";
+        LblBrightness.Text   = "0";
+        LblContrast.Text     = "0";
+        LblStroke.Text       = "0.0";
+        LblUsmAmount.Text    = "0.0";
+        LblUsmRadius.Text    = "1";
+        LblUsmThreshold.Text = "0";
 
         _ = RenderCurrentPageAsync();
         _ = ResetThumbnailForPageAsync((int)_currentPage);
@@ -2913,7 +3010,7 @@ public partial class PDFReaderPage : Page
         finally { win.Close(); }
         if (!cancelled)
             await RefreshWithAdjustedImagesAsync();
-        BtnAdjSavePdf.IsEnabled = true;
+
     }
 
     private async void AdjApplyRange_Click(object sender, RoutedEventArgs e)
@@ -2941,7 +3038,46 @@ public partial class PDFReaderPage : Page
         }
         finally { win.Close(); }
         await RefreshWithAdjustedImagesAsync();
-        BtnAdjSavePdf.IsEnabled = true;
+
+    }
+
+    private async void AdjApplyOdd_Click(object sender, RoutedEventArgs e)
+        => await AdjApplyByParityAsync(odd: true);
+
+    private async void AdjApplyEven_Click(object sender, RoutedEventArgs e)
+        => await AdjApplyByParityAsync(odd: false);
+
+    private async Task AdjApplyByParityAsync(bool odd)
+    {
+        if (_renderDocument == null || AdjustedStore == null) return;
+        // Page indices are 0-based; odd pages = index 0,2,4… (page numbers 1,3,5…)
+        var indices = Enumerable.Range(0, (int)_totalPages)
+                                .Where(i => odd ? (i % 2 == 0) : (i % 2 == 1))
+                                .ToList();
+        string label = odd ? "홀수" : "짝수";
+        var win = new ProgressWindow($"{label} 페이지 ({indices.Count}장) 적용 중…") { Owner = Window.GetWindow(this) };
+        win.Show();
+        bool cancelled = false;
+        try
+        {
+            for (int n = 0; n < indices.Count; n++)
+            {
+                if (win.IsCancelled) { cancelled = true; break; }
+                int i = indices[n];
+                win.Update(n + 1, indices.Count, $"Page {i + 1} / {_totalPages}…");
+                var bmp = await RenderPageToBitmapAsync(i);
+                if (bmp == null) continue;
+                var adjusted = AdjApplySettings(bmp);
+                bmp.Dispose();
+                AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
+                adjusted.Dispose();
+                SaveCurrentAdjSettings(i);
+            }
+        }
+        finally { win.Close(); }
+        if (!cancelled)
+            await RefreshWithAdjustedImagesAsync();
+
     }
 
     private async Task ResetThumbnailForPageAsync(int pageIndex)
@@ -2973,94 +3109,12 @@ public partial class PDFReaderPage : Page
         _adjSettings.Clear();
         AdjustedStore?.Clear();
         LoadAdjSettingsForPage(-1); // resets sliders to 0
-        BtnAdjSavePdf.IsEnabled = false;
+
         RefreshAdjustedThumbnails(); // will find nothing in store, so no-op; thumbnails reset by re-render
         _ = RenderCurrentPageAsync();
         _ = RenderThumbnailsAsync(_thumbCts.Token);
     }
 
-    private async void AdjSavePdf_Click(object sender, RoutedEventArgs e)
-    {
-        if (_renderDocument == null || AdjustedStore == null) return;
-        string? sourcePath = EffectiveFilePath;
-
-        var dlg = new SaveFileDialog { Title = "Save adjusted PDF", Filter = "PDF|*.pdf", DefaultExt = ".pdf" };
-        if (dlg.ShowDialog() != true) return;
-        string outputPath = dlg.FileName;
-
-        var win = new ProgressWindow("Saving PDF…") { Owner = Window.GetWindow(this) };
-        win.Show();
-        bool success = false;
-        try
-        {
-            int total = (int)_totalPages;
-
-            // Step 1 (UI thread): collect images — render any pages not yet in the adjusted store.
-            var images = new BitmapImage?[total];
-            for (int i = 0; i < total; i++)
-            {
-                win.Update(i + 1, total * 3, $"Collecting page {i + 1} / {total}…");
-                images[i] = AdjustedStore.Get(i);
-                if (images[i] == null)
-                {
-                    var bmp = await RenderPageToBitmapAsync(i);
-                    if (bmp != null) { images[i] = BitmapToBitmapImage(bmp); bmp.Dispose(); }
-                }
-            }
-
-            // Step 2 (background thread): PNG-encode images, build PdfSharp document,
-            // copy metadata from the source, then save.
-            // Progress is dispatched back to the UI thread so the ProgressBar can animate.
-            var dispatcher = Dispatcher;
-            await Task.Run(() =>
-            {
-                void Report(int cur, int tot, string msg) =>
-                    dispatcher.Invoke(() => win.Update(cur, tot, msg));
-
-                var outDoc = new PdfDocument();
-
-                for (int i = 0; i < total; i++)
-                {
-                    Report(total + i + 1, total * 3, $"Building page {i + 1} / {total}…");
-                    var img = images[i];
-                    if (img == null) continue;
-
-                    double ptW = img.PixelWidth  * 72.0 / img.DpiX;
-                    double ptH = img.PixelHeight * 72.0 / img.DpiY;
-
-                    var page = outDoc.AddPage();
-                    page.Width  = XUnit.FromPoint(ptW);
-                    page.Height = XUnit.FromPoint(ptH);
-
-                    using var gfx = XGraphics.FromPdfPage(page);
-                    var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
-                    encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(img));
-                    using var ms = new MemoryStream();
-                    encoder.Save(ms);
-                    ms.Position = 0;
-                    var xImg = XImage.FromStream(ms);
-                    gfx.DrawImage(xImg, 0, 0, ptW, ptH);
-                }
-
-                if (sourcePath != null)
-                {
-                    Report(total * 3, total * 3, "Copying text / bookmarks…");
-                    PdfMetaCopier.CopyMeta(sourcePath, outDoc);
-                }
-
-                outDoc.Save(outputPath);
-            });
-
-            success = true;
-        }
-        finally { win.Close(); }
-
-        if (success)
-        {
-            ResetAllAdjustments();
-            await LoadPdfAsync(outputPath);
-        }
-    }
 
     private async Task<System.Drawing.Bitmap?> RenderPageToBitmapAsync(int pageIndex)
     {
@@ -3080,26 +3134,45 @@ public partial class PDFReaderPage : Page
         catch { return null; }
     }
 
+    // Called during live-edit (reads from UI sliders).
     private System.Drawing.Bitmap AdjApplySettings(System.Drawing.Bitmap src)
     {
-        float brightness = (float)SliderBrightness.Value / 100f;
-        float contrast   = (float)SliderContrast.Value   / 100f;
-        bool  autoLevel  = ChkAutoLevel.IsChecked == true;
-        float stroke     = (float)SliderStroke.Value;
-        float sharpen    = (float)SliderSharpen.Value;
+        var s = new AdjSettings(
+            SliderBrightness.Value, SliderContrast.Value, SliderStroke.Value,
+            SliderUsmAmount.Value, SliderUsmRadius.Value, SliderUsmThreshold.Value,
+            ChkAutoLevel.IsChecked == true);
+        return AdjApplySettingsFrom(src, s);
+    }
+
+    // Called from RenderCurrentPageAsync (uses stored record, not UI sliders).
+    private static System.Drawing.Bitmap AdjApplySettingsFrom(System.Drawing.Bitmap src, AdjSettings s)
+    {
+        float brightness   = (float)s.Brightness / 100f;
+        float contrast     = (float)s.Contrast   / 100f;
+        bool  autoLevel    = s.AutoLevel;
+        float stroke       = (float)s.Stroke;
+        float usmAmount    = (float)s.UsmAmount;
+        int   usmRadius    = (int)s.UsmRadius;
+        int   usmThreshold = (int)s.UsmThreshold;
 
         var result = src;
-        if (Math.Abs(brightness) > 0.001f)  { var t = ImageProcessingService.AdjustBrightness(result, brightness); if (result != src) result.Dispose(); result = t; }
-        if (Math.Abs(contrast)   > 0.001f)  { var t = ImageProcessingService.AdjustContrast(result, contrast);     if (result != src) result.Dispose(); result = t; }
-        if (autoLevel)                       { var t = ImageProcessingService.AutoLevel(result);                    if (result != src) result.Dispose(); result = t; }
-        if (stroke > 0.01f)                  { var t = ImageProcessingService.ThickenStrokes(result, stroke);       if (result != src) result.Dispose(); result = t; }
-        if (sharpen > 0.01f)                 { var t = ImageProcessingService.Sharpen(result, sharpen);             if (result != src) result.Dispose(); result = t; }
-        if (result == src)
-        {
-            var copy = new System.Drawing.Bitmap(src);
-            return copy;
-        }
+        if (Math.Abs(brightness) > 0.001f)  { var t = ImageProcessingService.AdjustBrightness(result, brightness);                     if (result != src) result.Dispose(); result = t; }
+        if (Math.Abs(contrast)   > 0.001f)  { var t = ImageProcessingService.AdjustContrast(result, contrast);                         if (result != src) result.Dispose(); result = t; }
+        if (autoLevel)                       { var t = ImageProcessingService.AutoLevel(result);                                         if (result != src) result.Dispose(); result = t; }
+        if (stroke > 0.01f)                  { var t = ImageProcessingService.ThickenStrokes(result, stroke);                           if (result != src) result.Dispose(); result = t; }
+        if (usmAmount > 0.01f)               { var t = ImageProcessingService.UnsharpMask(result, usmAmount, usmRadius, usmThreshold);  if (result != src) result.Dispose(); result = t; }
+        if (result == src) return new System.Drawing.Bitmap(src);
         return result;
+    }
+
+    private static System.Drawing.Bitmap BitmapSourceToDrawingBitmap(BitmapSource source)
+    {
+        using var ms = new MemoryStream();
+        var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+        encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(source));
+        encoder.Save(ms);
+        ms.Position = 0;
+        return new System.Drawing.Bitmap(ms);
     }
 
     private static BitmapImage BitmapToBitmapImage(System.Drawing.Bitmap bmp)
@@ -4127,8 +4200,6 @@ public partial class PDFReaderPage : Page
         _thumbSelectedPages.Clear();
         _thumbLastClickedPage = -1;
         ThumbPanel.Children.Clear();
-        BtnThumbDeletePages.IsEnabled = false;
-
         if (_renderDocument == null) return;
         if (_totalPages == 0) return;
 
@@ -4165,13 +4236,26 @@ public partial class PDFReaderPage : Page
                 BorderThickness = new Thickness(2),
                 CornerRadius    = new CornerRadius(4),
                 Padding         = new Thickness(2),
-                Margin          = new Thickness(0, 0, 0, 4),
+                Margin          = new Thickness(2, 0, 2, 4),
                 Cursor          = Cursors.Hand,
                 Child           = stack
             };
 
-            // Context menu for deletion
+            // Context menu
             var ctxMenu = new ContextMenu();
+            var insertImgItem = new MenuItem { Header = "이미지 삽입…" };
+            insertImgItem.Click += (_, _) => InsertImagesAfterPage((int)capturedPage);
+            ctxMenu.Items.Add(insertImgItem);
+            ctxMenu.Items.Add(new Separator());
+            var extractImgItem = new MenuItem { Header = "이미지로 추출…" };
+            extractImgItem.Click += async (_, _) =>
+                await ExtractPagesToImagesAsync(_thumbSelectedPages.OrderBy(x => x).ToArray());
+            ctxMenu.Items.Add(extractImgItem);
+            var extractPdfItem = new MenuItem { Header = "PDF로 추출…" };
+            extractPdfItem.Click += async (_, _) =>
+                await ExtractPagesToPdfAsync(_thumbSelectedPages.OrderBy(x => x).ToArray());
+            ctxMenu.Items.Add(extractPdfItem);
+            ctxMenu.Items.Add(new Separator());
             var deleteItem = new MenuItem { Header = "선택 페이지 삭제" };
             deleteItem.Click += async (_, _) => await DeleteSelectedPagesAsync();
             ctxMenu.Items.Add(deleteItem);
@@ -4185,7 +4269,10 @@ public partial class PDFReaderPage : Page
                     _thumbLastClickedPage = (int)capturedPage;
                     UpdateThumbSelectionBorders();
                 }
-                deleteItem.Header = $"선택 페이지 삭제 ({_thumbSelectedPages.Count}페이지)";
+                int n = _thumbSelectedPages.Count;
+                extractImgItem.Header = $"이미지로 추출… ({n}페이지)";
+                extractPdfItem.Header = $"PDF로 추출… ({n}페이지)";
+                deleteItem.Header     = $"선택 페이지 삭제 ({n}페이지)";
             };
             container.ContextMenu = ctxMenu;
 
@@ -4204,7 +4291,7 @@ public partial class PDFReaderPage : Page
                 _thumbDragInitiated  = false;
                 container.CaptureMouse();
             };
-            container.MouseMove += (_, e) =>
+            container.PreviewMouseMove += (_, e) =>
             {
                 if (_thumbDragSourcePage < 0 || e.LeftButton != MouseButtonState.Pressed) return;
                 Point pos = e.GetPosition(ThumbPanel);
@@ -4339,11 +4426,162 @@ public partial class PDFReaderPage : Page
             _thumbItems[i].Container.BorderThickness = new Thickness(marked ? 2 : 0);
             _thumbItems[i].Container.Padding         = new Thickness(marked ? 2 : 4);
         }
-        BtnThumbDeletePages.IsEnabled = _thumbSelectedPages.Count > 0;
     }
 
-    private void BtnThumbDeletePages_Click(object sender, RoutedEventArgs e)
-        => _ = DeleteSelectedPagesAsync();
+    // ─── Page extraction ─────────────────────────────────────────────────────
+
+    private async Task ExtractPagesToImagesAsync(int[] pageIndices)
+    {
+        if (_renderDocument == null || pageIndices.Length == 0) return;
+
+        if (pageIndices.Length == 1)
+        {
+            var dlg = new SaveFileDialog
+            {
+                Filter   = "PNG 이미지|*.png|JPEG 이미지|*.jpg",
+                Title    = "이미지로 저장",
+                FileName = $"page_{pageIndices[0] + 1:D3}"
+            };
+            if (dlg.ShowDialog() != true) return;
+            await RenderPageToImageFileAsync((uint)pageIndices[0], dlg.FileName);
+            SetStatus($"저장 완료: {System.IO.Path.GetFileName(dlg.FileName)}");
+        }
+        else
+        {
+            var dlg = new Microsoft.Win32.OpenFolderDialog
+            {
+                Title      = "이미지를 저장할 폴더 선택",
+                Multiselect = false
+            };
+            if (dlg.ShowDialog() != true) return;
+            string folder = dlg.FolderName;
+
+            var win = new ProgressWindow("이미지 추출 중…") { Owner = Window.GetWindow(this) };
+            win.Show();
+            try
+            {
+                for (int i = 0; i < pageIndices.Length; i++)
+                {
+                    if (win.IsCancelled) break;
+                    win.Update(i + 1, pageIndices.Length, $"페이지 {pageIndices[i] + 1} 추출 중…");
+                    string outPath = System.IO.Path.Combine(folder, $"page_{pageIndices[i] + 1:D3}.png");
+                    await RenderPageToImageFileAsync((uint)pageIndices[i], outPath);
+                }
+            }
+            finally { win.Close(); }
+            SetStatus($"이미지 {pageIndices.Length}개 저장 완료 → {folder}");
+        }
+    }
+
+    private async Task RenderPageToImageFileAsync(uint pageIndex, string filePath)
+    {
+        using var pdfPage = _renderDocument!.GetPage(pageIndex);
+        uint destWidth = (uint)(pdfPage.Size.Width * 150.0 / 72.0);  // 150 DPI
+
+        using var ras = new Windows.Storage.Streams.InMemoryRandomAccessStream();
+        await pdfPage.RenderToStreamAsync(ras,
+            new Windows.Data.Pdf.PdfPageRenderOptions { DestinationWidth = destWidth });
+        ras.Seek(0);
+
+        var ms = new MemoryStream();
+        await ras.AsStream().CopyToAsync(ms);
+        ms.Position = 0;
+
+        var bi = new BitmapImage();
+        bi.BeginInit();
+        bi.StreamSource = ms;
+        bi.CacheOption  = BitmapCacheOption.OnLoad;
+        bi.EndInit();
+        bi.Freeze();
+
+        BitmapEncoder enc = System.IO.Path.GetExtension(filePath).Equals(".jpg", StringComparison.OrdinalIgnoreCase)
+            ? new JpegBitmapEncoder { QualityLevel = 95 }
+            : new PngBitmapEncoder();
+        enc.Frames.Add(BitmapFrame.Create(bi));
+        using var fs = File.OpenWrite(filePath);
+        enc.Save(fs);
+    }
+
+    private async Task ExtractPagesToPdfAsync(int[] pageIndices)
+    {
+        if (_editDocument == null || pageIndices.Length == 0) return;
+
+        var dlg = new SaveFileDialog
+        {
+            Filter   = "PDF 파일|*.pdf",
+            Title    = "PDF로 추출",
+            FileName = "extracted"
+        };
+        if (dlg.ShowDialog() != true) return;
+        string outPath = dlg.FileName;
+
+        // Pre-load image bytes for image pages (async I/O before PDF work)
+        var imageCache = new Dictionary<int, byte[]>();
+        foreach (int pi in pageIndices)
+        {
+            if (_pageImagePaths.TryGetValue(pi, out string? imgPath))
+            {
+                string cap = imgPath;
+                imageCache[pi] = await Task.Run(() => File.ReadAllBytes(cap));
+            }
+        }
+
+        string srcPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                             System.IO.Path.GetRandomFileName() + ".pdf");
+        var imgResources = new List<(MemoryStream Ms, XImage XImg)>();
+        try
+        {
+            byte[] srcBytes = _editPdfBytes ?? throw new InvalidOperationException("편집 문서 바이트가 없습니다.");
+            File.WriteAllBytes(srcPath, srcBytes);
+
+            using (var srcDoc = PdfReader.Open(srcPath, PdfDocumentOpenMode.Import))
+            {
+                var outDoc = new PdfDocument();
+                foreach (int pi in pageIndices)
+                {
+                    if (imageCache.TryGetValue(pi, out byte[]? imgBytes))
+                    {
+                        var (pngMs, xImg, ptW, ptH) = ImageBytesToXImage(imgBytes);
+                        imgResources.Add((pngMs, xImg));
+                        var page = outDoc.AddPage();
+                        page.Width  = XUnit.FromPoint(ptW);
+                        page.Height = XUnit.FromPoint(ptH);
+                        using var gfx = XGraphics.FromPdfPage(page);
+                        gfx.DrawImage(xImg, 0, 0, ptW, ptH);
+                    }
+                    else
+                    {
+                        outDoc.AddPage(srcDoc.Pages[pi]);
+                    }
+                }
+                outDoc.Save(outPath);
+                outDoc.Dispose();
+            }
+            foreach (var (ms, x) in imgResources) { x.Dispose(); ms.Dispose(); }
+            imgResources.Clear();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"PDF 추출 중 오류:\n{ex.Message}", "오류",
+                            MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+        finally
+        {
+            foreach (var (ms, x) in imgResources) { try { x.Dispose(); ms.Dispose(); } catch { } }
+            try { File.Delete(srcPath); } catch { }
+        }
+
+        SetStatus("PDF 추출 완료. 새 창으로 엽니다…");
+        string exePath = Environment.ProcessPath
+                         ?? System.Diagnostics.Process.GetCurrentProcess().MainModule!.FileName;
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName        = exePath,
+            Arguments       = $"\"{outPath}\"",
+            UseShellExecute = false
+        });
+    }
 
     private async Task DeleteSelectedPagesAsync()
     {
@@ -4382,13 +4620,110 @@ public partial class PDFReaderPage : Page
         SetStatus($"삭제 완료. 남은 페이지: {_editDocument.Pages.Count}");
     }
 
+    // ─── Insert images into PDF ──────────────────────────────────────────────
+
+    private void InsertImagesAfterPage(int afterPageIndex)
+    {
+        if (_editDocument is null) return;
+
+        var dlg = new OpenFileDialog
+        {
+            Filter      = "Image Files|*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.tif;*.gif|All Files|*.*",
+            Title       = "삽입할 이미지 선택",
+            Multiselect = true
+        };
+        if (dlg.ShowDialog() != true || dlg.FileNames.Length == 0) return;
+
+        _ = InsertImagesAfterPageAsync(afterPageIndex, dlg.FileNames);
+    }
+
+    private async Task InsertImagesAfterPageAsync(int afterPageIndex, string[] imagePaths)
+    {
+        if (_editDocument is null) return;
+
+        var win = new ProgressWindow($"이미지 삽입 중…") { Owner = Window.GetWindow(this) };
+        win.Show();
+        bool cancelled = false;
+
+        // Both MemoryStream and XImage must stay alive until after ReloadRenderDocumentAsync
+        // calls Save() — PDFsharp encodes image data lazily at Save time, not at DrawImage time.
+        var resources = new List<(MemoryStream Ms, XImage XImg)>();
+        int insertAt      = Math.Max(0, afterPageIndex + 1);
+        int insertedCount = 0;
+        try
+        {
+            for (int i = 0; i < imagePaths.Length; i++)
+            {
+                if (win.IsCancelled) { cancelled = true; break; }
+                win.Update(i + 1, imagePaths.Length, $"이미지 {i + 1} / {imagePaths.Length}…");
+
+                string path = imagePaths[i];
+                byte[] imgBytes = await Task.Run(() => File.ReadAllBytes(path));
+                var (pngMs, xImg, ptW, ptH) = ImageBytesToXImage(imgBytes);
+                resources.Add((pngMs, xImg));
+
+                var newPage = _editDocument.InsertPage(insertAt + i);
+                newPage.Width  = XUnit.FromPoint(ptW);
+                newPage.Height = XUnit.FromPoint(ptH);
+
+                using var gfx = XGraphics.FromPdfPage(newPage);
+                gfx.DrawImage(xImg, 0, 0, ptW, ptH);
+                insertedCount++;
+            }
+        }
+        catch (Exception ex)
+        {
+            win.Close();
+            foreach (var (ms, x) in resources) { x.Dispose(); ms.Dispose(); }
+            MessageBox.Show($"이미지 삽입 중 오류:\n{ex.Message}", "오류",
+                            MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+        finally { win.Close(); }
+
+        if (cancelled)
+        {
+            foreach (var (ms, x) in resources) { x.Dispose(); ms.Dispose(); }
+            return;
+        }
+
+        // Shift existing page-image entries to make room, then record the new paths.
+        var shifted = new Dictionary<int, string>();
+        foreach (var kv in _pageImagePaths)
+            shifted[kv.Key >= insertAt ? kv.Key + insertedCount : kv.Key] = kv.Value;
+        _pageImagePaths.Clear();
+        foreach (var kv in shifted) _pageImagePaths[kv.Key] = kv.Value;
+        for (int i = 0; i < insertedCount; i++)
+            _pageImagePaths[insertAt + i] = imagePaths[i];
+
+        _currentPage = (uint)Math.Min((int)_currentPage, _editDocument.Pages.Count - 1);
+        SetStatus("이미지 삽입 중…");
+        await ReloadRenderDocumentAsync();   // _editDocument.Save() runs here — resources alive
+        foreach (var (ms, x) in resources) { x.Dispose(); ms.Dispose(); }
+        StartThumbnailGeneration();
+        SetStatus($"이미지 삽입 완료. 총 {_editDocument.Pages.Count}페이지");
+    }
+
     // ─── Thumbnail drag-reorder ───────────────────────────────────────────────
 
     private void ThumbPanel_DragOver(object sender, DragEventArgs e)
     {
-        if (!e.Data.GetDataPresent("ThumbPages")) { e.Effects = DragDropEffects.None; return; }
-        e.Effects = DragDropEffects.Move;
-        int idx = GetThumbDropIndex(e.GetPosition(ThumbPanel));
+        if (e.Data.GetDataPresent("ThumbPages"))
+        {
+            e.Effects = DragDropEffects.Move;
+        }
+        else if (_editDocument != null && e.Data.GetDataPresent(DataFormats.FileDrop))
+        {
+            var files = e.Data.GetData(DataFormats.FileDrop) as string[];
+            if (files != null && files.Any(IsImageFile))
+                e.Effects = DragDropEffects.Copy;
+            else
+            { e.Effects = DragDropEffects.None; e.Handled = true; return; }
+        }
+        else
+        { e.Effects = DragDropEffects.None; e.Handled = true; return; }
+
+        int idx = GetThumbDropIndex(e.GetPosition(ThumbScrollViewer));
         if (idx != _thumbDropIndex)
         {
             _thumbDropIndex = idx;
@@ -4399,6 +4734,12 @@ public partial class PDFReaderPage : Page
 
     private void ThumbPanel_DragLeave(object sender, DragEventArgs e)
     {
+        // WPF fires DragLeave whenever the cursor moves between child elements,
+        // even while staying within ThumbPanel. Only clear the indicator when the
+        // cursor has actually left the panel's bounds.
+        Point pos = e.GetPosition(ThumbScrollViewer);
+        if (pos.X >= 0 && pos.Y >= 0 && pos.X <= ThumbScrollViewer.ActualWidth && pos.Y <= ThumbScrollViewer.ActualHeight)
+            return;
         RemoveThumbDropIndicator();
         _thumbDropIndex = -1;
     }
@@ -4406,20 +4747,46 @@ public partial class PDFReaderPage : Page
     private async void ThumbPanel_Drop(object sender, DragEventArgs e)
     {
         RemoveThumbDropIndicator();
-        if (!e.Data.GetDataPresent("ThumbPages")) return;
-        var pages = (int[])e.Data.GetData("ThumbPages");
         int idx = _thumbDropIndex >= 0 ? _thumbDropIndex : _thumbItems.Count;
         _thumbDropIndex = -1;
-        await ReorderThumbPagesAsync(pages, idx);
+
+        if (e.Data.GetDataPresent("ThumbPages"))
+        {
+            var pages = (int[])e.Data.GetData("ThumbPages");
+            await ReorderThumbPagesAsync(pages, idx);
+            return;
+        }
+
+        if (_editDocument != null && e.Data.GetDataPresent(DataFormats.FileDrop))
+        {
+            var rawFiles = e.Data.GetData(DataFormats.FileDrop) as string[];
+            if (rawFiles == null) return;
+
+            var files = rawFiles.Where(IsImageFile).ToArray();
+            if (files.Length > 0)
+            {
+                int afterPageIndex = (idx >= _thumbItems.Count) ? _thumbItems.Count - 1 : idx - 1;
+                await InsertImagesAfterPageAsync(afterPageIndex, files);
+            }
+        }
     }
 
-    private int GetThumbDropIndex(Point posInThumbPanel)
+    private int GetThumbDropIndex(Point pos)
     {
+        if (_thumbItems.Count == 0) return 0;
+
         for (int i = 0; i < _thumbItems.Count; i++)
         {
-            Point topLeft = _thumbItems[i].Container.TranslatePoint(new Point(0, 0), ThumbPanel);
-            double midY = topLeft.Y + _thumbItems[i].Container.ActualHeight / 2;
-            if (posInThumbPanel.Y < midY) return i;
+            var c  = _thumbItems[i].Container;
+            var pt = c.TransformToAncestor(ThumbScrollViewer).Transform(new Point(0, 0));
+            double midY = pt.Y + c.ActualHeight / 2;
+            double midX = pt.X + c.ActualWidth  / 2;
+
+            if (pos.Y < pt.Y) return i;
+            if (pos.Y >= pt.Y && pos.Y <= pt.Y + c.ActualHeight)
+            {
+                if (pos.X < midX) return i;
+            }
         }
         return _thumbItems.Count;
     }
@@ -4428,9 +4795,10 @@ public partial class PDFReaderPage : Page
     {
         _thumbDropLine ??= new Border
         {
-            Height           = 3,
+            Width            = 3,
+            Height           = 110,
             Background       = new SolidColorBrush(Color.FromRgb(0x89, 0xB4, 0xFA)),
-            Margin           = new Thickness(4, 0, 4, 2),
+            Margin           = new Thickness(0, 2, 0, 2),
             CornerRadius     = new CornerRadius(1.5),
             IsHitTestVisible = false
         };
@@ -4444,18 +4812,81 @@ public partial class PDFReaderPage : Page
             ThumbPanel.Children.Insert(_thumbDropIndex, _thumbDropLine);
     }
 
+    // Converts raw image file bytes into an XImage ready for PDFsharp DrawImage.
+    // 1. OnLoad forces synchronous pixel decode (prevents gray output from lazy BitmapImage).
+    // 2. Reads EXIF orientation and applies TransformedBitmap so JPEG photos taken in portrait
+    //    or landscape modes appear upright (WPF BitmapImage does not auto-apply EXIF rotation).
+    // 3. Re-encodes to PNG so PDFsharp's Save() gets fully-decoded pixel data.
+    // Returns the backing MemoryStream — caller must keep alive until after Save().
+    private static (MemoryStream PngMs, XImage XImg, double PtW, double PtH)
+        ImageBytesToXImage(byte[] imgBytes)
+    {
+        var bi = new BitmapImage();
+        bi.BeginInit();
+        bi.StreamSource = new MemoryStream(imgBytes);
+        bi.CacheOption  = BitmapCacheOption.OnLoad;
+        bi.EndInit();
+        bi.Freeze();
+
+        // Apply EXIF orientation if present (common in JPEG from cameras/phones).
+        BitmapSource source = bi;
+        try
+        {
+            var decoder  = BitmapDecoder.Create(new MemoryStream(imgBytes),
+                               BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.None);
+            var metadata = decoder.Frames[0].Metadata as BitmapMetadata;
+            if (metadata?.GetQuery("/app1/ifd/{ushort=274}") is ushort exifOrientation)
+            {
+                RotateTransform? rot = exifOrientation switch
+                {
+                    3 => new RotateTransform(180),
+                    6 => new RotateTransform(90),
+                    8 => new RotateTransform(270),
+                    _ => null
+                };
+                if (rot != null)
+                {
+                    var rotated = new TransformedBitmap(bi, rot);
+                    rotated.Freeze();
+                    source = rotated;
+                }
+            }
+        }
+        catch { /* non-JPEG or no EXIF — ignore */ }
+
+        double dpiX = source.DpiX  > 0 ? source.DpiX  : 96.0;
+        double dpiY = source.DpiY  > 0 ? source.DpiY  : 96.0;
+        double ptW  = source.PixelWidth  * 72.0 / dpiX;
+        double ptH  = source.PixelHeight * 72.0 / dpiY;
+
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(source));
+        var pngMs = new MemoryStream();
+        encoder.Save(pngMs);
+        pngMs.Position = 0;
+
+        return (pngMs, XImage.FromStream(pngMs), ptW, ptH);
+    }
+
     private void RemoveThumbDropIndicator()
     {
         if (_thumbDropLine != null && ThumbPanel.Children.Contains(_thumbDropLine))
             ThumbPanel.Children.Remove(_thumbDropLine);
     }
 
+    private static readonly HashSet<string> _imageExtensions =
+        new(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp" };
+
+    private static bool IsImageFile(string path) =>
+        _imageExtensions.Contains(System.IO.Path.GetExtension(path));
+
     private async Task ReorderThumbPagesAsync(int[] draggedPages, int insertIndex)
     {
         if (_editDocument == null || draggedPages.Length == 0) return;
 
-        var draggedSet  = new HashSet<int>(draggedPages);
-        var nonDragged  = Enumerable.Range(0, _thumbItems.Count).Where(i => !draggedSet.Contains(i)).ToList();
+        var draggedSet = new HashSet<int>(draggedPages);
+        var nonDragged = Enumerable.Range(0, _thumbItems.Count)
+                                   .Where(i => !draggedSet.Contains(i)).ToList();
 
         int effectiveInsert = nonDragged.Count(i => i < insertIndex);
 
@@ -4467,23 +4898,89 @@ public partial class PDFReaderPage : Page
         }
         if (effectiveInsert >= nonDragged.Count) newOrder.AddRange(draggedPages);
 
-        // No-op if order unchanged
         if (newOrder.Select((v, i) => v == i).All(x => x)) return;
 
-        // Save current document to bytes for import
-        string tmpSrc = System.IO.Path.Combine(System.IO.Path.GetTempPath(), System.IO.Path.GetRandomFileName() + ".pdf");
-        _editDocument.Save(tmpSrc);
-        byte[] srcBytes = System.IO.File.ReadAllBytes(tmpSrc);
-
-        var srcDoc = PdfReader.Open(new MemoryStream(srcBytes), PdfDocumentOpenMode.Import);
-        var newDoc  = new PdfDocument();
+        // Pre-load image bytes for all image pages in newOrder (async I/O before PDF work).
+        var imageCache = new Dictionary<int, byte[]>();
         foreach (int pi in newOrder)
-            newDoc.AddPage(srcDoc.Pages[pi]);
-        srcDoc.Dispose();
+        {
+            if (_pageImagePaths.TryGetValue(pi, out string? imgPath) && !imageCache.ContainsKey(pi))
+            {
+                string captured = imgPath;
+                imageCache[pi] = await Task.Run(() => File.ReadAllBytes(captured));
+            }
+        }
 
+        string srcPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), System.IO.Path.GetRandomFileName() + ".pdf");
+        string outPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), System.IO.Path.GetRandomFileName() + ".pdf");
+        byte[]? newBytes = null;
+        var imgResources = new List<(MemoryStream Ms, XImage XImg)>();
+        try
+        {
+            byte[] srcBytes = _editPdfBytes ?? throw new InvalidOperationException("편집 문서 바이트가 없습니다.");
+            System.IO.File.WriteAllBytes(srcPath, srcBytes);
+
+            using (var srcDoc = PdfReader.Open(srcPath, PdfDocumentOpenMode.Import))
+            {
+                var outDoc = new PdfDocument();
+                foreach (int pi in newOrder)
+                {
+                    if (imageCache.TryGetValue(pi, out byte[]? imgBytes))
+                    {
+                        // Image page: re-draw from original file bytes (same as right-click insert).
+                        // PDFsharp-WPF AddPage silently drops image XObjects — DrawImage is the only
+                        // reliable path for pages that contain image content.
+                        var (pngMs, xImg, ptW, ptH) = ImageBytesToXImage(imgBytes);
+                        imgResources.Add((pngMs, xImg));
+
+                        var newPage = outDoc.AddPage();
+                        newPage.Width  = XUnit.FromPoint(ptW);
+                        newPage.Height = XUnit.FromPoint(ptH);
+                        using var gfx = XGraphics.FromPdfPage(newPage);
+                        gfx.DrawImage(xImg, 0, 0, ptW, ptH);
+                    }
+                    else
+                    {
+                        // Text/vector page: copy via Import (no image XObjects → safe).
+                        outDoc.AddPage(srcDoc.Pages[pi]);
+                    }
+                }
+
+                outDoc.Save(outPath);  // imgResources alive; srcDoc alive for vector pages
+                outDoc.Dispose();
+            }
+
+            // ms/xImg can be released now (outDoc has been saved)
+            foreach (var (ms, x) in imgResources) { x.Dispose(); ms.Dispose(); }
+            imgResources.Clear();
+
+            newBytes = System.IO.File.ReadAllBytes(outPath);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"페이지 순서 변경 중 오류:\n{ex.Message}", "오류",
+                            MessageBoxButton.OK, MessageBoxImage.Error);
+            return;  // _editDocument is still valid — not touched yet
+        }
+        finally
+        {
+            foreach (var (ms, x) in imgResources) { try { x.Dispose(); ms.Dispose(); } catch { } }
+            try { if (System.IO.File.Exists(srcPath)) System.IO.File.Delete(srcPath); } catch { }
+            try { if (System.IO.File.Exists(outPath)) System.IO.File.Delete(outPath); } catch { }
+        }
+
+        // Remap _pageImagePaths to new positions
+        var remapped = new Dictionary<int, string>();
+        for (int i = 0; i < newOrder.Count; i++)
+            if (_pageImagePaths.TryGetValue(newOrder[i], out string? path))
+                remapped[i] = path;
+        _pageImagePaths.Clear();
+        foreach (var kv in remapped) _pageImagePaths[kv.Key] = kv.Value;
+
+        // Only swap _editDocument after the new doc is fully built
         _editDocument.Dispose();
-        _editDocument = newDoc;
-        _currentPage  = (uint)Math.Min((int)_currentPage, newDoc.Pages.Count - 1);
+        _editDocument = PdfReader.Open(new MemoryStream(newBytes!), PdfDocumentOpenMode.Modify);
+        _currentPage  = (uint)Math.Min((int)_currentPage, _editDocument.Pages.Count - 1);
 
         SetStatus("페이지 순서 변경 중…");
         await ReloadRenderDocumentAsync();

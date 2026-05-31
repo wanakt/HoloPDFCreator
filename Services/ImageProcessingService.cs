@@ -160,15 +160,15 @@ public static class ImageProcessingService
     }
 
     /// <summary>
-    /// Sharpens the image using unsharp masking.
-    /// amount 0 = no change; 1 = moderate; 3+ = strong.
+    /// Applies Unsharp Mask sharpening.
+    /// amount: 0–3 (sharpening strength); radius: 1–10 (blur radius in pixels); threshold: 0–30 (min difference to sharpen).
     /// </summary>
-    public static Bitmap Sharpen(Bitmap source, float amount)
+    public static Bitmap UnsharpMask(Bitmap source, float amount, int radius, int threshold)
     {
         if (amount <= 0f) return new Bitmap(source);
 
         var srcPixels = GetPixels(source);
-        using var blurred = BoxBlur(source, 1);
+        using var blurred = BoxBlur(source, Math.Max(1, radius));
         var blrPixels = GetPixels(blurred);
 
         var dst = new byte[srcPixels.Length];
@@ -176,9 +176,12 @@ public static class ImageProcessingService
         {
             for (int c = 0; c < 3; c++)
             {
-                float orig  = srcPixels[i + c];
-                float blur  = blrPixels[i + c];
-                dst[i + c]  = Clamp((int)(orig + amount * (orig - blur)));
+                float orig = srcPixels[i + c];
+                float blur = blrPixels[i + c];
+                float diff = orig - blur;
+                dst[i + c] = Math.Abs(diff) >= threshold
+                    ? Clamp((int)(orig + amount * diff))
+                    : (byte)orig;
             }
             dst[i + 3] = srcPixels[i + 3];
         }
