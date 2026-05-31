@@ -59,6 +59,7 @@
                             </ContextMenu.Resources>
                             <MenuItem Header="Open Images…" Click="OpenImages_Click"/>
                             <MenuItem Header="Open PDF…"    Click="OpenPdf_Click"/>
+                            <MenuItem x:Name="MenuRecentFiles" Header="최근 파일"/>
                             <Separator/>
                             <MenuItem x:Name="MenuItemSave"
                                       Header="Save"
@@ -127,11 +128,11 @@
 
                 <Separator/>
 
-                <!-- Memos Toggle -->
-                <Button x:Name="BtnToggleMemos"
-                        Content="Memos"
+                <!-- Adjust Toggle -->
+                <Button x:Name="BtnToggleAdjust"
+                        Content="Image Adjust"
                         Style="{StaticResource SecondaryButton}"
-                        Click="ToggleMemos_Click"
+                        Click="ToggleAdjust_Click"
                         Margin="6,0,0,0"/>
 
                 <Separator/>
@@ -174,7 +175,7 @@
                         Style="{StaticResource SecondaryButton}"
                         Click="DrawTool_Click" Tag="Circle"
                         Padding="10,8"
-                        Margin="0,0,0,0">
+                        Margin="0,0,4,0">
                     <Button.ToolTip>
                         <ToolTip Content="Circle (Shift: perfect circle)"/>
                     </Button.ToolTip>
@@ -184,6 +185,57 @@
                                      Width="18" Height="18"
                                      Stroke="#CDD6F4" StrokeThickness="2.5"
                                      Fill="Transparent"/>
+                        </Canvas>
+                    </Viewbox>
+                </Button>
+
+                <!-- Memos Toggle (icon) — placed right after Circle -->
+                <Button x:Name="BtnToggleMemos"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="ToggleMemos_Click"
+                        Padding="10,8"
+                        Margin="0,0,4,0"
+                        ToolTip="Memos">
+                    <Viewbox Width="18" Height="18">
+                        <Canvas Width="24" Height="24">
+                            <!-- Note body -->
+                            <Rectangle Canvas.Left="3" Canvas.Top="2"
+                                       Width="16" Height="20"
+                                       Stroke="#CDD6F4" StrokeThickness="1.8"
+                                       Fill="Transparent" RadiusX="2" RadiusY="2"/>
+                            <!-- Lines representing text -->
+                            <Line X1="6" Y1="8"  X2="18" Y2="8"
+                                  Stroke="#CDD6F4" StrokeThickness="1.5"/>
+                            <Line X1="6" Y1="12" X2="18" Y2="12"
+                                  Stroke="#CDD6F4" StrokeThickness="1.5"/>
+                            <Line X1="6" Y1="16" X2="14" Y2="16"
+                                  Stroke="#CDD6F4" StrokeThickness="1.5"/>
+                            <!-- Folded corner -->
+                            <Polyline Points="15,2 19,6 15,6 15,2"
+                                      Stroke="#CDD6F4" StrokeThickness="1.4"
+                                      Fill="#313244"/>
+                        </Canvas>
+                    </Viewbox>
+                </Button>
+
+                <!-- Highlight — applies yellow highlight to selected searchable text -->
+                <Button x:Name="BtnHighlight"
+                        Style="{StaticResource SecondaryButton}"
+                        Click="BtnHighlight_Click"
+                        Padding="10,8"
+                        Margin="0,0,0,0"
+                        IsEnabled="False"
+                        ToolTip="Highlight selected text (yellow)">
+                    <Viewbox Width="18" Height="18">
+                        <Canvas Width="24" Height="24">
+                            <!-- Yellow highlight bar -->
+                            <Rectangle Canvas.Left="2" Canvas.Top="15"
+                                       Width="20" Height="6"
+                                       Fill="#FFEE00" RadiusX="1" RadiusY="1"/>
+                            <!-- "A" letter above it -->
+                            <Path Fill="#CDD6F4"
+                                  Data="M12,3 L17,14 H15 L13.5,10.5 H10.5 L9,14 H7 Z
+                                        M12,6.5 L13,9.5 H11 Z"/>
                         </Canvas>
                     </Viewbox>
                 </Button>
@@ -198,14 +250,8 @@
                         IsEnabled="False"
                         Margin="6,0,0,0"/>
 
-                <!-- Status -->
-                <Border Background="#313244" CornerRadius="6" Padding="12,6" Margin="16,0,0,0">
-                    <TextBlock x:Name="TxtStatus"
-                               Text="Ready"
-                               FontSize="12"
-                               Foreground="#A6ADC8"
-                               VerticalAlignment="Center"/>
-                </Border>
+                <!-- TxtStatus kept hidden so code-behind references compile -->
+                <TextBlock x:Name="TxtStatus" Visibility="Collapsed"/>
             </WrapPanel>
         </Border>
 
@@ -213,17 +259,19 @@
         <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
-                <ColumnDefinition x:Name="MemoPanelCol" Width="0"/>
+                <ColumnDefinition x:Name="MemoPanelCol"    Width="0"/>
+                <ColumnDefinition x:Name="AdjustPanelCol"  Width="0"/>
             </Grid.ColumnDefinitions>
 
             <Grid Grid.Column="0">
                 <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="240"/>
                     <ColumnDefinition Width="150"/>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
 
-                <!-- ══════════════ THUMBNAIL PANEL ══════════════ -->
+                <!-- ══════════════ BOOKMARK PANEL ══════════════ -->
                 <Border Grid.Column="0"
                         Background="#181825"
                         BorderBrush="#313244"
@@ -238,9 +286,61 @@
                                 BorderBrush="#313244"
                                 BorderThickness="0,0,0,1"
                                 Padding="8,6">
-                            <TextBlock Text="Pages"
+                            <TextBlock Text="Bookmarks"
                                        FontSize="11" FontWeight="SemiBold"
-                                       Foreground="#89B4FA"/>
+                                       Foreground="#89B4FA"
+                                       VerticalAlignment="Center"/>
+                        </Border>
+                        <ScrollViewer x:Name="BookmarkScrollViewer"
+                                      Grid.Row="1"
+                                      VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled"
+                                      Background="#181825">
+                            <StackPanel x:Name="BookmarkPanel" Background="Transparent" Margin="4,4,4,4"/>
+                        </ScrollViewer>
+                        <!-- Drag overlay: sits above ScrollViewer, captures mouse during bookmark drag -->
+                        <Canvas x:Name="BmDragOverlay"
+                                Grid.Row="1"
+                                Background="Transparent"
+                                IsHitTestVisible="False"/>
+                    </Grid>
+                </Border>
+
+                <!-- ══════════════ THUMBNAIL PANEL ══════════════ -->
+                <Border Grid.Column="1"
+                        Background="#181825"
+                        BorderBrush="#313244"
+                        BorderThickness="0,0,1,0">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0"
+                                Background="#13131F"
+                                BorderBrush="#313244"
+                                BorderThickness="0,0,0,1"
+                                Padding="8,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0"
+                                           Text="Pages"
+                                           FontSize="11" FontWeight="SemiBold"
+                                           Foreground="#89B4FA"
+                                           VerticalAlignment="Center"/>
+                                <Button Grid.Column="1"
+                                        x:Name="BtnThumbDeletePages"
+                                        Content="🗑"
+                                        FontSize="11"
+                                        Padding="4,1"
+                                        IsEnabled="False"
+                                        ToolTip="Delete selected pages (Delete)"
+                                        Style="{StaticResource SecondaryButton}"
+                                        Click="BtnThumbDeletePages_Click"/>
+                            </Grid>
                         </Border>
                         <ScrollViewer x:Name="ThumbScrollViewer"
                                       Grid.Row="1"
@@ -257,7 +357,7 @@
                 </Border>
 
                 <ScrollViewer x:Name="PdfScrollViewer"
-                              Grid.Column="1"
+                              Grid.Column="2"
                               Background="#1E1E2E"
                               HorizontalScrollBarVisibility="Auto"
                               VerticalScrollBarVisibility="Hidden"
@@ -340,7 +440,7 @@
                 </ScrollViewer>
 
                 <ScrollBar x:Name="GlobalScrollBar"
-                           Grid.Column="2"
+                           Grid.Column="3"
                            Orientation="Vertical"
                            Minimum="0"
                            Maximum="1"
@@ -349,6 +449,145 @@
                            IsEnabled="False"
                            Scroll="GlobalScrollBar_Scroll"/>
             </Grid>
+
+            <!-- ══════════════ ADJUST PANEL ══════════════ -->
+            <Border Grid.Column="2"
+                    Background="#181825"
+                    BorderBrush="#313244"
+                    BorderThickness="1,0,0,0"
+                    ClipToBounds="True">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel Margin="12,10,12,12">
+                        <TextBlock Text="Image Adjust"
+                                   FontSize="13" FontWeight="SemiBold"
+                                   Foreground="#CDD6F4" Margin="0,0,0,10"/>
+
+                        <!-- Brightness -->
+                        <TextBlock Text="Brightness" FontSize="11" Foreground="#A6ADC8" Margin="0,0,0,2"/>
+                        <Grid Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="36"/>
+                            </Grid.ColumnDefinitions>
+                            <Slider x:Name="SliderBrightness" Grid.Column="0"
+                                    Minimum="-100" Maximum="100" Value="0"
+                                    TickFrequency="10" IsSnapToTickEnabled="False"
+                                    ValueChanged="AdjSlider_ValueChanged"
+                                    VerticalAlignment="Center"/>
+                            <TextBlock x:Name="LblBrightness" Grid.Column="1"
+                                       Text="0" FontSize="11" Foreground="#89B4FA"
+                                       VerticalAlignment="Center" TextAlignment="Right"/>
+                        </Grid>
+
+                        <!-- Contrast -->
+                        <TextBlock Text="Contrast" FontSize="11" Foreground="#A6ADC8" Margin="0,0,0,2"/>
+                        <Grid Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="36"/>
+                            </Grid.ColumnDefinitions>
+                            <Slider x:Name="SliderContrast" Grid.Column="0"
+                                    Minimum="-100" Maximum="100" Value="0"
+                                    TickFrequency="10" IsSnapToTickEnabled="False"
+                                    ValueChanged="AdjSlider_ValueChanged"
+                                    VerticalAlignment="Center"/>
+                            <TextBlock x:Name="LblContrast" Grid.Column="1"
+                                       Text="0" FontSize="11" Foreground="#89B4FA"
+                                       VerticalAlignment="Center" TextAlignment="Right"/>
+                        </Grid>
+
+                        <!-- Stroke -->
+                        <TextBlock Text="Thicken Strokes" FontSize="11" Foreground="#A6ADC8" Margin="0,0,0,2"/>
+                        <Grid Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="36"/>
+                            </Grid.ColumnDefinitions>
+                            <Slider x:Name="SliderStroke" Grid.Column="0"
+                                    Minimum="0" Maximum="10" Value="0"
+                                    TickFrequency="0.1" IsSnapToTickEnabled="False"
+                                    ValueChanged="AdjSlider_ValueChanged"
+                                    VerticalAlignment="Center"/>
+                            <TextBlock x:Name="LblStroke" Grid.Column="1"
+                                       Text="0.0" FontSize="11" Foreground="#89B4FA"
+                                       VerticalAlignment="Center" TextAlignment="Right"/>
+                        </Grid>
+
+                        <!-- Sharpen -->
+                        <TextBlock Text="Sharpen" FontSize="11" Foreground="#A6ADC8" Margin="0,0,0,2"/>
+                        <Grid Margin="0,0,0,10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="36"/>
+                            </Grid.ColumnDefinitions>
+                            <Slider x:Name="SliderSharpen" Grid.Column="0"
+                                    Minimum="0" Maximum="5" Value="0"
+                                    TickFrequency="0.5" IsSnapToTickEnabled="False"
+                                    ValueChanged="AdjSlider_ValueChanged"
+                                    VerticalAlignment="Center"/>
+                            <TextBlock x:Name="LblSharpen" Grid.Column="1"
+                                       Text="0.0" FontSize="11" Foreground="#89B4FA"
+                                       VerticalAlignment="Center" TextAlignment="Right"/>
+                        </Grid>
+
+                        <!-- Auto Level -->
+                        <CheckBox x:Name="ChkAutoLevel"
+                                  Content="Auto Level"
+                                  FontSize="12" Foreground="#CDD6F4"
+                                  Checked="AdjAutoLevel_Changed"
+                                  Unchecked="AdjAutoLevel_Changed"
+                                  Margin="0,0,0,10"/>
+
+                        <!-- Reset -->
+                        <Button Content="Reset"
+                                Style="{StaticResource SecondaryButton}"
+                                FontSize="11" Padding="8,4" Height="24"
+                                Click="AdjReset_Click"
+                                Margin="0,0,0,12"/>
+
+                        <Rectangle Height="1" Fill="#313244" Margin="0,0,0,12"/>
+
+                        <!-- Apply buttons -->
+                        <Button x:Name="BtnAdjApplyAll"
+                                Content="Apply to All Pages"
+                                Style="{StaticResource SecondaryButton}"
+                                FontSize="12" Padding="8,6"
+                                IsEnabled="False"
+                                Click="AdjApplyAll_Click"
+                                Margin="0,0,0,6"/>
+
+                        <Grid Margin="0,0,0,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBox x:Name="TxtAdjRange"
+                                     Grid.Column="0"
+                                     Text="1"
+                                     FontSize="12"
+                                     Padding="6,4"
+                                     ToolTip="e.g. 1-3,5,7-9"/>
+                            <Button Grid.Column="2"
+                                    Content="Apply Range"
+                                    Style="{StaticResource SecondaryButton}"
+                                    FontSize="12" Padding="8,4"
+                                    IsEnabled="{Binding IsEnabled, ElementName=BtnAdjApplyAll}"
+                                    Click="AdjApplyRange_Click"/>
+                        </Grid>
+
+                        <Rectangle Height="1" Fill="#313244" Margin="0,6,0,10"/>
+
+                        <Button x:Name="BtnAdjSavePdf"
+                                Content="Save as PDF…"
+                                Style="{StaticResource SecondaryButton}"
+                                FontSize="12" Padding="8,6"
+                                IsEnabled="False"
+                                Click="AdjSavePdf_Click"/>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
 
             <!-- ══════════════ MEMO PANEL ══════════════ -->
             <Border Grid.Column="1"

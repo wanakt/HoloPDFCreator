@@ -60,34 +60,10 @@
                             Click="BtnNavImageAdjuster_Click">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="&#x1F5BC;" FontSize="16" Margin="0,0,10,0"/>
-                            <TextBlock Text="Image Adjuster" FontSize="14"/>
+                            <TextBlock Text="OCR" FontSize="14"/>
                         </StackPanel>
                     </Button>
                 </StackPanel>
-
-                <!-- Bookmark section header -->
-                <Rectangle DockPanel.Dock="Top"
-                           Height="1" Fill="#313244"
-                           Margin="16,12,16,0"/>
-                <DockPanel DockPanel.Dock="Top" Margin="16,8,8,4">
-                    <TextBlock Text="BOOKMARKS"
-                               FontSize="10" FontWeight="SemiBold"
-                               Foreground="#585B70"
-                               VerticalAlignment="Center"
-                               Margin="8,0,0,0"/>
-                    <Button x:Name="BtnClearBookmarks"
-                            DockPanel.Dock="Right"
-                            Content="Clear all"
-                            FontSize="10"
-                            Padding="6,2"
-                            Background="Transparent"
-                            BorderBrush="Transparent"
-                            Foreground="#45475A"
-                            Cursor="Hand"
-                            HorizontalAlignment="Right"
-                            Click="BtnClearBookmarks_Click"
-                            ToolTip="Remove all bookmarks"/>
-                </DockPanel>
 
                 <!-- Version at bottom -->
                 <TextBlock DockPanel.Dock="Bottom"
@@ -96,13 +72,6 @@
                            Foreground="#45475A"
                            HorizontalAlignment="Center"
                            Margin="0,8,0,16"/>
-
-                <!-- Bookmark list – fills remaining space -->
-                <ScrollViewer x:Name="BookmarkScrollViewer"
-                              VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Disabled">
-                    <StackPanel x:Name="BookmarkListPanel" Margin="8,0,8,8"/>
-                </ScrollViewer>
 
             </DockPanel>
         </Border>

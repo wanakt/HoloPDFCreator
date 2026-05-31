@@ -67,10 +67,36 @@ public partial class PDFReaderPage : Page
     private double                       _currentPagePdfWidth;
     private double                       _currentPagePdfHeight;
 
+    // ─── Adjust panel state ───────────────────────────────────────────────────
+    private bool _suppressAdjSlider;
+    private CancellationTokenSource _liveAdjCts = new();
+    private record AdjSettings(double Brightness, double Contrast, double Stroke, double Sharpen, bool AutoLevel);
+    private readonly Dictionary<int, AdjSettings> _adjSettings = new();
+
     // ─── Memo state ───────────────────────────────────────────────────────────
     private double _memoInsertPdfX;
     private double _memoInsertPdfY;
     private Popup? _memoEditPopup;
+
+    // ─── Bookmark tree drag state ────────────────────────────────────────────
+    private static readonly SolidColorBrush BmNormalBg   = new(Color.FromRgb(0x1E, 0x1E, 0x2E));
+    private static readonly SolidColorBrush BmHoverBg    = new(Color.FromRgb(0x2A, 0x2A, 0x3E));
+    private static readonly SolidColorBrush BmSelectedBg = new(Color.FromRgb(0x31, 0x32, 0x44));
+    private static readonly SolidColorBrush BmDropIntoBg = new(Color.FromArgb(0xFF, 0x1D, 0x3A, 0x5F));
+    private int    _bmSelectedId = -1;
+    private readonly Dictionary<int, Border>                        _bmContainers = new();
+    private readonly Dictionary<Border, (Bookmark Bm, int Depth)>  _bmInfo       = new();
+    private enum BmDropPos { Before, Into, After }
+    private Bookmark?   _bmDragBm;
+    private Border?     _bmDragContainer;
+    private Point       _bmDragStartPt;
+    private bool        _bmIsDragging;
+    private Bookmark?   _bmDropTargetBm;
+    private BmDropPos   _bmDropPos;
+    private int?        _bmDropNewParentId;
+    private int         _bmDropNewSortOrder;
+    private Rectangle?  _bmDragIndicator;
+    private Border?     _bmDropHighlightBorder;
 
     // ─── Continuous scroll ────────────────────────────────────────────────────
     private bool   _pageTransitioning;
@@ -81,11 +107,20 @@ public partial class PDFReaderPage : Page
 
     // ─── Thumbnail panel ──────────────────────────────────────────────────────
     private record ThumbEntry(System.Windows.Controls.Image Img, Border Container);
-    private readonly List<ThumbEntry> _thumbItems = new();
+    private readonly List<ThumbEntry>  _thumbItems          = new();
+    private readonly HashSet<int>      _thumbSelectedPages  = new();
+    private int                        _thumbLastClickedPage = -1;
     private CancellationTokenSource _thumbCts = new();
-    private static readonly SolidColorBrush ThumbBrushNormal   = Frozen(0x1E, 0x1E, 0x2E);
-    private static readonly SolidColorBrush ThumbBrushSelected = Frozen(0x31, 0x32, 0x44);
-    private static readonly SolidColorBrush ThumbBrushHover    = Frozen(0x28, 0x28, 0x3C);
+    // Drag-reorder state
+    private int     _thumbDragSourcePage = -1;
+    private Point   _thumbDragStartPos;
+    private bool    _thumbDragInitiated;
+    private int     _thumbDropIndex      = -1;
+    private Border? _thumbDropLine;
+    private static readonly SolidColorBrush ThumbBrushNormal     = Frozen(0x1E, 0x1E, 0x2E);
+    private static readonly SolidColorBrush ThumbBrushSelected   = Frozen(0x31, 0x32, 0x44);
+    private static readonly SolidColorBrush ThumbBrushHover      = Frozen(0x28, 0x28, 0x3C);
+    private static readonly SolidColorBrush ThumbBrushDeleteMark = Frozen(0xF3, 0x8B, 0xA8);
     private static SolidColorBrush Frozen(byte r, byte g, byte b)
     { var br = new SolidColorBrush(Color.FromRgb(r, g, b)); br.Freeze(); return br; }
 
@@ -122,6 +157,19 @@ public partial class PDFReaderPage : Page
         };
 
         // DrawingCanvas stays below TextOverlayCanvas; it only captures input during active draw mode.
+
+        BookmarkService.Instance.Changed += (_, _) => Dispatcher.Invoke(RefreshBookmarkPanel);
+        RefreshBookmarkPanel();
+
+        ThumbPanel.AllowDrop = true;
+        ThumbPanel.DragOver  += ThumbPanel_DragOver;
+        ThumbPanel.DragLeave += ThumbPanel_DragLeave;
+        ThumbPanel.Drop      += ThumbPanel_Drop;
+
+        BookmarkPanel.AllowDrop  = true;
+        BookmarkPanel.DragOver  += BmScrollViewer_DragOver;
+        BookmarkPanel.DragLeave += BmScrollViewer_DragLeave;
+        BookmarkPanel.Drop      += BmScrollViewer_Drop;
     }
 
     // ─── Image mode (images loaded as a temp PDF) ────────────────────────────
@@ -130,9 +178,42 @@ public partial class PDFReaderPage : Page
     public bool IsImageMode => _imageFiles.Count > 0;
     public IReadOnlyList<string> ImageFiles => _imageFiles;
 
-    public string?             CurrentFilePath => _currentFilePath;
-    public uint               CurrentPage     => _currentPage;
-    public AdjustedImageStore? AdjustedStore  { get; set; }
+    // After rotation/edit-reload, tracks the temp file that holds the current in-memory state.
+    // Cleaned up when a completely new PDF is loaded or when replaced by a newer rotation.
+    private string? _tempEditedPath;
+
+    public string?             CurrentFilePath  => _currentFilePath;
+    // Returns the latest saved version: temp file after rotations, or original file path.
+    public string?             EffectiveFilePath => _tempEditedPath ?? _currentFilePath;
+    public uint               CurrentPage      => _currentPage;
+    public uint               TotalPages       => _totalPages;
+    public AdjustedImageStore? AdjustedStore   { get; set; }
+    public BitmapSource?       CurrentPageImage => PdfPageImage.Source as BitmapSource;
+
+    // Renders the current page at high resolution for OCR (≈300 DPI for letter paper).
+    public async Task<BitmapSource?> RenderPageForOcrAsync(uint page, uint width = 1600)
+    {
+        if (_renderDocument == null) return null;
+        try
+        {
+            using var pdfPage = _renderDocument.GetPage(page);
+            using var stream  = new InMemoryRandomAccessStream();
+            await pdfPage.RenderToStreamAsync(stream,
+                new WinPdf.PdfPageRenderOptions { DestinationWidth = width });
+            stream.Seek(0);
+            var ms = new MemoryStream();
+            await stream.AsStream().CopyToAsync(ms);
+            ms.Position = 0;
+            var bmp = new BitmapImage();
+            bmp.BeginInit();
+            bmp.StreamSource = ms;
+            bmp.CacheOption  = BitmapCacheOption.OnLoad;
+            bmp.EndInit();
+            bmp.Freeze();
+            return bmp;
+        }
+        catch { return null; }
+    }
 
     // Re-render the current page and update thumbnails with any adjusted-image overrides.
     public async Task RefreshWithAdjustedImagesAsync()
@@ -160,10 +241,34 @@ public partial class PDFReaderPage : Page
 
     private void BtnFile_Click(object sender, RoutedEventArgs e)
     {
+        RefreshRecentFilesMenu();
         var cm = BtnFile.ContextMenu;
         cm.PlacementTarget = BtnFile;
         cm.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
         cm.IsOpen = true;
+    }
+
+    private void RefreshRecentFilesMenu()
+    {
+        MenuRecentFiles.Items.Clear();
+        var recents = RecentFilesService.Load()
+                          .Where(File.Exists)
+                          .ToList();
+
+        MenuRecentFiles.IsEnabled = recents.Count > 0;
+
+        foreach (var path in recents)
+        {
+            var item = new MenuItem
+            {
+                Header     = System.IO.Path.GetFileName(path),
+                ToolTip    = path,
+                Tag        = path,
+                Foreground = System.Windows.Media.Brushes.Black,
+            };
+            item.Click += (_, _) => _ = LoadPdfAsync((string)((MenuItem)item).Tag);
+            MenuRecentFiles.Items.Add(item);
+        }
     }
 
     private void OpenImages_Click(object sender, RoutedEventArgs e)
@@ -293,6 +398,11 @@ public partial class PDFReaderPage : Page
             _imageFiles.Clear();
             CleanupTempImagePdf();
         }
+        // A new PDF load invalidates any prior edit-temp (rotation etc.).
+        // Don't clean up if _tempEditedPath IS the file being loaded (that would delete it mid-load).
+        if (filePath != _tempEditedPath)
+            CleanupTempEditedPath();
+
         SetStatus("Loading…");
         try
         {
@@ -311,11 +421,13 @@ public partial class PDFReaderPage : Page
                 System.IO.Path.GetRandomFileName() + ".pdf");
             _editDocument.Save(renderTmp);
 
-            // PDFsharp locks a document after Save(), so re-open from the
-            // original file to keep _editDocument modifiable for future saves.
+            // PDFsharp locks a document after Save(), so re-open for future saves.
+            // Open from a MemoryStream so no FileStream is held on the original file;
+            // otherwise File.Move(tmp, originalPath, overwrite:true) fails with Access Denied.
             _editDocument.Dispose();
             _editPdfBytes = File.ReadAllBytes(renderTmp);   // snapshot for PdfPig
-            _editDocument = PdfReader.Open(filePath, PdfDocumentOpenMode.Modify);
+            var originalBytes = File.ReadAllBytes(filePath);
+            _editDocument = PdfReader.Open(new MemoryStream(originalBytes), PdfDocumentOpenMode.Modify);
 
             var cleanFile = await StorageFile.GetFileFromPathAsync(renderTmp);
             _renderDocument = await WinPdf.PdfDocument.LoadFromFileAsync(cleanFile);
@@ -333,6 +445,10 @@ public partial class PDFReaderPage : Page
             await RenderCurrentPageAsync();
             SetStatus($"Opened: {System.IO.Path.GetFileName(filePath)}");
             StartThumbnailGeneration();
+            ImportPdfOutlinesToService(filePath);
+            RefreshBookmarkPanel();
+            if (filePath != _tempImagePdfPath)
+                RecentFilesService.Add(filePath);
         }
         catch (Exception ex)
         {
@@ -418,6 +534,7 @@ public partial class PDFReaderPage : Page
     {
         bool ctrl = Keyboard.IsKeyDown(Key.LeftCtrl) || Keyboard.IsKeyDown(Key.RightCtrl);
         if (ctrl && e.Key == Key.B) { AddBookmarkForCurrentPage(); e.Handled = true; }
+        if (e.Key == Key.Delete && _thumbSelectedPages.Count > 0) { _ = DeleteSelectedPagesAsync(); e.Handled = true; }
     }
 
     private void AddBookmark_Click(object sender, RoutedEventArgs e) => AddBookmarkForCurrentPage();
@@ -459,6 +576,477 @@ public partial class PDFReaderPage : Page
         _currentPage = Math.Min(bm.PageNumber, _totalPages - 1);
         UpdateNavButtons();
         await RenderCurrentPageAsync();
+    }
+
+    private void ImportPdfOutlinesToService(string filePath)
+    {
+        BookmarkService.Instance.RemovePdfOutlines(filePath);
+        if (_editDocument == null) return;
+        try
+        {
+            if (_editDocument.Outlines.Count == 0) return;
+            var list = new List<Bookmark>();
+            ImportOutlinesRecursive(_editDocument.Outlines, filePath, null, list);
+            BookmarkService.Instance.AddPdfOutlines(list);
+        }
+        catch { /* non-critical */ }
+    }
+
+    private void ImportOutlinesRecursive(PdfOutlineCollection outlines, string filePath,
+                                         int? parentId, List<Bookmark> result)
+    {
+        int sort = 0;
+        foreach (var outline in outlines)
+        {
+            int pageIdx = GetOutlinePageIndex(outline);
+            var bm = new Bookmark
+            {
+                FilePath   = filePath,
+                PageNumber = pageIdx >= 0 ? (uint)pageIdx : 0,
+                Title      = outline.Title ?? "(untitled)",
+                ParentId   = parentId,
+                SortOrder  = sort++,
+                IsFromPdf  = true,
+            };
+            result.Add(bm);
+            if (outline.Outlines.Count > 0)
+                ImportOutlinesRecursive(outline.Outlines, filePath, bm.Id, result);
+        }
+    }
+
+    private void RefreshBookmarkPanel()
+    {
+        if (_bmIsDragging)
+        {
+            _bmIsDragging = false; _bmDragBm = null; _bmDragContainer = null;
+        }
+        ClearBmDropVisuals();
+        _bmInfo.Clear();
+        _bmContainers.Clear();
+        BookmarkPanel.Children.Clear();
+
+        bool hasAny = _currentFilePath != null &&
+                      BookmarkService.Instance.All
+                          .Any(b => b.FilePath.Equals(_currentFilePath, StringComparison.OrdinalIgnoreCase));
+
+        if (hasAny)
+        {
+            RenderBmSubtree(null, 0);
+            if (_bmContainers.TryGetValue(_bmSelectedId, out var sel))
+                sel.Background = BmSelectedBg;
+        }
+        else
+        {
+            BookmarkPanel.Children.Add(new TextBlock
+            {
+                Text = "No bookmarks\nCtrl+B to add", FontSize = 10,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x45, 0x47, 0x5A)),
+                TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 8, 4, 0)
+            });
+        }
+    }
+
+    private void RenderBmSubtree(int? parentId, int depth)
+    {
+        IEnumerable<Bookmark> items = parentId == null && _currentFilePath != null
+            ? BookmarkService.Instance.GetRoots()
+                  .Where(b => b.FilePath.Equals(_currentFilePath, StringComparison.OrdinalIgnoreCase))
+            : BookmarkService.Instance.GetChildren(parentId);
+
+        foreach (var bm in items)
+        {
+            BookmarkPanel.Children.Add(CreateBmTreeItem(bm, depth));
+            if (bm.IsExpanded)
+                RenderBmSubtree(bm.Id, depth + 1);
+        }
+    }
+
+    private UIElement CreateBmTreeItem(Bookmark bm, int depth)
+    {
+        bool hasKids = BookmarkService.Instance.HasChildren(bm.Id);
+
+        var expandBtn = new Button
+        {
+            Width = 16, Height = 16,
+            Content = hasKids ? (bm.IsExpanded ? "▼" : "▶") : "",
+            FontSize = 8, Padding = new Thickness(0),
+            Background = Brushes.Transparent, BorderBrush = Brushes.Transparent,
+            Foreground = new SolidColorBrush(Color.FromRgb(0x89, 0xB4, 0xFA)),
+            VerticalAlignment = VerticalAlignment.Center,
+            IsEnabled = hasKids, Cursor = hasKids ? Cursors.Hand : Cursors.Arrow
+        };
+        if (hasKids) expandBtn.Click += (_, _) => BookmarkService.Instance.ToggleExpand(bm.Id);
+
+        var dragHandle = new TextBlock
+        {
+            Text = "::", FontSize = 13, FontWeight = FontWeights.Bold,
+            Foreground = Brushes.White,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(2, 0, 6, 0),
+            Cursor = Cursors.SizeNS,
+            Background = new SolidColorBrush(Color.FromRgb(0x45, 0x47, 0x5A)),
+            ToolTip = "여기를 잡고 끌어서 순서를 변경하세요"
+        };
+
+        var badge = new Border
+        {
+            Background = new SolidColorBrush(Color.FromRgb(0x31, 0x32, 0x44)),
+            CornerRadius = new CornerRadius(4), Padding = new Thickness(5, 2, 5, 2),
+            Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center,
+            Child = new TextBlock
+            {
+                Text = $"P{bm.PageNumber + 1}", FontSize = 10,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x89, 0xB4, 0xFA))
+            }
+        };
+
+        var titleBlock = new TextBlock
+        {
+            Text = bm.Title, FontSize = 12,
+            Foreground = new SolidColorBrush(Color.FromRgb(0xCD, 0xD6, 0xF4)),
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            VerticalAlignment = VerticalAlignment.Center,
+            Cursor = Cursors.Hand, ToolTip = bm.Title
+        };
+        var titleBox = new TextBox
+        {
+            Text = bm.Title, FontSize = 12,
+            Foreground = new SolidColorBrush(Color.FromRgb(0xCD, 0xD6, 0xF4)),
+            Background = new SolidColorBrush(Color.FromRgb(0x31, 0x32, 0x44)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(0x89, 0xB4, 0xFA)),
+            BorderThickness = new Thickness(1), Padding = new Thickness(3, 1, 3, 1),
+            Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Center
+        };
+        var titleArea = new Grid();
+        titleArea.Children.Add(titleBlock);
+        titleArea.Children.Add(titleBox);
+
+        void StartEdit()
+        {
+            titleBox.Text = bm.Title; titleBlock.Visibility = Visibility.Collapsed;
+            titleBox.Visibility = Visibility.Visible; titleBox.Focus(); titleBox.SelectAll();
+        }
+        void CommitEdit()
+        {
+            var t = titleBox.Text.Trim();
+            if (!string.IsNullOrEmpty(t)) bm.Title = t;
+            titleBlock.Text = bm.Title; titleBlock.ToolTip = bm.Title;
+            titleBox.Visibility = Visibility.Collapsed; titleBlock.Visibility = Visibility.Visible;
+        }
+        titleBox.LostFocus += (_, _) => CommitEdit();
+        titleBox.KeyDown += (_, e) =>
+        {
+            if      (e.Key == Key.Enter)  { CommitEdit(); e.Handled = true; }
+            else if (e.Key == Key.Escape) { titleBox.Text = bm.Title; CommitEdit(); e.Handled = true; }
+        };
+        titleBlock.MouseLeftButtonDown += (_, e) => { if (e.ClickCount == 2) { StartEdit(); e.Handled = true; } };
+
+        var addChildBtn = new Button
+        {
+            Content = "+", FontSize = 12, Width = 18, Height = 18,
+            Padding = new Thickness(0), Background = Brushes.Transparent, BorderBrush = Brushes.Transparent,
+            Foreground = new SolidColorBrush(Color.FromRgb(0x45, 0x47, 0x5A)),
+            Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(4, 0, 1, 0), ToolTip = "하위 북마크 추가"
+        };
+        addChildBtn.Click += (_, _) =>
+        {
+            if (_currentFilePath == null) return;
+            bm.IsExpanded = true;
+            BookmarkService.Instance.Add(new Bookmark
+            {
+                FilePath = _currentFilePath, PageNumber = _currentPage,
+                Title = $"Page {_currentPage + 1}", ParentId = bm.Id
+            });
+        };
+
+        var editBtn = new Button
+        {
+            Content = "✎", FontSize = 13, Width = 18, Height = 18,
+            Padding = new Thickness(0), Background = Brushes.Transparent, BorderBrush = Brushes.Transparent,
+            Foreground = new SolidColorBrush(Color.FromRgb(0x89, 0xB4, 0xFA)),
+            Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(1, 0, 1, 0), ToolTip = "이름 변경"
+        };
+        editBtn.Click += (_, _) => StartEdit();
+
+        var deleteBtn = new Button
+        {
+            Content = "✕", FontSize = 10, Width = 18, Height = 18,
+            Padding = new Thickness(0), Background = Brushes.Transparent, BorderBrush = Brushes.Transparent,
+            Foreground = new SolidColorBrush(Color.FromRgb(0x58, 0x5B, 0x70)),
+            Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center, ToolTip = "삭제 (하위 포함)"
+        };
+        deleteBtn.Click += (_, _) => BookmarkService.Instance.Remove(bm.Id);
+
+        var btnPanel = new StackPanel { Orientation = Orientation.Horizontal };
+        btnPanel.Children.Add(addChildBtn);
+        btnPanel.Children.Add(editBtn);
+        btnPanel.Children.Add(deleteBtn);
+
+        var mainGrid = new Grid();
+        mainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(16) });
+        mainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        mainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        mainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        mainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(expandBtn,  0); Grid.SetColumn(dragHandle, 1);
+        Grid.SetColumn(badge,      2); Grid.SetColumn(titleArea,  3);
+        Grid.SetColumn(btnPanel,   4);
+        mainGrid.Children.Add(expandBtn); mainGrid.Children.Add(dragHandle);
+        mainGrid.Children.Add(badge);     mainGrid.Children.Add(titleArea);
+        mainGrid.Children.Add(btnPanel);
+
+        var container = new Border
+        {
+            Background = BmNormalBg, CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(4), Margin = new Thickness(depth * 16, 1, 0, 1)
+        };
+        container.Child = mainGrid;
+        _bmContainers[bm.Id] = container;
+        _bmInfo[container]   = (bm, depth);
+
+        container.MouseEnter += (_, _) =>
+        {
+            if (!_bmIsDragging && _bmSelectedId != bm.Id) container.Background = BmHoverBg;
+        };
+        container.MouseLeave += (_, _) =>
+        {
+            if (_bmDropHighlightBorder == container) return;
+            container.Background = _bmSelectedId == bm.Id ? BmSelectedBg : BmNormalBg;
+        };
+
+        dragHandle.PreviewMouseLeftButtonDown += (_, e) =>
+        {
+            _bmDragBm        = bm;
+            _bmDragContainer = container;
+            _bmDragStartPt   = e.GetPosition(BookmarkPanel);
+            _bmIsDragging    = false;
+            dragHandle.CaptureMouse();
+            System.Diagnostics.Debug.WriteLine($"[BM] DOWN captured={dragHandle.IsMouseCaptured} bm={bm.Title}");
+        };
+
+        MouseEventHandler bmMoveHandler = null!;
+        bmMoveHandler = (_, e) =>
+        {
+            System.Diagnostics.Debug.WriteLine($"[BM] MOVE src={e.RoutedEvent?.Name} leftBtn={e.LeftButton} bmNull={_bmDragBm == null}");
+            if (_bmDragBm == null || _bmDragContainer != container) return;
+            if (e.LeftButton != MouseButtonState.Pressed) return;
+
+            var pos = e.GetPosition(BookmarkPanel);
+            var dx  = Math.Abs(pos.X - _bmDragStartPt.X);
+            var dy  = Math.Abs(pos.Y - _bmDragStartPt.Y);
+            System.Diagnostics.Debug.WriteLine($"[BM] MOVE dx={dx:F1} dy={dy:F1}");
+
+            if (!_bmIsDragging && (dx > SystemParameters.MinimumHorizontalDragDistance || dy > SystemParameters.MinimumVerticalDragDistance))
+            {
+                System.Diagnostics.Debug.WriteLine("[BM] DoDragDrop starting");
+                _bmIsDragging = true;
+                var dragging  = _bmDragBm;
+                _bmDragBm     = null;
+                if (dragHandle.IsMouseCaptured) dragHandle.ReleaseMouseCapture();
+                container.Opacity = 0.45;
+                DragDrop.DoDragDrop(dragHandle, new DataObject("BmId", dragging.Id), DragDropEffects.Move);
+                System.Diagnostics.Debug.WriteLine("[BM] DoDragDrop ended");
+                container.Opacity = 1.0;
+                _bmDragContainer = null;
+                _bmIsDragging    = false;
+                ClearBmDropVisuals();
+                e.Handled        = true;
+            }
+        };
+        dragHandle.PreviewMouseMove += bmMoveHandler;
+        dragHandle.MouseMove        += bmMoveHandler;
+
+        dragHandle.LostMouseCapture += (_, _) =>
+        {
+            System.Diagnostics.Debug.WriteLine($"[BM] LostMouseCapture isDragging={_bmIsDragging}");
+            if (!_bmIsDragging) { _bmDragBm = null; _bmDragContainer = null; }
+        };
+
+        container.MouseLeftButtonUp += (_, _) =>
+        {
+            if (dragHandle.IsMouseCaptured) dragHandle.ReleaseMouseCapture();
+            bool wasDrag     = _bmIsDragging;
+            _bmDragBm        = null;
+            _bmDragContainer = null;
+            _bmIsDragging    = false;
+            if (!wasDrag) { BmSelect(bm.Id); _ = NavigateToBookmarkAsync(bm); }
+        };
+
+        return container;
+    }
+
+    // ─── Bookmark DragDrop helpers ────────────────────────────────────────────
+
+    private void BmScrollViewer_DragOver(object sender, DragEventArgs e)
+    {
+        if (!e.Data.GetDataPresent("BmId")) { e.Effects = DragDropEffects.None; e.Handled = true; return; }
+        e.Effects = DragDropEffects.Move;
+        var pos = e.GetPosition(BookmarkPanel);
+        UpdateBmDropIndicator(pos.Y, pos.X);
+        e.Handled = true;
+    }
+
+    private void BmScrollViewer_DragLeave(object sender, DragEventArgs e) => ClearBmDropVisuals();
+
+    private void BmScrollViewer_Drop(object sender, DragEventArgs e)
+    {
+        ClearBmDropVisuals();
+        if (!e.Data.GetDataPresent("BmId")) return;
+        int id      = (int)e.Data.GetData("BmId");
+        var dragged = BookmarkService.Instance.All.FirstOrDefault(b => b.Id == id);
+        CommitBmDrop(dragged, _bmDropNewParentId, _bmDropNewSortOrder);
+        e.Handled = true;
+    }
+
+    private void BmSelect(int id)
+    {
+        if (_bmContainers.TryGetValue(_bmSelectedId, out var prev)) prev.Background = BmNormalBg;
+        _bmSelectedId = id;
+        if (_bmContainers.TryGetValue(id, out var next)) next.Background = BmSelectedBg;
+    }
+
+    private void UpdateBmDropIndicator(double mouseY, double mouseX)
+    {
+        ClearBmDropVisuals();
+        var (targetBm, pos, targetDepth) = GetBmDropTarget(mouseY);
+        _bmDropTargetBm = targetBm;
+        _bmDropPos      = pos;
+
+        if (targetBm == null)
+        {
+            _bmDropNewParentId  = null;
+            _bmDropNewSortOrder = BookmarkService.Instance.GetRoots().Count();
+            _bmDragIndicator    = MakeBmLine(0);
+            BookmarkPanel.Children.Add(_bmDragIndicator);
+            return;
+        }
+
+        var targetContainer = _bmContainers[targetBm.Id];
+
+        if (pos == BmDropPos.Into)
+        {
+            _bmDropNewParentId     = targetBm.Id;
+            _bmDropNewSortOrder    = BookmarkService.Instance.GetChildren(targetBm.Id).Count();
+            _bmDropHighlightBorder = targetContainer;
+            targetContainer.Background = BmDropIntoBg;
+        }
+        else
+        {
+            int mouseDepth    = Math.Max(0, (int)(mouseX / 16));
+            int maxDepth      = pos == BmDropPos.After ? targetDepth + 1 : targetDepth;
+            int effectiveDepth = Math.Clamp(mouseDepth, 0, maxDepth);
+            ComputeBmInsertionPoint(targetBm, targetDepth, effectiveDepth, pos,
+                out int? newParentId, out int newSortOrder);
+            _bmDropNewParentId  = newParentId;
+            _bmDropNewSortOrder = newSortOrder;
+            _bmDragIndicator    = MakeBmLine(effectiveDepth);
+            int ci = BookmarkPanel.Children.IndexOf(targetContainer);
+            if (ci >= 0)
+                BookmarkPanel.Children.Insert(pos == BmDropPos.Before ? ci : ci + 1, _bmDragIndicator);
+        }
+    }
+
+    private void ComputeBmInsertionPoint(Bookmark target, int targetDepth, int effectiveDepth,
+        BmDropPos pos, out int? newParentId, out int newSortOrder)
+    {
+        if (pos == BmDropPos.After && effectiveDepth > targetDepth)
+        {
+            newParentId  = target.Id;
+            newSortOrder = BookmarkService.Instance.GetChildren(target.Id).Count();
+            return;
+        }
+        var ancestor = target;
+        int curDepth = targetDepth;
+        while (curDepth > effectiveDepth && ancestor.ParentId.HasValue)
+        {
+            var parent = BookmarkService.Instance.All.FirstOrDefault(b => b.Id == ancestor.ParentId.Value);
+            if (parent == null) break;
+            ancestor = parent; curDepth--;
+        }
+        newParentId  = ancestor.ParentId;
+        newSortOrder = pos == BmDropPos.Before ? ancestor.SortOrder : ancestor.SortOrder + 1;
+    }
+
+    private (Bookmark? bm, BmDropPos pos, int depth) GetBmDropTarget(double mouseY)
+    {
+        foreach (UIElement child in BookmarkPanel.Children)
+        {
+            if (child is not Border b)              continue;
+            if (b == _bmDragContainer)              continue;
+            if (!_bmInfo.TryGetValue(b, out var info)) continue;
+            try
+            {
+                var topY = b.TransformToAncestor(BookmarkPanel).Transform(new Point(0, 0)).Y;
+                var h    = b.ActualHeight;
+                if (mouseY < topY || mouseY > topY + h) continue;
+                float rel = (float)((mouseY - topY) / h);
+                var dpos = rel < 0.28f ? BmDropPos.Before : rel > 0.72f ? BmDropPos.After : BmDropPos.Into;
+                return (info.Bm, dpos, info.Depth);
+            }
+            catch { continue; }
+        }
+        return (null, BmDropPos.After, 0);
+    }
+
+    private Rectangle MakeBmLine(int depth) => new Rectangle
+    {
+        Height = 2, Fill = new SolidColorBrush(Color.FromRgb(0x89, 0xB4, 0xFA)),
+        Margin = new Thickness(6 + depth * 16, 0, 6, 0), IsHitTestVisible = false
+    };
+
+    private void ClearBmDropVisuals()
+    {
+        if (_bmDragIndicator != null)
+        {
+            BookmarkPanel.Children.Remove(_bmDragIndicator);
+            _bmDragIndicator = null;
+        }
+        if (_bmDropHighlightBorder != null)
+        {
+            var prev = _bmDropTargetBm;
+            _bmDropHighlightBorder.Background =
+                prev != null && _bmSelectedId == prev.Id ? BmSelectedBg : BmNormalBg;
+            _bmDropHighlightBorder = null;
+        }
+        _bmDropTargetBm = null;
+    }
+
+    private void CommitBmDrop(Bookmark? dragged, int? newParentId, int newSortOrder)
+    {
+        if (dragged == null) return;
+        if (newParentId.HasValue)
+        {
+            var parent = BookmarkService.Instance.All.FirstOrDefault(b => b.Id == newParentId.Value);
+            if (parent != null && !parent.IsExpanded) parent.IsExpanded = true;
+        }
+        BookmarkService.Instance.Move(dragged.Id, newParentId, newSortOrder);
+    }
+
+
+
+    private int GetOutlinePageIndex(PdfOutline outline)
+    {
+        if (_editDocument is null || outline.DestinationPage is null) return -1;
+        for (int i = 0; i < _editDocument.PageCount; i++)
+            if (ReferenceEquals(_editDocument.Pages[i], outline.DestinationPage)) return i;
+        return -1;
+    }
+
+    private async Task NavigateToPageAsync(int pageIdx)
+    {
+        if (_totalPages == 0 || pageIdx < 0) return;
+        _currentPage = (uint)Math.Min(pageIdx, (int)_totalPages - 1);
+        UpdateNavButtons();
+        await RenderCurrentPageAsync();
+    }
+
+    private async Task NavigateToBookmarkAsync(Bookmark bm)
+    {
+        if (!bm.FilePath.Equals(_currentFilePath, StringComparison.OrdinalIgnoreCase))
+            await LoadPdfAsync(bm.FilePath);
+        await NavigateToPageAsync((int)bm.PageNumber);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -685,6 +1273,7 @@ public partial class PDFReaderPage : Page
     private async Task RenderCurrentPageAsync()
     {
         if (_renderDocument is null) return;
+        LoadAdjSettingsForPage((int)_currentPage);
         SetStatus("Rendering…");
 
         try
@@ -1480,7 +2069,10 @@ public partial class PDFReaderPage : Page
 
     private void UpdateSelectionStatus()
     {
-        if (_selectedIndices.Count == 0)
+        bool hasSel = _selectedIndices.Count > 0;
+        BtnHighlight.IsEnabled = hasSel;
+
+        if (!hasSel)
         {
             SetStatus($"Page {_currentPage + 1} / {_totalPages}  ·  Drag or click to select");
             return;
@@ -1490,6 +2082,14 @@ public partial class PDFReaderPage : Page
             _readingOrder.Where(_selectedIndices.Contains).Select(i => _pageWords[i].Text));
         if (preview.Length > 60) preview = preview[..57] + "…";
         SetStatus($"{_selectedIndices.Count} word(s) selected: \"{preview}\"");
+    }
+
+    private void BtnHighlight_Click(object sender, RoutedEventArgs e)
+    {
+        AddAnnotation(AnnotationType.Highlight, Color.FromRgb(0xFF, 0xEE, 0x00));
+        _selectedIndices.Clear();
+        RefreshHighlights();
+        UpdateSelectionStatus();
     }
 
     private void SetStatus(string msg) => TxtStatus.Text = msg;
@@ -2165,6 +2765,380 @@ public partial class PDFReaderPage : Page
         MemoPanelCol.Width = open ? new GridLength(280) : new GridLength(0);
         BtnToggleMemos.Style = (Style)FindResource(open ? "PrimaryButton" : "SecondaryButton");
         if (open) RefreshMemoList(MemoSearchBox.Text);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Adjust panel
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void ToggleAdjust_Click(object sender, RoutedEventArgs e)
+    {
+        bool open = AdjustPanelCol.Width.Value < 1;
+        AdjustPanelCol.Width = open ? new GridLength(240) : new GridLength(0);
+        BtnToggleAdjust.Style = (Style)FindResource(open ? "PrimaryButton" : "SecondaryButton");
+        if (open) UpdateAdjustButtons();
+    }
+
+    private void UpdateAdjustButtons()
+    {
+        bool hasPdf = _renderDocument != null;
+        BtnAdjApplyAll.IsEnabled = hasPdf;
+        BtnAdjSavePdf.IsEnabled  = hasPdf && AdjustedStore != null && AdjustedStore.HasAny;
+    }
+
+    private void AdjSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_suppressAdjSlider) return;
+        LblBrightness.Text = ((int)SliderBrightness.Value).ToString();
+        LblContrast.Text   = ((int)SliderContrast.Value).ToString();
+        LblStroke.Text     = SliderStroke.Value.ToString("F1");
+        LblSharpen.Text    = SliderSharpen.Value.ToString("F1");
+        SaveCurrentAdjSettings();
+        TriggerLiveAdjust();
+    }
+
+    private void AdjAutoLevel_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_suppressAdjSlider) return;
+        SaveCurrentAdjSettings();
+        TriggerLiveAdjust();
+    }
+
+    private void SaveCurrentAdjSettings() => SaveCurrentAdjSettings((int)_currentPage);
+
+    private void SaveCurrentAdjSettings(int page)
+    {
+        _adjSettings[page] = new AdjSettings(
+            SliderBrightness.Value, SliderContrast.Value,
+            SliderStroke.Value, SliderSharpen.Value,
+            ChkAutoLevel.IsChecked == true);
+    }
+
+    private void LoadAdjSettingsForPage(int page)
+    {
+        _suppressAdjSlider = true;
+        if (page >= 0 && _adjSettings.TryGetValue(page, out var s))
+        {
+            SliderBrightness.Value = s.Brightness;
+            SliderContrast.Value   = s.Contrast;
+            SliderStroke.Value     = s.Stroke;
+            SliderSharpen.Value    = s.Sharpen;
+            ChkAutoLevel.IsChecked = s.AutoLevel;
+        }
+        else
+        {
+            SliderBrightness.Value = 0;
+            SliderContrast.Value   = 0;
+            SliderStroke.Value     = 0;
+            SliderSharpen.Value    = 0;
+            ChkAutoLevel.IsChecked = false;
+        }
+        _suppressAdjSlider = false;
+        LblBrightness.Text = ((int)SliderBrightness.Value).ToString();
+        LblContrast.Text   = ((int)SliderContrast.Value).ToString();
+        LblStroke.Text     = SliderStroke.Value.ToString("F1");
+        LblSharpen.Text    = SliderSharpen.Value.ToString("F1");
+    }
+
+    private void TriggerLiveAdjust()
+    {
+        if (_renderDocument == null || AdjustedStore == null) return;
+        _liveAdjCts.Cancel();
+        _liveAdjCts = new CancellationTokenSource();
+        var ct = _liveAdjCts.Token;
+        _ = Task.Delay(350, ct).ContinueWith(
+            _ => Dispatcher.InvokeAsync(() => _ = ApplyAdjustToCurrentAsync()),
+            ct, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
+    }
+
+    private async Task ApplyAdjustToCurrentAsync()
+    {
+        if (_renderDocument == null || AdjustedStore == null) return;
+        var bmp = await RenderPageToBitmapAsync((int)_currentPage);
+        if (bmp == null) return;
+        var adjusted = AdjApplySettings(bmp);
+        bmp.Dispose();
+        var wpfImg = BitmapToBitmapImage(adjusted);
+        adjusted.Dispose();
+        AdjustedStore.Set((int)_currentPage, wpfImg);
+        // Set image directly — avoids re-rendering from PDF which causes flickering
+        PdfPageImage.Source = wpfImg;
+        if ((int)_currentPage < _thumbItems.Count)
+            _thumbItems[(int)_currentPage].Img.Source = wpfImg;
+        BtnAdjSavePdf.IsEnabled = true;
+    }
+
+    private void AdjReset_Click(object sender, RoutedEventArgs e)
+    {
+        _adjSettings.Remove((int)_currentPage);
+        AdjustedStore?.Remove((int)_currentPage);
+
+        _suppressAdjSlider = true;
+        SliderBrightness.Value = 0;
+        SliderContrast.Value   = 0;
+        SliderStroke.Value     = 0;
+        SliderSharpen.Value    = 0;
+        ChkAutoLevel.IsChecked = false;
+        _suppressAdjSlider = false;
+        LblBrightness.Text = "0";
+        LblContrast.Text   = "0";
+        LblStroke.Text     = "0.0";
+        LblSharpen.Text    = "0.0";
+
+        _ = RenderCurrentPageAsync();
+        _ = ResetThumbnailForPageAsync((int)_currentPage);
+    }
+
+    private async void AdjApplyAll_Click(object sender, RoutedEventArgs e)
+    {
+        if (_renderDocument == null || AdjustedStore == null) return;
+        var win = new ProgressWindow($"Applying to {_totalPages} pages…") { Owner = Window.GetWindow(this) };
+        win.Show();
+        bool cancelled = false;
+        try
+        {
+            for (int i = 0; i < (int)_totalPages; i++)
+            {
+                if (win.IsCancelled) { cancelled = true; break; }
+                win.Update(i + 1, (int)_totalPages, $"Page {i + 1} / {_totalPages}…");
+                var bmp = await RenderPageToBitmapAsync(i);
+                if (bmp == null) continue;
+                var adjusted = AdjApplySettings(bmp);
+                bmp.Dispose();
+                AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
+                adjusted.Dispose();
+                SaveCurrentAdjSettings(i);
+            }
+        }
+        finally { win.Close(); }
+        if (!cancelled)
+            await RefreshWithAdjustedImagesAsync();
+        BtnAdjSavePdf.IsEnabled = true;
+    }
+
+    private async void AdjApplyRange_Click(object sender, RoutedEventArgs e)
+    {
+        if (_renderDocument == null || AdjustedStore == null) return;
+        var indices = ParseAdjRange(TxtAdjRange.Text, (int)_totalPages);
+        if (indices.Count == 0) { MessageBox.Show("유효한 페이지 범위를 입력하세요. 예: 1-3,5,7-9", "범위 오류"); return; }
+        var win = new ProgressWindow($"Applying to {indices.Count} pages…") { Owner = Window.GetWindow(this) };
+        win.Show();
+        try
+        {
+            for (int n = 0; n < indices.Count; n++)
+            {
+                if (win.IsCancelled) break;
+                int i = indices[n];
+                win.Update(n + 1, indices.Count, $"Page {i + 1} / {_totalPages}…");
+                var bmp = await RenderPageToBitmapAsync(i);
+                if (bmp == null) continue;
+                var adjusted = AdjApplySettings(bmp);
+                bmp.Dispose();
+                AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
+                adjusted.Dispose();
+                SaveCurrentAdjSettings(i);
+            }
+        }
+        finally { win.Close(); }
+        await RefreshWithAdjustedImagesAsync();
+        BtnAdjSavePdf.IsEnabled = true;
+    }
+
+    private async Task ResetThumbnailForPageAsync(int pageIndex)
+    {
+        if (_renderDocument == null || pageIndex >= _thumbItems.Count) return;
+        try
+        {
+            using var pdfPage = _renderDocument.GetPage((uint)pageIndex);
+            using var stream  = new InMemoryRandomAccessStream();
+            await pdfPage.RenderToStreamAsync(stream,
+                new WinPdf.PdfPageRenderOptions { DestinationWidth = 160 });
+            stream.Seek(0);
+            var ms = new MemoryStream();
+            await stream.AsStream().CopyToAsync(ms);
+            ms.Position = 0;
+            var thumb = new BitmapImage();
+            thumb.BeginInit();
+            thumb.StreamSource = ms;
+            thumb.CacheOption  = BitmapCacheOption.OnLoad;
+            thumb.EndInit();
+            thumb.Freeze();
+            _thumbItems[pageIndex].Img.Source = thumb;
+        }
+        catch { }
+    }
+
+    private void ResetAllAdjustments()
+    {
+        _adjSettings.Clear();
+        AdjustedStore?.Clear();
+        LoadAdjSettingsForPage(-1); // resets sliders to 0
+        BtnAdjSavePdf.IsEnabled = false;
+        RefreshAdjustedThumbnails(); // will find nothing in store, so no-op; thumbnails reset by re-render
+        _ = RenderCurrentPageAsync();
+        _ = RenderThumbnailsAsync(_thumbCts.Token);
+    }
+
+    private async void AdjSavePdf_Click(object sender, RoutedEventArgs e)
+    {
+        if (_renderDocument == null || AdjustedStore == null) return;
+        string? sourcePath = EffectiveFilePath;
+
+        var dlg = new SaveFileDialog { Title = "Save adjusted PDF", Filter = "PDF|*.pdf", DefaultExt = ".pdf" };
+        if (dlg.ShowDialog() != true) return;
+        string outputPath = dlg.FileName;
+
+        var win = new ProgressWindow("Saving PDF…") { Owner = Window.GetWindow(this) };
+        win.Show();
+        bool success = false;
+        try
+        {
+            int total = (int)_totalPages;
+
+            // Step 1 (UI thread): collect images — render any pages not yet in the adjusted store.
+            var images = new BitmapImage?[total];
+            for (int i = 0; i < total; i++)
+            {
+                win.Update(i + 1, total * 3, $"Collecting page {i + 1} / {total}…");
+                images[i] = AdjustedStore.Get(i);
+                if (images[i] == null)
+                {
+                    var bmp = await RenderPageToBitmapAsync(i);
+                    if (bmp != null) { images[i] = BitmapToBitmapImage(bmp); bmp.Dispose(); }
+                }
+            }
+
+            // Step 2 (background thread): PNG-encode images, build PdfSharp document,
+            // copy metadata from the source, then save.
+            // Progress is dispatched back to the UI thread so the ProgressBar can animate.
+            var dispatcher = Dispatcher;
+            await Task.Run(() =>
+            {
+                void Report(int cur, int tot, string msg) =>
+                    dispatcher.Invoke(() => win.Update(cur, tot, msg));
+
+                var outDoc = new PdfDocument();
+
+                for (int i = 0; i < total; i++)
+                {
+                    Report(total + i + 1, total * 3, $"Building page {i + 1} / {total}…");
+                    var img = images[i];
+                    if (img == null) continue;
+
+                    double ptW = img.PixelWidth  * 72.0 / img.DpiX;
+                    double ptH = img.PixelHeight * 72.0 / img.DpiY;
+
+                    var page = outDoc.AddPage();
+                    page.Width  = XUnit.FromPoint(ptW);
+                    page.Height = XUnit.FromPoint(ptH);
+
+                    using var gfx = XGraphics.FromPdfPage(page);
+                    var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                    encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(img));
+                    using var ms = new MemoryStream();
+                    encoder.Save(ms);
+                    ms.Position = 0;
+                    var xImg = XImage.FromStream(ms);
+                    gfx.DrawImage(xImg, 0, 0, ptW, ptH);
+                }
+
+                if (sourcePath != null)
+                {
+                    Report(total * 3, total * 3, "Copying text / bookmarks…");
+                    PdfMetaCopier.CopyMeta(sourcePath, outDoc);
+                }
+
+                outDoc.Save(outputPath);
+            });
+
+            success = true;
+        }
+        finally { win.Close(); }
+
+        if (success)
+        {
+            ResetAllAdjustments();
+            await LoadPdfAsync(outputPath);
+        }
+    }
+
+    private async Task<System.Drawing.Bitmap?> RenderPageToBitmapAsync(int pageIndex)
+    {
+        if (_renderDocument == null) return null;
+        try
+        {
+            using var pdfPage = _renderDocument.GetPage((uint)pageIndex);
+            using var stream  = new InMemoryRandomAccessStream();
+            await pdfPage.RenderToStreamAsync(stream,
+                new WinPdf.PdfPageRenderOptions { DestinationWidth = 1200 });
+            stream.Seek(0);
+            var ms = new MemoryStream();
+            await stream.AsStream().CopyToAsync(ms);
+            ms.Position = 0;
+            return new System.Drawing.Bitmap(ms);
+        }
+        catch { return null; }
+    }
+
+    private System.Drawing.Bitmap AdjApplySettings(System.Drawing.Bitmap src)
+    {
+        float brightness = (float)SliderBrightness.Value / 100f;
+        float contrast   = (float)SliderContrast.Value   / 100f;
+        bool  autoLevel  = ChkAutoLevel.IsChecked == true;
+        float stroke     = (float)SliderStroke.Value;
+        float sharpen    = (float)SliderSharpen.Value;
+
+        var result = src;
+        if (Math.Abs(brightness) > 0.001f)  { var t = ImageProcessingService.AdjustBrightness(result, brightness); if (result != src) result.Dispose(); result = t; }
+        if (Math.Abs(contrast)   > 0.001f)  { var t = ImageProcessingService.AdjustContrast(result, contrast);     if (result != src) result.Dispose(); result = t; }
+        if (autoLevel)                       { var t = ImageProcessingService.AutoLevel(result);                    if (result != src) result.Dispose(); result = t; }
+        if (stroke > 0.01f)                  { var t = ImageProcessingService.ThickenStrokes(result, stroke);       if (result != src) result.Dispose(); result = t; }
+        if (sharpen > 0.01f)                 { var t = ImageProcessingService.Sharpen(result, sharpen);             if (result != src) result.Dispose(); result = t; }
+        if (result == src)
+        {
+            var copy = new System.Drawing.Bitmap(src);
+            return copy;
+        }
+        return result;
+    }
+
+    private static BitmapImage BitmapToBitmapImage(System.Drawing.Bitmap bmp)
+    {
+        using var ms = new MemoryStream();
+        bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+        ms.Position = 0;
+        var bi = new BitmapImage();
+        bi.BeginInit();
+        bi.StreamSource = ms;
+        bi.CacheOption  = BitmapCacheOption.OnLoad;
+        bi.EndInit();
+        bi.Freeze();
+        return bi;
+    }
+
+    private static List<int> ParseAdjRange(string text, int total)
+    {
+        var result = new List<int>();
+        foreach (var part in text.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmed = part.Trim();
+            if (trimmed.Contains('-'))
+            {
+                var sides = trimmed.Split('-');
+                if (sides.Length == 2 &&
+                    int.TryParse(sides[0], out int from) &&
+                    int.TryParse(sides[1], out int to))
+                {
+                    for (int i = from; i <= to && i <= total; i++)
+                        if (i >= 1) result.Add(i - 1);
+                }
+            }
+            else if (int.TryParse(trimmed, out int page) && page >= 1 && page <= total)
+            {
+                result.Add(page - 1);
+            }
+        }
+        return result.Distinct().OrderBy(x => x).ToList();
     }
 
     private void MemoSearch_TextChanged(object sender, TextChangedEventArgs e) =>
@@ -3104,11 +4078,18 @@ public partial class PDFReaderPage : Page
             _editDocument.Save(tmpPath);
             _editDocument.Dispose();
             _editPdfBytes = System.IO.File.ReadAllBytes(tmpPath);  // snapshot for PdfPig
-            _editDocument = PdfReader.Open(tmpPath, PdfDocumentOpenMode.Modify);
+
+            // Open _editDocument from a MemoryStream so tmpPath is not file-locked
+            // by both _editDocument and _renderDocument simultaneously.
+            _editDocument = PdfReader.Open(new MemoryStream(_editPdfBytes), PdfDocumentOpenMode.Modify);
 
             var tmpFile = await StorageFile.GetFileFromPathAsync(tmpPath);
             _renderDocument = await WinPdf.PdfDocument.LoadFromFileAsync(tmpFile);
-            try { System.IO.File.Delete(tmpPath); } catch { }
+
+            // Keep tmpPath alive so EffectiveFilePath reflects rotations/edits.
+            // Clean up the previous temp edited file first.
+            CleanupTempEditedPath();
+            _tempEditedPath = tmpPath;
 
             _totalPages = _renderDocument.PageCount;
             UpdateNavButtons();
@@ -3125,6 +4106,15 @@ public partial class PDFReaderPage : Page
         }
     }
 
+    private void CleanupTempEditedPath()
+    {
+        if (_tempEditedPath != null)
+        {
+            try { System.IO.File.Delete(_tempEditedPath); } catch { }
+            _tempEditedPath = null;
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  Thumbnail panel
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3134,12 +4124,14 @@ public partial class PDFReaderPage : Page
         _thumbCts.Cancel();
         _thumbCts = new CancellationTokenSource();
         _thumbItems.Clear();
+        _thumbSelectedPages.Clear();
+        _thumbLastClickedPage = -1;
         ThumbPanel.Children.Clear();
+        BtnThumbDeletePages.IsEnabled = false;
 
         if (_renderDocument == null) return;
         if (_totalPages == 0) return;
 
-        // Add placeholder containers immediately so the panel shows all pages at once.
         for (uint i = 0; i < _totalPages; i++)
         {
             uint capturedPage = i;
@@ -3154,11 +4146,11 @@ public partial class PDFReaderPage : Page
 
             var numBlock = new TextBlock
             {
-                Text              = $"{i + 1}",
-                FontSize          = 10,
-                Foreground        = new SolidColorBrush(Color.FromRgb(0x9A, 0x9D, 0xB2)),
+                Text                = $"{i + 1}",
+                FontSize            = 10,
+                Foreground          = new SolidColorBrush(Color.FromRgb(0x9A, 0x9D, 0xB2)),
                 HorizontalAlignment = HorizontalAlignment.Center,
-                Margin            = new Thickness(0, 2, 0, 0)
+                Margin              = new Thickness(0, 2, 0, 0)
             };
 
             var stack = new StackPanel { Margin = new Thickness(0) };
@@ -3168,13 +4160,34 @@ public partial class PDFReaderPage : Page
             bool isCurrent = (capturedPage == _currentPage);
             var container = new Border
             {
-                Background   = isCurrent ? ThumbBrushSelected : ThumbBrushNormal,
-                CornerRadius = new CornerRadius(4),
-                Padding      = new Thickness(4),
-                Margin       = new Thickness(0, 0, 0, 4),
-                Cursor       = Cursors.Hand,
-                Child        = stack
+                Background      = isCurrent ? ThumbBrushSelected : ThumbBrushNormal,
+                BorderBrush     = System.Windows.Media.Brushes.Transparent,
+                BorderThickness = new Thickness(2),
+                CornerRadius    = new CornerRadius(4),
+                Padding         = new Thickness(2),
+                Margin          = new Thickness(0, 0, 0, 4),
+                Cursor          = Cursors.Hand,
+                Child           = stack
             };
+
+            // Context menu for deletion
+            var ctxMenu = new ContextMenu();
+            var deleteItem = new MenuItem { Header = "선택 페이지 삭제" };
+            deleteItem.Click += async (_, _) => await DeleteSelectedPagesAsync();
+            ctxMenu.Items.Add(deleteItem);
+            ctxMenu.Opened += (_, _) =>
+            {
+                // Right-click on a non-selected page → replace selection with just this page
+                if (!_thumbSelectedPages.Contains((int)capturedPage))
+                {
+                    _thumbSelectedPages.Clear();
+                    _thumbSelectedPages.Add((int)capturedPage);
+                    _thumbLastClickedPage = (int)capturedPage;
+                    UpdateThumbSelectionBorders();
+                }
+                deleteItem.Header = $"선택 페이지 삭제 ({_thumbSelectedPages.Count}페이지)";
+            };
+            container.ContextMenu = ctxMenu;
 
             container.MouseEnter += (_, _) =>
             {
@@ -3184,19 +4197,84 @@ public partial class PDFReaderPage : Page
             {
                 container.Background = capturedPage == _currentPage ? ThumbBrushSelected : ThumbBrushNormal;
             };
+            container.PreviewMouseLeftButtonDown += (_, _) =>
+            {
+                _thumbDragSourcePage = (int)capturedPage;
+                _thumbDragStartPos   = Mouse.GetPosition(ThumbPanel);
+                _thumbDragInitiated  = false;
+                container.CaptureMouse();
+            };
+            container.MouseMove += (_, e) =>
+            {
+                if (_thumbDragSourcePage < 0 || e.LeftButton != MouseButtonState.Pressed) return;
+                Point pos = e.GetPosition(ThumbPanel);
+                if (_thumbDragInitiated ||
+                    !(Math.Abs(pos.X - _thumbDragStartPos.X) > SystemParameters.MinimumHorizontalDragDistance ||
+                      Math.Abs(pos.Y - _thumbDragStartPos.Y) > SystemParameters.MinimumVerticalDragDistance)) return;
+
+                if (!_thumbSelectedPages.Contains(_thumbDragSourcePage))
+                {
+                    _thumbSelectedPages.Clear();
+                    _thumbSelectedPages.Add(_thumbDragSourcePage);
+                    _thumbLastClickedPage = _thumbDragSourcePage;
+                    UpdateThumbSelectionBorders();
+                }
+                _thumbDragInitiated = true;
+                var pages = _thumbSelectedPages.OrderBy(x => x).ToArray();
+                container.ReleaseMouseCapture();
+                DragDrop.DoDragDrop(container, new DataObject("ThumbPages", pages), DragDropEffects.Move);
+                _thumbDragSourcePage = -1;
+                RemoveThumbDropIndicator();
+                _thumbDropIndex = -1;
+            };
+            container.LostMouseCapture += (_, _) =>
+            {
+                if (!_thumbDragInitiated) _thumbDragSourcePage = -1;
+            };
             container.MouseLeftButtonUp += async (_, _) =>
             {
-                if (capturedPage == _currentPage) return;
-                _currentPage = capturedPage;
-                UpdateNavButtons();
-                await RenderCurrentPageAsync();
+                if (container.IsMouseCaptured) container.ReleaseMouseCapture();
+                bool wasDrag = _thumbDragInitiated;
+                _thumbDragInitiated  = false;
+                _thumbDragSourcePage = -1;
+                if (wasDrag) return;
+
+                bool ctrl  = Keyboard.IsKeyDown(Key.LeftCtrl)  || Keyboard.IsKeyDown(Key.RightCtrl);
+                bool shift = Keyboard.IsKeyDown(Key.LeftShift) || Keyboard.IsKeyDown(Key.RightShift);
+                int  page  = (int)capturedPage;
+
+                if (ctrl)
+                {
+                    if (_thumbSelectedPages.Contains(page)) _thumbSelectedPages.Remove(page);
+                    else                                    _thumbSelectedPages.Add(page);
+                    _thumbLastClickedPage = page;
+                    UpdateThumbSelectionBorders();
+                }
+                else if (shift && _thumbLastClickedPage >= 0)
+                {
+                    int from = Math.Min(_thumbLastClickedPage, page);
+                    int to   = Math.Max(_thumbLastClickedPage, page);
+                    for (int n = from; n <= to; n++) _thumbSelectedPages.Add(n);
+                    UpdateThumbSelectionBorders();
+                }
+                else
+                {
+                    _thumbSelectedPages.Clear();
+                    _thumbLastClickedPage = page;
+                    UpdateThumbSelectionBorders();
+                    if (capturedPage != _currentPage)
+                    {
+                        _currentPage = capturedPage;
+                        UpdateNavButtons();
+                        await RenderCurrentPageAsync();
+                    }
+                }
             };
 
             _thumbItems.Add(new ThumbEntry(imgEl, container));
             ThumbPanel.Children.Add(container);
         }
 
-        // Highlight initial page and render thumbnails in background.
         UpdateThumbnailHighlight();
         _ = RenderThumbnailsAsync(_thumbCts.Token);
     }
@@ -3246,5 +4324,170 @@ public partial class PDFReaderPage : Page
 
         if (_currentPage < _thumbItems.Count)
             _thumbItems[(int)_currentPage].Container.BringIntoView();
+
+        UpdateThumbSelectionBorders();
+    }
+
+    private void UpdateThumbSelectionBorders()
+    {
+        for (int i = 0; i < _thumbItems.Count; i++)
+        {
+            bool marked = _thumbSelectedPages.Contains(i);
+            _thumbItems[i].Container.BorderBrush     = marked
+                ? ThumbBrushDeleteMark
+                : System.Windows.Media.Brushes.Transparent;
+            _thumbItems[i].Container.BorderThickness = new Thickness(marked ? 2 : 0);
+            _thumbItems[i].Container.Padding         = new Thickness(marked ? 2 : 4);
+        }
+        BtnThumbDeletePages.IsEnabled = _thumbSelectedPages.Count > 0;
+    }
+
+    private void BtnThumbDeletePages_Click(object sender, RoutedEventArgs e)
+        => _ = DeleteSelectedPagesAsync();
+
+    private async Task DeleteSelectedPagesAsync()
+    {
+        if (_editDocument is null || _thumbSelectedPages.Count == 0) return;
+
+        int remaining = _editDocument.Pages.Count - _thumbSelectedPages.Count;
+        if (remaining <= 0)
+        {
+            MessageBox.Show("모든 페이지를 삭제할 수 없습니다. 최소 1페이지는 남겨야 합니다.",
+                "삭제 불가", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var result = MessageBox.Show(
+            $"선택한 {_thumbSelectedPages.Count}개 페이지를 삭제하시겠습니까?\n" +
+            $"(저장하기 전까지는 Save As로 원본을 유지할 수 있습니다.)",
+            "페이지 삭제", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (result != MessageBoxResult.Yes) return;
+
+        // Remove in reverse index order so earlier indices stay valid.
+        foreach (int pi in _thumbSelectedPages.OrderByDescending(x => x))
+        {
+            if (pi >= 0 && pi < _editDocument.Pages.Count)
+                _editDocument.Pages.RemoveAt(pi);
+        }
+
+        // Clamp current page to new range.
+        _currentPage = (uint)Math.Min((int)_currentPage, _editDocument.Pages.Count - 1);
+
+        _thumbSelectedPages.Clear();
+        _thumbLastClickedPage = -1;
+
+        SetStatus("페이지 삭제 중…");
+        await ReloadRenderDocumentAsync();
+        StartThumbnailGeneration();
+        SetStatus($"삭제 완료. 남은 페이지: {_editDocument.Pages.Count}");
+    }
+
+    // ─── Thumbnail drag-reorder ───────────────────────────────────────────────
+
+    private void ThumbPanel_DragOver(object sender, DragEventArgs e)
+    {
+        if (!e.Data.GetDataPresent("ThumbPages")) { e.Effects = DragDropEffects.None; return; }
+        e.Effects = DragDropEffects.Move;
+        int idx = GetThumbDropIndex(e.GetPosition(ThumbPanel));
+        if (idx != _thumbDropIndex)
+        {
+            _thumbDropIndex = idx;
+            UpdateThumbDropIndicator();
+        }
+        e.Handled = true;
+    }
+
+    private void ThumbPanel_DragLeave(object sender, DragEventArgs e)
+    {
+        RemoveThumbDropIndicator();
+        _thumbDropIndex = -1;
+    }
+
+    private async void ThumbPanel_Drop(object sender, DragEventArgs e)
+    {
+        RemoveThumbDropIndicator();
+        if (!e.Data.GetDataPresent("ThumbPages")) return;
+        var pages = (int[])e.Data.GetData("ThumbPages");
+        int idx = _thumbDropIndex >= 0 ? _thumbDropIndex : _thumbItems.Count;
+        _thumbDropIndex = -1;
+        await ReorderThumbPagesAsync(pages, idx);
+    }
+
+    private int GetThumbDropIndex(Point posInThumbPanel)
+    {
+        for (int i = 0; i < _thumbItems.Count; i++)
+        {
+            Point topLeft = _thumbItems[i].Container.TranslatePoint(new Point(0, 0), ThumbPanel);
+            double midY = topLeft.Y + _thumbItems[i].Container.ActualHeight / 2;
+            if (posInThumbPanel.Y < midY) return i;
+        }
+        return _thumbItems.Count;
+    }
+
+    private void UpdateThumbDropIndicator()
+    {
+        _thumbDropLine ??= new Border
+        {
+            Height           = 3,
+            Background       = new SolidColorBrush(Color.FromRgb(0x89, 0xB4, 0xFA)),
+            Margin           = new Thickness(4, 0, 4, 2),
+            CornerRadius     = new CornerRadius(1.5),
+            IsHitTestVisible = false
+        };
+
+        if (ThumbPanel.Children.Contains(_thumbDropLine))
+            ThumbPanel.Children.Remove(_thumbDropLine);
+
+        if (_thumbDropIndex >= _thumbItems.Count)
+            ThumbPanel.Children.Add(_thumbDropLine);
+        else
+            ThumbPanel.Children.Insert(_thumbDropIndex, _thumbDropLine);
+    }
+
+    private void RemoveThumbDropIndicator()
+    {
+        if (_thumbDropLine != null && ThumbPanel.Children.Contains(_thumbDropLine))
+            ThumbPanel.Children.Remove(_thumbDropLine);
+    }
+
+    private async Task ReorderThumbPagesAsync(int[] draggedPages, int insertIndex)
+    {
+        if (_editDocument == null || draggedPages.Length == 0) return;
+
+        var draggedSet  = new HashSet<int>(draggedPages);
+        var nonDragged  = Enumerable.Range(0, _thumbItems.Count).Where(i => !draggedSet.Contains(i)).ToList();
+
+        int effectiveInsert = nonDragged.Count(i => i < insertIndex);
+
+        var newOrder = new List<int>();
+        for (int j = 0; j < nonDragged.Count; j++)
+        {
+            if (j == effectiveInsert) newOrder.AddRange(draggedPages);
+            newOrder.Add(nonDragged[j]);
+        }
+        if (effectiveInsert >= nonDragged.Count) newOrder.AddRange(draggedPages);
+
+        // No-op if order unchanged
+        if (newOrder.Select((v, i) => v == i).All(x => x)) return;
+
+        // Save current document to bytes for import
+        string tmpSrc = System.IO.Path.Combine(System.IO.Path.GetTempPath(), System.IO.Path.GetRandomFileName() + ".pdf");
+        _editDocument.Save(tmpSrc);
+        byte[] srcBytes = System.IO.File.ReadAllBytes(tmpSrc);
+
+        var srcDoc = PdfReader.Open(new MemoryStream(srcBytes), PdfDocumentOpenMode.Import);
+        var newDoc  = new PdfDocument();
+        foreach (int pi in newOrder)
+            newDoc.AddPage(srcDoc.Pages[pi]);
+        srcDoc.Dispose();
+
+        _editDocument.Dispose();
+        _editDocument = newDoc;
+        _currentPage  = (uint)Math.Min((int)_currentPage, newDoc.Pages.Count - 1);
+
+        SetStatus("페이지 순서 변경 중…");
+        await ReloadRenderDocumentAsync();
+        StartThumbnailGeneration();
+        SetStatus("페이지 순서 변경 완료.");
     }
 }

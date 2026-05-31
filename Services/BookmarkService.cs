@@ -92,5 +92,19 @@ public sealed class BookmarkService
         return false;
     }
 
+    public void RemovePdfOutlines(string filePath)
+    {
+        bool any = _items.RemoveAll(b =>
+            b.IsFromPdf &&
+            b.FilePath.Equals(filePath, StringComparison.OrdinalIgnoreCase)) > 0;
+        if (any) Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void AddPdfOutlines(IEnumerable<Bookmark> outlines)
+    {
+        foreach (var b in outlines) _items.Add(b);
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
     public void RaiseChanged() => Changed?.Invoke(this, EventArgs.Empty);
 }

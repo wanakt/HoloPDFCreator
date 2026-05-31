@@ -16,7 +16,14 @@ public class AdjustedImageStore
 
     public void Set(int pageIndex, BitmapImage img) => _images[pageIndex] = img;
 
+    public void Remove(int pageIndex) => _images.Remove(pageIndex);
+
     public void Clear() => _images.Clear();
 
     public bool HasAny => _images.Count > 0;
+
+    public IReadOnlyList<(int PageIndex, BitmapImage Image)> GetAll()
+        => _images.OrderBy(kv => kv.Key)
+                  .Select(kv => (kv.Key, kv.Value))
+                  .ToList();
 }

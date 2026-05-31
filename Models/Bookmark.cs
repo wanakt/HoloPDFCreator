@@ -12,6 +12,7 @@ public class Bookmark
     public int?     ParentId   { get; set;  }
     public int      SortOrder  { get; set;  }
     public bool     IsExpanded { get; set;  } = true;
+    public bool     IsFromPdf  { get; init; }
 
     public string FileName => System.IO.Path.GetFileNameWithoutExtension(FilePath);
 }

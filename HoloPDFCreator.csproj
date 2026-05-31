@@ -11,9 +11,18 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
     <PackageReference Include="PDFsharp-WPF" Version="6.1.1" />
     <PackageReference Include="PdfPig" Version="0.1.9" />
+    <PackageReference Include="RapidOcrNet" Version="2.0.0" />
     <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- Additional language models (Korean/Chinese v5, Japanese v4) -->
+  <ItemGroup>
+    <Content Include="models\**\*.*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>
