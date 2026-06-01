@@ -27,16 +27,13 @@ public partial class OcrPage : Page
     {
         public required string DisplayName  { get; init; }
         public Bitmap?         Original     { get; set; }
-        public Bitmap?         Adjusted     { get; set; }
         public BitmapImage?    ThumbSource  { get; set; }
         public BitmapSource?   OcrSource    { get; set; }  // BitmapSource received from PDF Reader
-        public bool            IsAdjusted   => Adjusted != null;
         public bool            IsLoaded     => Original  != null;
 
         public void Dispose()
         {
             Original?.Dispose();
-            Adjusted?.Dispose();
         }
     }
 
@@ -45,7 +42,6 @@ public partial class OcrPage : Page
     private int    _selectedIndex    = -1;
     private int    _lastMarkedIndex  = -1;
     private bool   _isProcessing;
-    private bool   _showAdjusted = true;
     private string? _lastPdfPath;
     private CancellationTokenSource _previewCts  = new();
     private CancellationTokenSource _pdfThumbCts = new();
@@ -96,30 +92,29 @@ public partial class OcrPage : Page
         MediaColor.FromRgb(0x89, 0xDC, 0xEB),
     };
 
-    // ─── Public API ───────────────────────────────────────────────────────────
-
-    public AdjustedImageStore? AdjustedStore { get; set; }
-
     public OcrPage()
     {
         InitializeComponent();
         GridMainContent.LayoutTransform = _zoomTransform;
     }
 
-    public void OverrideWithAdjustedStore()
+    // ─── Public API ───────────────────────────────────────────────────────────
+
+    public void ApplyAdjustedImages(AdjustedImageStore store)
     {
-        if (AdjustedStore == null) return;
-        bool anySet = false;
+        if (!store.HasAny || _items.Count == 0) return;
+        bool changed = false;
         for (int i = 0; i < _items.Count; i++)
         {
-            var img = AdjustedStore.Get(i);
+            var img = store.Get(i);
             if (img == null) continue;
-            _items[i].Adjusted = BitmapSourceToBitmap(img);
-            anySet = true;
+            _items[i].OcrSource = img;
+            changed = true;
         }
-        if (!anySet) return;
+        if (!changed) return;
         RefreshImageList();
-        if (_selectedIndex >= 0) SelectItem(_selectedIndex);
+        if (_selectedIndex >= 0 && _selectedIndex < _items.Count)
+            UpdateMainImageDisplay(_items[_selectedIndex]);
         UpdateButtonStates();
     }
 
@@ -288,7 +283,7 @@ public partial class OcrPage : Page
     {
         if (_sourcePdfPath == null) return true;
         var unloaded = Enumerable.Range(0, _items.Count)
-            .Where(i => _items[i].Original == null).ToList();
+            .Where(i => _items[i].Original == null && _items[i].OcrSource == null).ToList();
         if (unloaded.Count == 0) return true;
 
         string filePath = _sourcePdfPath;
@@ -565,10 +560,10 @@ public partial class OcrPage : Page
         {
             Width             = 7,
             Height            = 7,
-            Fill              = item.IsAdjusted ? BrushDotDone : BrushDotPend,
+            Fill              = (item.IsLoaded || item.OcrSource != null) ? BrushDotDone : BrushDotPend,
             VerticalAlignment = VerticalAlignment.Center,
             Margin            = new Thickness(4, 0, 0, 0),
-            ToolTip           = item.IsAdjusted ? "Adjusted" : "Pending"
+            ToolTip           = (item.IsLoaded || item.OcrSource != null) ? "Ready" : "Pending"
         };
 
         var nameBlock = new TextBlock
@@ -707,9 +702,7 @@ public partial class OcrPage : Page
     private void UpdateMainImageDisplay(ImageItem item)
     {
         BitmapSource src;
-        if (_showAdjusted && item.Adjusted != null)
-            src = BitmapToWpf(item.Adjusted);
-        else if (item.OcrSource != null)
+        if (item.OcrSource != null)
             src = item.OcrSource;
         else
             src = BitmapToWpf(item.Original!);
@@ -728,10 +721,6 @@ public partial class OcrPage : Page
     {
         bool hasItems    = _items.Count > 0;
         bool hasSelected = _selectedIndex >= 0 && _selectedIndex < _items.Count;
-        bool selLoaded   = hasSelected && _items[_selectedIndex].IsLoaded;
-        bool selAdjusted = hasSelected && _items[_selectedIndex].IsAdjusted;
-        bool anyAdjusted = _items.Any(i => i.IsAdjusted);
-        bool isFromPdf   = _sourcePdfPath != null;
 
         int  loadedCount     = _items.Count(i => i.IsLoaded || i.OcrSource != null);
         bool hasPendingPages = loadedCount < _items.Count;
@@ -739,7 +728,6 @@ public partial class OcrPage : Page
         BtnClearAll.IsEnabled    = hasItems && !_isProcessing;
 
         bool imageAvailable  = hasSelected && (_items[_selectedIndex].IsLoaded || _items[_selectedIndex].OcrSource != null);
-        BtnShowAdjusted.IsEnabled = hasSelected && _items[_selectedIndex].IsAdjusted;
         BtnRunOcr.IsEnabled       = imageAvailable && !_isProcessing;
 
         bool hasAnyOcr = _pageRegions.Values.Any(r => r.Count > 0);
@@ -784,34 +772,6 @@ public partial class OcrPage : Page
         BtnNext.IsEnabled = hasSel && _selectedIndex < _items.Count - 1;
     }
 
-    // ─── View toggle ─────────────────────────────────────────────────────────
-
-    private void BtnShowOriginal_Click(object sender, RoutedEventArgs e)
-    {
-        _showAdjusted              = false;
-        BtnShowOriginal.IsChecked  = true;
-        BtnShowAdjusted.IsChecked  = false;
-        if (_selectedIndex >= 0 && _selectedIndex < _items.Count)
-        {
-            var item = _items[_selectedIndex];
-            if (item.IsLoaded || item.OcrSource != null)
-                UpdateMainImageDisplay(item);
-        }
-    }
-
-    private void BtnShowAdjusted_Click(object sender, RoutedEventArgs e)
-    {
-        _showAdjusted              = true;
-        BtnShowOriginal.IsChecked  = false;
-        BtnShowAdjusted.IsChecked  = true;
-        if (_selectedIndex >= 0 && _selectedIndex < _items.Count)
-        {
-            var item = _items[_selectedIndex];
-            if (item.IsLoaded || item.OcrSource != null)
-                UpdateMainImageDisplay(item);
-        }
-    }
-
     // ─── Zoom ─────────────────────────────────────────────────────────────────
 
     private void BtnZoomIn_Click(object sender, RoutedEventArgs e)
@@ -832,7 +792,7 @@ public partial class OcrPage : Page
     {
         if (_selectedIndex < 0 || _selectedIndex >= _items.Count) { ApplyZoom(1.0); return; }
         var item = _items[_selectedIndex];
-        var bmp  = item.Adjusted ?? item.Original;
+        var bmp  = item.Original;
         if (bmp == null) { ApplyZoom(1.0); return; }
         double avW = Math.Max(1, ScrollMain.ActualWidth  - 28);
         double avH = Math.Max(1, ScrollMain.ActualHeight - 28);
@@ -925,7 +885,6 @@ public partial class OcrPage : Page
     private BitmapSource? GetOcrSourceForPage(int index)
     {
         var item = _items[index];
-        if (item.Adjusted != null) return BitmapToWpf(item.Adjusted);
         if (item.OcrSource != null) return item.OcrSource;
         if (item.Original != null) return BitmapToWpf(item.Original);
         return null;
@@ -1033,7 +992,8 @@ public partial class OcrPage : Page
                 finally { pdfDocPool.Enqueue(doc!); pdfPoolSem.Release(); }
             }
 
-            int done = 0;
+            int done   = 0;
+            bool deskew = ChkDeskew.IsChecked == true;
             SetOcrStatus($"OCR 실행 중… (0/{idxList.Count})");
 
             // Both GPU and CPU: N workers in parallel, semaphore in RunOcrRawAsync distributes
@@ -1045,37 +1005,53 @@ public partial class OcrPage : Page
                 {
                     await LazyLoadPageAsync(idx, localCt).ConfigureAwait(false);
 
-                    Bitmap?       bmp    = _items[idx].Adjusted ?? _items[idx].Original;
+                    Bitmap?       bmp    = _items[idx].Original;
                     BitmapSource? wpfSrc = _items[idx].OcrSource;
 
-                    int w, h;
                     SkiaSharp.SKBitmap skBmp;
                     if (bmp != null)
-                    {
-                        w = bmp.Width; h = bmp.Height;
                         skBmp = await Task.Run(() => OcrService.ConvertToSKBitmap(bmp), localCt).ConfigureAwait(false);
-                    }
                     else if (wpfSrc != null)
-                    {
-                        w = wpfSrc.PixelWidth; h = wpfSrc.PixelHeight;
                         skBmp = await Task.Run(() => OcrService.ConvertToSKBitmap(wpfSrc), localCt).ConfigureAwait(false);
-                    }
                     else return;
 
-                    using (skBmp)
+                    if (deskew)
                     {
-                        var regions = await _ocrService.RunOcrRawAsync(skBmp, w, h, localCt).ConfigureAwait(false);
-                        lock (_pageRegions) _pageRegions[idx] = regions;
-                        int current = System.Threading.Interlocked.Increment(ref done);
-                        await Dispatcher.InvokeAsync(() =>
-                        {
-                            OcrProgress.Value = current;
-                            SetOcrStatus($"OCR: {current}/{idxList.Count}…");
-                            win.SetTitle($"OCR — {current} / {idxList.Count} 페이지");
-                            win.Update(current, idxList.Count, $"페이지 {idx + 1} 완료");
-                            if (idx == _selectedIndex) { _currentRegions = regions; DrawOverlays(); ShowResults(); }
-                        });
+                        var corrected = await Task.Run(() => DeskewService.Deskew(skBmp), localCt).ConfigureAwait(false);
+                        if (!ReferenceEquals(corrected, skBmp)) skBmp.Dispose();
+                        skBmp = corrected;
                     }
+
+                    int w = skBmp.Width, h = skBmp.Height;
+                    List<OcrRegion> regions;
+                    try
+                    {
+                        regions = await _ocrService.RunOcrRawAsync(skBmp, w, h, localCt).ConfigureAwait(false);
+                        if (deskew)
+                        {
+                            double residual = DeskewService.ComputeAngleFromRegions(regions, w);
+                            if (Math.Abs(residual) >= 0.2)
+                            {
+                                var fine = await Task.Run(() => DeskewService.RotateByAngle(skBmp, -residual), localCt).ConfigureAwait(false);
+                                if (!ReferenceEquals(fine, skBmp)) skBmp.Dispose();
+                                skBmp = fine;
+                                w = skBmp.Width; h = skBmp.Height;
+                                regions = await _ocrService.RunOcrRawAsync(skBmp, w, h, localCt).ConfigureAwait(false);
+                            }
+                        }
+                    }
+                    finally { skBmp.Dispose(); }
+
+                    lock (_pageRegions) _pageRegions[idx] = regions;
+                    int current = System.Threading.Interlocked.Increment(ref done);
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        OcrProgress.Value = current;
+                        SetOcrStatus($"OCR: {current}/{idxList.Count}…");
+                        win.SetTitle($"OCR — {current} / {idxList.Count} 페이지");
+                        win.Update(current, idxList.Count, $"페이지 {idx + 1} 완료");
+                        if (idx == _selectedIndex) { _currentRegions = regions; DrawOverlays(); ShowResults(); }
+                    });
                 }), ct);
 
             SetOcrStatus($"완료 — {idxList.Count}페이지 처리됨");
@@ -1270,11 +1246,278 @@ public partial class OcrPage : Page
         }
     }
 
+    // ─── Batch OCR & Save ────────────────────────────────────────────────────
+
+    private async void BtnBatchOcrSave_Click(object sender, RoutedEventArgs e)
+    {
+        var fileDlg = new OpenFileDialog
+        {
+            Title       = "일괄 OCR할 PDF 파일 선택",
+            Filter      = "PDF 파일|*.pdf|모든 파일|*.*",
+            Multiselect = true,
+        };
+        if (fileDlg.ShowDialog() != true || fileDlg.FileNames.Length == 0) return;
+
+        // Ask for model/GPU/workers settings (scope is ignored — always All pages per file)
+        var settingsDlg = new OcrRunDialog(
+            totalPages:    1,
+            currentPage:   1,
+            lastModelSize: _lastModelSize,
+            lastGpu:       _lastGpu,
+            lastWorkers:   _lastWorkers)
+        { Owner = Window.GetWindow(this) };
+        if (settingsDlg.ShowDialog() != true) return;
+
+        _lastModelSize = settingsDlg.Result!.ModelSize;
+        _lastGpu       = settingsDlg.Result!.UseGpu;
+        _lastWorkers   = settingsDlg.Result!.Workers;
+
+        await RunBatchOcrAndSaveAsync(
+            fileDlg.FileNames,
+            settingsDlg.Result!.ModelSize,
+            settingsDlg.Result!.UseGpu,
+            settingsDlg.Result!.Workers,
+            ChkDeskew.IsChecked == true);
+    }
+
+    private async Task RunBatchOcrAndSaveAsync(
+        string[] pdfPaths,
+        OcrModelSize modelSize,
+        bool useGpu,
+        int workers,
+        bool deskew = false)
+    {
+        _batchCts?.Cancel();
+        _batchCts = new CancellationTokenSource();
+        var ct = _batchCts.Token;
+
+        _isProcessing             = true;
+        BtnRunOcr.IsEnabled       = false;
+        BtnBatchOcrSave.IsEnabled = false;
+        BtnCancelOcr.Visibility   = Visibility.Visible;
+        OcrProgress.Visibility    = Visibility.Visible;
+        OcrProgress.Value         = 0;
+        OcrProgress.Maximum       = pdfPaths.Length;
+        UpdateButtonStates();
+
+        var progWin = new ProgressWindow($"일괄 OCR — 0 / {pdfPaths.Length} 파일")
+                      { Owner = Window.GetWindow(this) };
+        progWin.Token.Register(() => _batchCts?.Cancel());
+        progWin.Show();
+        await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Render);
+
+        int filesDone = 0;
+        var errors    = new List<string>();
+
+        try
+        {
+            var lang = SelectedOcrLanguage();
+
+            // Initialize OCR engine if needed
+            if (!_ocrService.IsReady          ||
+                _ocrService.UseGpu            != useGpu    ||
+                _ocrService.RequestedWorkers  != workers   ||
+                _ocrService.CurrentLanguage   != lang      ||
+                _ocrService.CurrentModelSize  != modelSize)
+            {
+                progWin.Update(0, pdfPaths.Length, "OCR 엔진 초기화 중…");
+                var progress = new Progress<(int, int, string)>(p =>
+                    progWin.Update(0, pdfPaths.Length, $"초기화: {p.Item3}"));
+                await _ocrService.InitializeAsync(
+                    language:    lang,
+                    progress:    progress,
+                    ct:          ct,
+                    parallelism: workers,
+                    useGpu:      useGpu,
+                    modelSize:   modelSize);
+
+                if (_ocrService.GpuFallbackReason != null)
+                    MessageBox.Show(
+                        $"GPU 초기화 실패 — CPU 모드로 전환됩니다.\n\n{_ocrService.GpuFallbackReason}",
+                        "GPU 초기화 실패", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+
+            foreach (var pdfPath in pdfPaths)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                string baseName = Path.GetFileNameWithoutExtension(pdfPath);
+                string dir      = Path.GetDirectoryName(pdfPath)!;
+                string outPath  = Path.Combine(dir, baseName + "_ocr.pdf");
+
+                progWin.SetTitle($"일괄 OCR — {filesDone + 1} / {pdfPaths.Length} 파일");
+                progWin.Update(filesDone, pdfPaths.Length, $"{baseName} — 준비 중…");
+
+                try
+                {
+                    // 1. Load all pages
+                    var storageFile = await StorageFile.GetFileFromPathAsync(pdfPath);
+                    var pdfDoc      = await WinPdf.PdfDocument.LoadFromFileAsync(storageFile);
+                    int pageCount   = (int)pdfDoc.PageCount;
+
+                    var images  = new BitmapSource[pageCount];
+                    var ocrDims = new (int w, int h)[pageCount];
+
+                    for (int i = 0; i < pageCount; i++)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        progWin.Update(filesDone, pdfPaths.Length,
+                            $"{baseName} — 페이지 로딩 {i + 1} / {pageCount}…");
+
+                        using var pdfPage = pdfDoc.GetPage((uint)i);
+                        using var stream  = new InMemoryRandomAccessStream();
+                        await pdfPage.RenderToStreamAsync(stream,
+                            new WinPdf.PdfPageRenderOptions { DestinationWidth = 1200 });
+                        stream.Seek(0);
+                        var ms = new MemoryStream();
+                        await stream.AsStream().CopyToAsync(ms);
+                        ms.Position = 0;
+                        var bmp = new BitmapImage();
+                        bmp.BeginInit();
+                        bmp.StreamSource = ms;
+                        bmp.CacheOption  = BitmapCacheOption.OnLoad;
+                        bmp.EndInit();
+                        bmp.Freeze();
+                        images[i]  = bmp;
+                        ocrDims[i] = (bmp.PixelWidth, bmp.PixelHeight);
+                    }
+                    if (ct.IsCancellationRequested) break;
+
+                    // 2. OCR all pages in parallel
+                    int pageDone   = 0;
+                    var pageRegions = new Dictionary<int, List<OcrRegion>>();
+
+                    await Task.Run(() => Parallel.ForEachAsync(
+                        Enumerable.Range(0, pageCount),
+                        new ParallelOptions { MaxDegreeOfParallelism = workers, CancellationToken = ct },
+                        async (idx, localCt) =>
+                        {
+                            var skBmp = OcrService.ConvertToSKBitmap(images[idx]);
+                            if (deskew)
+                            {
+                                var corrected = DeskewService.Deskew(skBmp);
+                                if (!ReferenceEquals(corrected, skBmp)) skBmp.Dispose();
+                                skBmp = corrected;
+                            }
+                            int w = skBmp.Width, h = skBmp.Height;
+                            List<OcrRegion> regions;
+                            try
+                            {
+                                regions = await _ocrService.RunOcrRawAsync(skBmp, w, h, localCt).ConfigureAwait(false);
+                                if (deskew)
+                                {
+                                    double residual = DeskewService.ComputeAngleFromRegions(regions, w);
+                                    if (Math.Abs(residual) >= 0.2)
+                                    {
+                                        var fine = DeskewService.RotateByAngle(skBmp, -residual);
+                                        if (!ReferenceEquals(fine, skBmp)) skBmp.Dispose();
+                                        skBmp = fine;
+                                        w = skBmp.Width; h = skBmp.Height;
+                                        regions = await _ocrService.RunOcrRawAsync(skBmp, w, h, localCt).ConfigureAwait(false);
+                                    }
+                                }
+                                // Update image and dims so PDF page matches final deskewed coordinates
+                                if (deskew)
+                                {
+                                    images[idx]  = DeskewService.ToBitmapSource(skBmp);
+                                    ocrDims[idx] = (w, h);
+                                }
+                            }
+                            finally { skBmp.Dispose(); }
+                            lock (pageRegions) pageRegions[idx] = regions;
+                            int cur = System.Threading.Interlocked.Increment(ref pageDone);
+                            await Dispatcher.InvokeAsync(() =>
+                                progWin.Update(filesDone, pdfPaths.Length,
+                                    $"{baseName} — OCR {cur} / {pageCount}…"));
+                        }), ct);
+                    if (ct.IsCancellationRequested) break;
+
+                    // 3. Build and save searchable PDF
+                    progWin.Update(filesDone, pdfPaths.Length, $"{baseName} — PDF 저장 중…");
+
+                    var ocrData = new Dictionary<int, OcrPageData>();
+                    for (int i = 0; i < pageCount; i++)
+                        if (pageRegions.TryGetValue(i, out var regs) && regs.Count > 0)
+                            ocrData[i] = new OcrPageData(regs, ocrDims[i].w, ocrDims[i].h);
+
+                    var capturedImages  = images;
+                    var capturedOcrData = ocrData;
+                    string capturedSrc  = pdfPath;
+                    string capturedOut  = outPath;
+
+                    await Task.Run(() =>
+                    {
+                        var outDoc = new PdfDocument();
+                        for (int i = 0; i < pageCount; i++)
+                        {
+                            var imgSrc = capturedImages[i];
+                            double dpiX = imgSrc.DpiX > 0 ? imgSrc.DpiX : 96.0;
+                            double dpiY = imgSrc.DpiY > 0 ? imgSrc.DpiY : 96.0;
+                            var page    = outDoc.AddPage();
+                            page.Width  = XUnit.FromPoint(imgSrc.PixelWidth  * 72.0 / dpiX);
+                            page.Height = XUnit.FromPoint(imgSrc.PixelHeight * 72.0 / dpiY);
+                            using var gfx   = XGraphics.FromPdfPage(page);
+                            using var imgMs = new MemoryStream();
+                            var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                            enc.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(imgSrc));
+                            enc.Save(imgMs);
+                            imgMs.Position = 0;
+                            using var xImg = XImage.FromStream(imgMs);
+                            gfx.DrawImage(xImg, 0, 0, page.Width.Point, page.Height.Point);
+                        }
+                        if (capturedOcrData.Count > 0)
+                            SearchablePdfService.ApplyTextLayer(outDoc, capturedOcrData);
+                        PdfMetaCopier.CopyMeta(capturedSrc, outDoc, includeText: false);
+                        outDoc.Save(capturedOut);
+                    });
+
+                    filesDone++;
+                    OcrProgress.Value = filesDone;
+                    progWin.SetTitle($"일괄 OCR — {filesDone} / {pdfPaths.Length} 파일");
+                    progWin.Update(filesDone, pdfPaths.Length, $"{baseName} — 완료");
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    errors.Add($"{Path.GetFileName(pdfPath)}: {ex.Message}");
+                }
+            }
+
+            if (!ct.IsCancellationRequested)
+            {
+                string msg = $"일괄 OCR 완료.\n{filesDone} / {pdfPaths.Length}개 파일 저장됨.\n\n" +
+                             $"저장 위치: 원본 파일 폴더 (_ocr.pdf 접미사)";
+                if (errors.Count > 0)
+                    msg += "\n\n오류 발생 파일:\n" + string.Join("\n", errors);
+                MessageBox.Show(msg, "완료", MessageBoxButton.OK,
+                    errors.Count > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            SetOcrStatus("일괄 OCR 취소됨.");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"일괄 OCR 실패:\n{ex.Message}", "오류",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            progWin.Close();
+            _isProcessing             = false;
+            BtnRunOcr.IsEnabled       = _selectedIndex >= 0;
+            BtnBatchOcrSave.IsEnabled = true;
+            BtnCancelOcr.Visibility   = Visibility.Collapsed;
+            OcrProgress.Visibility    = Visibility.Collapsed;
+            UpdateButtonStates();
+        }
+    }
+
     private async Task<BitmapSource?> GetPageBitmapSourceAsync(int index, WinPdf.PdfDocument? srcPdf)
     {
         var item = _items[index];
 
-        if (item.Adjusted != null)  return BitmapToWpf(item.Adjusted);
         if (item.OcrSource != null) return item.OcrSource;
         if (item.Original  != null) return BitmapToWpf(item.Original);
 

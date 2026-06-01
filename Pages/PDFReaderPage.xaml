@@ -57,8 +57,8 @@
                                 <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#CDD6F4"/>
                                 <SolidColorBrush x:Key="{x:Static SystemColors.GrayTextBrushKey}"      Color="#585B70"/>
                             </ContextMenu.Resources>
-                            <MenuItem Header="Open Images…" Click="OpenImages_Click"/>
                             <MenuItem Header="Open PDF…"    Click="OpenPdf_Click"/>
+                            <MenuItem Header="Open Images…" Click="OpenImages_Click"/>
                             <Separator/>
                             <MenuItem x:Name="MenuItemSave"
                                       Header="Save"
@@ -101,6 +101,14 @@
                                       Header="Image Adjust"
                                       IsCheckable="True" IsChecked="False"
                                       Click="MenuViewAdjust_Click"/>
+                            <MenuItem x:Name="MenuViewSearch"
+                                      Header="Search"
+                                      IsCheckable="True" IsChecked="False"
+                                      Click="MenuViewSearch_Click"/>
+                            <MenuItem x:Name="MenuViewCrop"
+                                      Header="Crop"
+                                      IsCheckable="True" IsChecked="False"
+                                      Click="MenuViewCrop_Click"/>
                         </ContextMenu>
                     </Button.ContextMenu>
                 </Button>
@@ -284,6 +292,8 @@
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition x:Name="MemoPanelCol"    Width="0"/>
                 <ColumnDefinition x:Name="AdjustPanelCol"  Width="0"/>
+                <ColumnDefinition x:Name="SearchPanelCol"  Width="0"/>
+                <ColumnDefinition x:Name="CropPanelCol"    Width="0"/>
             </Grid.ColumnDefinitions>
 
             <Grid Grid.Column="0">
@@ -471,6 +481,10 @@
                                     <ContextMenu/>
                                 </Canvas.ContextMenu>
                             </Canvas>
+
+                            <Canvas x:Name="CropCanvas"
+                                    IsHitTestVisible="False"
+                                    Background="Transparent"/>
                         </Grid>
                     </Border>
 
@@ -707,6 +721,241 @@
                         </Grid>
 
                     </StackPanel>
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+
+            <!-- ══════════════ SEARCH PANEL ══════════════ -->
+            <Border Grid.Column="3"
+                    Background="#181825"
+                    BorderBrush="#313244"
+                    BorderThickness="1,0,0,0"
+                    ClipToBounds="True">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Header -->
+                    <Border Grid.Row="0"
+                            Background="#13131F"
+                            BorderBrush="#313244"
+                            BorderThickness="0,0,0,1"
+                            Padding="10,6">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0"
+                                       Text="Search"
+                                       FontSize="11" FontWeight="SemiBold"
+                                       Foreground="#89B4FA"
+                                       VerticalAlignment="Center"/>
+                            <Button Grid.Column="1"
+                                    Content="✕" FontSize="10"
+                                    Padding="4,2"
+                                    Style="{StaticResource SecondaryButton}"
+                                    ToolTip="Hide Search"
+                                    Click="BtnHideSearch_Click"/>
+                        </Grid>
+                    </Border>
+
+                    <!-- Input area -->
+                    <Border Grid.Row="1"
+                            Background="#1E1E2E"
+                            BorderBrush="#313244"
+                            BorderThickness="0,0,0,1"
+                            Padding="8,8">
+                        <StackPanel>
+                            <Grid Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="TxtSearchBox"
+                                         Grid.Column="0"
+                                         Background="#313244"
+                                         Foreground="#CDD6F4"
+                                         CaretBrush="#CDD6F4"
+                                         BorderBrush="#45475A"
+                                         BorderThickness="1"
+                                         Padding="6,5"
+                                         FontSize="12"
+                                         KeyDown="TxtSearch_KeyDown"/>
+                                <Button x:Name="BtnSearch"
+                                        Grid.Column="1"
+                                        Content="▶"
+                                        Width="28" Height="28"
+                                        Margin="4,0,0,0"
+                                        Style="{StaticResource PrimaryButton}"
+                                        FontSize="10"
+                                        Padding="0"
+                                        Click="BtnSearch_Click"/>
+                            </Grid>
+                            <CheckBox x:Name="ChkSearchWithin"
+                                      Content="결과 내 재검색"
+                                      FontSize="11"
+                                      Foreground="#A6ADC8"
+                                      Margin="0,0,0,4"/>
+                            <TextBlock x:Name="TxtSearchStatus"
+                                       Text=""
+                                       FontSize="10"
+                                       Foreground="#585B70"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Results list -->
+                    <ScrollViewer Grid.Row="2"
+                                  VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled"
+                                  Background="#181825">
+                        <StackPanel x:Name="SearchResultsPanel" Margin="4,4,4,8"/>
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+
+            <!-- ══════════════ CROP PANEL ══════════════ -->
+            <Border Grid.Column="4"
+                    Background="#181825"
+                    BorderBrush="#313244"
+                    BorderThickness="1,0,0,0"
+                    ClipToBounds="True">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Header -->
+                    <Border Grid.Row="0"
+                            Background="#13131F"
+                            BorderBrush="#313244"
+                            BorderThickness="0,0,0,1"
+                            Padding="10,6">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0"
+                                       Text="Crop"
+                                       FontSize="11" FontWeight="SemiBold"
+                                       Foreground="#89B4FA"
+                                       VerticalAlignment="Center"/>
+                            <Button Grid.Column="1"
+                                    Content="✕" FontSize="10"
+                                    Padding="4,2"
+                                    Style="{StaticResource SecondaryButton}"
+                                    ToolTip="Hide Crop"
+                                    Click="BtnHideCrop_Click"/>
+                        </Grid>
+                    </Border>
+
+                    <!-- Content -->
+                    <ScrollViewer Grid.Row="1"
+                                  VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel Margin="12,12,12,12">
+
+                            <TextBlock Text="Crop (pt)"
+                                       FontSize="12" FontWeight="SemiBold"
+                                       Foreground="#89B4FA" Margin="0,0,0,10"/>
+
+                            <Grid Margin="0,0,0,4">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="54"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Top" FontSize="11"
+                                           Foreground="#A6ADC8" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TxtCropTop" Grid.Column="1"
+                                         Text="0" FontSize="12" Padding="6,4"
+                                         TextChanged="CropInput_Changed"/>
+                            </Grid>
+                            <Grid Margin="0,0,0,4">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="54"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Bottom" FontSize="11"
+                                           Foreground="#A6ADC8" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TxtCropBottom" Grid.Column="1"
+                                         Text="0" FontSize="12" Padding="6,4"
+                                         TextChanged="CropInput_Changed"/>
+                            </Grid>
+                            <Grid Margin="0,0,0,4">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="54"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Left" FontSize="11"
+                                           Foreground="#A6ADC8" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TxtCropLeft" Grid.Column="1"
+                                         Text="0" FontSize="12" Padding="6,4"
+                                         TextChanged="CropInput_Changed"/>
+                            </Grid>
+                            <Grid Margin="0,0,0,12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="54"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Right" FontSize="11"
+                                           Foreground="#A6ADC8" VerticalAlignment="Center"/>
+                                <TextBox x:Name="TxtCropRight" Grid.Column="1"
+                                         Text="0" FontSize="12" Padding="6,4"
+                                         TextChanged="CropInput_Changed"/>
+                            </Grid>
+
+                            <Button x:Name="BtnCropApplyPage"
+                                    Content="Crop This Page"
+                                    Style="{StaticResource PrimaryButton}"
+                                    FontSize="12" Padding="8,6"
+                                    IsEnabled="False"
+                                    Click="BtnCropApplyPage_Click"
+                                    Margin="0,0,0,6"/>
+
+                            <Button x:Name="BtnCropApplyAll"
+                                    Content="Crop All Pages"
+                                    Style="{StaticResource SecondaryButton}"
+                                    FontSize="12" Padding="8,6"
+                                    IsEnabled="False"
+                                    Click="BtnCropApplyAll_Click"
+                                    Margin="0,0,0,6"/>
+
+                            <Grid Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="6"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Button x:Name="BtnCropApplyOdd"
+                                        Grid.Column="0"
+                                        Content="Crop Odd"
+                                        Style="{StaticResource SecondaryButton}"
+                                        FontSize="11" Padding="4,5"
+                                        IsEnabled="{Binding IsEnabled, ElementName=BtnCropApplyAll}"
+                                        Click="BtnCropApplyOdd_Click"/>
+                                <Button x:Name="BtnCropApplyEven"
+                                        Grid.Column="2"
+                                        Content="Crop Even"
+                                        Style="{StaticResource SecondaryButton}"
+                                        FontSize="11" Padding="4,5"
+                                        IsEnabled="{Binding IsEnabled, ElementName=BtnCropApplyAll}"
+                                        Click="BtnCropApplyEven_Click"/>
+                            </Grid>
+
+                            <Button x:Name="BtnCropReset"
+                                    Content="Reset Crop"
+                                    Style="{StaticResource SecondaryButton}"
+                                    FontSize="11" Padding="8,4" Height="24"
+                                    IsEnabled="{Binding IsEnabled, ElementName=BtnCropApplyAll}"
+                                    Click="BtnCropReset_Click"/>
+
+                        </StackPanel>
                     </ScrollViewer>
                 </Grid>
             </Border>

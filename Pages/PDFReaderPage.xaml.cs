@@ -147,8 +147,20 @@ public partial class PDFReaderPage : Page
     };
 
     // ─── Colors ───────────────────────────────────────────────────────────────
-    private static readonly Brush HoverBrush    = new SolidColorBrush(Color.FromArgb(70,  137, 180, 250));
-    private static readonly Brush SelectedBrush = new SolidColorBrush(Color.FromArgb(160, 137, 180, 250));
+    private static readonly Brush HoverBrush           = new SolidColorBrush(Color.FromArgb(70,  137, 180, 250));
+    private static readonly Brush SelectedBrush        = new SolidColorBrush(Color.FromArgb(160, 137, 180, 250));
+    private static readonly Brush SearchHighlightBrush = new SolidColorBrush(Color.FromArgb(178, 255, 220, 0));
+
+    // ─── Crop state ───────────────────────────────────────────────────────────
+    private double _cropTop    = 0;
+    private double _cropBottom = 0;
+    private double _cropLeft   = 0;
+    private double _cropRight  = 0;
+    private bool   _suppressCropInput;
+
+    // ─── Search highlight state ───────────────────────────────────────────────
+    private string?      _searchHighlightQuery   = null;
+    private HashSet<int> _searchHighlightIndices = new();
 
     public PDFReaderPage()
     {
@@ -418,6 +430,8 @@ public partial class PDFReaderPage : Page
             CleanupTempImagePdf();
         }
         _pageImagePaths.Clear();
+        _searchHighlightQuery = null;
+        _searchHighlightIndices.Clear();
         // A new PDF load invalidates any prior edit-temp (rotation etc.).
         // Don't clean up if _tempEditedPath IS the file being loaded (that would delete it mid-load).
         if (filePath != _tempEditedPath)
@@ -1345,32 +1359,49 @@ public partial class PDFReaderPage : Page
             PdfPageImage.Height  = double.NaN;
             PdfPageImage.Stretch = Stretch.Uniform;
 
-            // Clear stale previews while new page renders.
-            PrevPagesPanel.Children.Clear();
-            NextPagesPanel.Children.Clear();
-
             int dispW = displaySrc.PixelWidth;
             int dispH = displaySrc.PixelHeight;
 
             if (_currentFilePath is not null && _renderDocument is not null)
                 await PopulateTextOverlayAsync(_currentFilePath, (int)_currentPage, dispW, dispH);
 
-            // Pre-render prev pages (await so PrevPagesPanel.ActualHeight is ready for scroll offset).
-            await RenderPrevPagesAsync(dispH);
+            // Apply search highlights over the freshly built word borders.
+            ComputeSearchHighlights();
+            RefreshHighlights();
 
-            // Place scroll: preserve position for adjust re-renders, go to page top otherwise.
+            // Load and show crop box for the current page.
+            LoadCropBoxForCurrentPage();
+            UpdateCropOverlay();
+
+            if (!preserveScroll)
+            {
+                // Clear stale previews while new page renders.
+                PrevPagesPanel.Children.Clear();
+                NextPagesPanel.Children.Clear();
+
+                // Pre-render prev pages (await so PrevPagesPanel.ActualHeight is ready for scroll offset).
+                await RenderPrevPagesAsync(dispH);
+            }
+
+            // Place scroll: during page transitions the caller handles scroll positioning,
+            // so only scroll here for non-transition renders (nav buttons, adjust re-renders, etc.).
             await Dispatcher.InvokeAsync(() =>
             {
-                double prevH = PrevPagesPanel.ActualHeight;
-                PdfScrollViewer.ScrollToVerticalOffset(prevH + savedLocalOffset);
                 if (!_pageTransitioning)
+                {
+                    double prevH = PrevPagesPanel.ActualHeight;
+                    PdfScrollViewer.ScrollToVerticalOffset(prevH + savedLocalOffset);
                     UpdateGlobalScrollBar();
+                }
             }, System.Windows.Threading.DispatcherPriority.Render);
 
-            // Pre-render next pages for smooth scrolling (intentional fire-and-forget).
+            if (!preserveScroll)
+            {
+                // Pre-render next pages for smooth scrolling (intentional fire-and-forget).
 #pragma warning disable CS4014
-            RenderNextPagesAsync(dispH);
+                RenderNextPagesAsync(dispH);
 #pragma warning restore CS4014
+            }
 
             SetStatus(_pageWords.Count > 0
                 ? $"Page {_currentPage + 1} / {_totalPages}  ·  Drag or click to select"
@@ -1610,6 +1641,9 @@ public partial class PDFReaderPage : Page
         DrawingCanvas.Width  = imageWidth;
         DrawingCanvas.Height = imageHeight;
         RefreshDrawingCanvas();
+
+        CropCanvas.Width  = imageWidth;
+        CropCanvas.Height = imageHeight;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2102,8 +2136,50 @@ public partial class PDFReaderPage : Page
     private void RefreshHighlights()
     {
         for (int i = 0; i < _pageWords.Count; i++)
-            SetWordBackground(i, _selectedIndices.Contains(i) ? SelectedBrush : Brushes.Transparent);
+        {
+            Brush brush;
+            if (_selectedIndices.Contains(i))
+                brush = SelectedBrush;
+            else if (_searchHighlightIndices.Contains(i))
+                brush = SearchHighlightBrush;
+            else
+                brush = Brushes.Transparent;
+            SetWordBackground(i, brush);
+        }
         _lastHoverIndex = -1;
+    }
+
+    private void ComputeSearchHighlights()
+    {
+        _searchHighlightIndices.Clear();
+        if (string.IsNullOrEmpty(_searchHighlightQuery) || _pageWords.Count == 0) return;
+
+        var sb      = new System.Text.StringBuilder();
+        var wStarts = new int[_pageWords.Count];
+        for (int i = 0; i < _pageWords.Count; i++)
+        {
+            wStarts[i] = sb.Length;
+            sb.Append(_pageWords[i].Text);
+            if (i < _pageWords.Count - 1) sb.Append(' ');
+        }
+
+        string text  = sb.ToString();
+        string query = _searchHighlightQuery;
+        var    comp  = StringComparison.OrdinalIgnoreCase;
+        int    pos   = 0;
+        while (pos < text.Length)
+        {
+            int idx = text.IndexOf(query, pos, comp);
+            if (idx < 0) break;
+            int end = idx + query.Length;
+            for (int w = 0; w < _pageWords.Count; w++)
+            {
+                int wEnd = wStarts[w] + _pageWords[w].Text.Length;
+                if (wStarts[w] < end && wEnd > idx)
+                    _searchHighlightIndices.Add(w);
+            }
+            pos = idx + 1;
+        }
     }
 
     private void UpdateSelectionStatus()
@@ -2864,10 +2940,30 @@ public partial class PDFReaderPage : Page
     private void BtnHideAdjust_Click(object sender, RoutedEventArgs e)
         => SetAdjustPanel(false);
 
+    private void SetCropPanel(bool visible)
+    {
+        CropPanelCol.Width     = visible ? new GridLength(210) : new GridLength(0);
+        MenuViewCrop.IsChecked = visible;
+        if (visible) UpdateCropButtons();
+    }
+
+    private void MenuViewCrop_Click(object sender, RoutedEventArgs e)
+        => SetCropPanel(MenuViewCrop.IsChecked);
+
+    private void BtnHideCrop_Click(object sender, RoutedEventArgs e)
+        => SetCropPanel(false);
+
     private void UpdateAdjustButtons()
     {
         bool hasPdf = _renderDocument != null;
         BtnAdjApplyAll.IsEnabled = hasPdf;
+    }
+
+    private void UpdateCropButtons()
+    {
+        bool hasPdf = _renderDocument != null;
+        BtnCropApplyPage.IsEnabled = hasPdf;
+        BtnCropApplyAll.IsEnabled  = hasPdf;
     }
 
     private void AdjSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -4107,6 +4203,20 @@ public partial class PDFReaderPage : Page
     //  Page Rotation
     // ═══════════════════════════════════════════════════════════════════════════
 
+    private async Task RotatePagesAsync(IEnumerable<int> pageIndices, int angle)
+    {
+        if (_editDocument is null) return;
+        foreach (int pi in pageIndices)
+        {
+            var page = _editDocument.Pages[pi];
+            page.Rotate = ((page.Rotate + angle) % 360 + 360) % 360;
+        }
+        SetStatus("회전 적용 중…");
+        await ReloadRenderDocumentAsync();
+        StartThumbnailGeneration();
+        SetStatus($"회전 완료 ({angle}°).");
+    }
+
     private async void RotatePage_Click(object sender, RoutedEventArgs e)
     {
         if (_totalPages == 0) return;
@@ -4135,6 +4245,7 @@ public partial class PDFReaderPage : Page
 
         SetStatus("회전 적용 중…");
         await ReloadRenderDocumentAsync();
+        StartThumbnailGeneration();
         SetStatus($"회전 완료 ({dlg.Angle}°).");
     }
 
@@ -4256,6 +4367,18 @@ public partial class PDFReaderPage : Page
                 await ExtractPagesToPdfAsync(_thumbSelectedPages.OrderBy(x => x).ToArray());
             ctxMenu.Items.Add(extractPdfItem);
             ctxMenu.Items.Add(new Separator());
+            var rotateMenu = new MenuItem { Header = "회전" };
+            var rotateCwItem   = new MenuItem { Header = "시계방향 90°" };
+            var rotateCcwItem  = new MenuItem { Header = "반시계방향 90°" };
+            var rotate180Item  = new MenuItem { Header = "180°" };
+            rotateCwItem.Click  += async (_, _) => await RotatePagesAsync(_thumbSelectedPages.OrderBy(x => x).ToArray(), 90);
+            rotateCcwItem.Click += async (_, _) => await RotatePagesAsync(_thumbSelectedPages.OrderBy(x => x).ToArray(), 270);
+            rotate180Item.Click += async (_, _) => await RotatePagesAsync(_thumbSelectedPages.OrderBy(x => x).ToArray(), 180);
+            rotateMenu.Items.Add(rotateCwItem);
+            rotateMenu.Items.Add(rotateCcwItem);
+            rotateMenu.Items.Add(rotate180Item);
+            ctxMenu.Items.Add(rotateMenu);
+            ctxMenu.Items.Add(new Separator());
             var deleteItem = new MenuItem { Header = "선택 페이지 삭제" };
             deleteItem.Click += async (_, _) => await DeleteSelectedPagesAsync();
             ctxMenu.Items.Add(deleteItem);
@@ -4272,6 +4395,7 @@ public partial class PDFReaderPage : Page
                 int n = _thumbSelectedPages.Count;
                 extractImgItem.Header = $"이미지로 추출… ({n}페이지)";
                 extractPdfItem.Header = $"PDF로 추출… ({n}페이지)";
+                rotateMenu.Header     = $"회전 ({n}페이지)";
                 deleteItem.Header     = $"선택 페이지 삭제 ({n}페이지)";
             };
             container.ContextMenu = ctxMenu;
@@ -4986,5 +5110,406 @@ public partial class PDFReaderPage : Page
         await ReloadRenderDocumentAsync();
         StartThumbnailGeneration();
         SetStatus("페이지 순서 변경 완료.");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Full-document Search
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private record SearchHit(int PageIndex, string Before, string MatchText, string After);
+
+    private List<SearchHit>           _searchHits      = new();
+    private HashSet<int>              _searchBasePages = new();
+    private CancellationTokenSource?  _searchCts;
+
+    private static readonly SolidColorBrush SrchMatchBrush =
+        MakeFrozen(0xF9, 0xE2, 0xAF);   // warm yellow — match highlight
+    private static readonly SolidColorBrush SrchTextBrush  =
+        MakeFrozen(0xA6, 0xAD, 0xC8);   // muted text
+    private static readonly SolidColorBrush SrchNormBrush  =
+        MakeFrozen(0x18, 0x18, 0x25);   // card normal bg
+    private static readonly SolidColorBrush SrchHoverBrush =
+        MakeFrozen(0x31, 0x32, 0x44);   // card hover bg
+    private static readonly SolidColorBrush SrchBadgeBrush =
+        MakeFrozen(0x31, 0x32, 0x44);   // page badge bg
+    private static readonly SolidColorBrush SrchBadgeFg    =
+        MakeFrozen(0x89, 0xB4, 0xFA);   // page badge text
+
+    private static SolidColorBrush MakeFrozen(byte r, byte g, byte b)
+    {
+        var br = new SolidColorBrush(Color.FromRgb(r, g, b));
+        br.Freeze();
+        return br;
+    }
+
+    // ── Panel toggle ─────────────────────────────────────────────────────────
+
+    private void SetSearchPanel(bool visible)
+    {
+        SearchPanelCol.Width     = visible ? new GridLength(270) : new GridLength(0);
+        MenuViewSearch.IsChecked = visible;
+        if (visible) TxtSearchBox.Focus();
+    }
+
+    private void MenuViewSearch_Click(object sender, RoutedEventArgs e)
+        => SetSearchPanel(MenuViewSearch.IsChecked);
+
+    private void BtnHideSearch_Click(object sender, RoutedEventArgs e)
+        => SetSearchPanel(false);
+
+    // ── Search trigger ───────────────────────────────────────────────────────
+
+    private async void TxtSearch_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter) await RunSearchAsync();
+    }
+
+    private async void BtnSearch_Click(object sender, RoutedEventArgs e)
+        => await RunSearchAsync();
+
+    private async Task RunSearchAsync()
+    {
+        string query = TxtSearchBox.Text.Trim();
+
+        if (_renderDocument is null) return;
+
+        if (string.IsNullOrEmpty(query))
+        {
+            _searchHits.Clear();
+            _searchBasePages.Clear();
+            _searchHighlightQuery = null;
+            _searchHighlightIndices.Clear();
+            RefreshHighlights();
+            SearchResultsPanel.Children.Clear();
+            TxtSearchStatus.Text = "";
+            return;
+        }
+
+        bool within = ChkSearchWithin.IsChecked == true && _searchBasePages.Count > 0;
+        HashSet<int>? restrictPages = within ? new HashSet<int>(_searchBasePages) : null;
+
+        _searchCts?.Cancel();
+        _searchCts = new CancellationTokenSource();
+
+        BtnSearch.IsEnabled  = false;
+        TxtSearchStatus.Text = "검색 중…";
+        SearchResultsPanel.Children.Clear();
+
+        try
+        {
+            var hits = await SearchDocumentAsync(query, restrictPages, _searchCts.Token);
+            _searchHits           = hits;
+            _searchHighlightQuery = query;
+
+            if (!within)
+                _searchBasePages = hits.Select(h => h.PageIndex).ToHashSet();
+
+            // Highlight matches on the currently visible page immediately.
+            ComputeSearchHighlights();
+            RefreshHighlights();
+
+            ShowSearchResults(hits);
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            BtnSearch.IsEnabled = true;
+        }
+    }
+
+    // ── Core search logic ────────────────────────────────────────────────────
+
+    private async Task<List<SearchHit>> SearchDocumentAsync(
+        string query, HashSet<int>? restrictToPages, CancellationToken ct)
+    {
+        var hits     = new List<SearchHit>();
+        byte[]? bytes = _editPdfBytes;
+        string? path  = _currentFilePath;
+        int total     = (int)_totalPages;
+        if (total == 0 || (bytes == null && path == null)) return hits;
+
+        await Task.Run(() =>
+        {
+            try
+            {
+                var doc = bytes != null
+                    ? PigPdf.PdfDocument.Open(bytes)
+                    : PigPdf.PdfDocument.Open(path!);
+                using (doc)
+                {
+                    int pageCount = Math.Min(doc.NumberOfPages, total);
+                    var comp      = StringComparison.OrdinalIgnoreCase;
+                    for (int p = 0; p < pageCount && hits.Count < 500; p++)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        if (restrictToPages != null && !restrictToPages.Contains(p)) continue;
+
+                        var page  = doc.GetPage(p + 1);
+                        var words = NearestNeighbourWordExtractor.Instance
+                            .GetWords(page.Letters)
+                            .Select(w => w.Text)
+                            .ToList();
+                        if (words.Count == 0) continue;
+
+                        string text  = string.Join(" ", words);
+                        int    start = 0;
+                        while (start < text.Length && hits.Count < 500)
+                        {
+                            int idx = text.IndexOf(query, start, comp);
+                            if (idx < 0) break;
+
+                            int s  = Math.Max(0, idx - 40);
+                            int e2 = Math.Min(text.Length, idx + query.Length + 40);
+
+                            string before = (s > 0 ? "…" : "") + text[s..idx];
+                            string match  = text[idx..(idx + query.Length)];
+                            string after  = text[(idx + query.Length)..e2]
+                                          + (e2 < text.Length ? "…" : "");
+
+                            hits.Add(new SearchHit(p, before, match, after));
+                            start = idx + query.Length;
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { }
+        }, ct);
+
+        // Already in page order (we iterate pages sequentially)
+        return hits;
+    }
+
+    // ── Results display ──────────────────────────────────────────────────────
+
+    private void ShowSearchResults(List<SearchHit> hits)
+    {
+        SearchResultsPanel.Children.Clear();
+
+        if (hits.Count == 0)
+        {
+            TxtSearchStatus.Text = "결과 없음";
+            SearchResultsPanel.Children.Add(new TextBlock
+            {
+                Text         = "검색 결과가 없습니다.",
+                FontSize     = 11,
+                Foreground   = new SolidColorBrush(Color.FromRgb(0x45, 0x47, 0x5A)),
+                TextWrapping = TextWrapping.Wrap,
+                Margin       = new Thickness(8, 8, 8, 0),
+            });
+            return;
+        }
+
+        int pageCount = hits.Select(h => h.PageIndex).Distinct().Count();
+        TxtSearchStatus.Text = $"{hits.Count}개 결과  ·  {pageCount}페이지";
+
+        foreach (var hit in hits)
+        {
+            int capturedPage = hit.PageIndex;
+
+            var badge = new Border
+            {
+                Background        = SrchBadgeBrush,
+                CornerRadius      = new CornerRadius(4),
+                Padding           = new Thickness(5, 2, 5, 2),
+                Margin            = new Thickness(0, 2, 6, 0),
+                VerticalAlignment = VerticalAlignment.Top,
+                Child             = new TextBlock
+                {
+                    Text       = $"p.{hit.PageIndex + 1}",
+                    FontSize   = 10,
+                    Foreground = SrchBadgeFg,
+                    FontWeight = FontWeights.SemiBold,
+                },
+            };
+
+            var snippet = new TextBlock { TextWrapping = TextWrapping.Wrap, FontSize = 11 };
+            snippet.Inlines.Add(new System.Windows.Documents.Run(hit.Before)
+                { Foreground = SrchTextBrush });
+            snippet.Inlines.Add(new System.Windows.Documents.Run(hit.MatchText)
+                { Foreground = SrchMatchBrush, FontWeight = FontWeights.Bold });
+            snippet.Inlines.Add(new System.Windows.Documents.Run(hit.After)
+                { Foreground = SrchTextBrush });
+
+            var row = new Grid();
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            Grid.SetColumn(badge,   0);
+            Grid.SetColumn(snippet, 1);
+            row.Children.Add(badge);
+            row.Children.Add(snippet);
+
+            var card = new Border
+            {
+                Padding    = new Thickness(8, 6, 8, 6),
+                Margin     = new Thickness(0, 0, 0, 2),
+                Background = SrchNormBrush,
+                Cursor     = Cursors.Hand,
+                Child      = row,
+            };
+            card.MouseEnter += (_, _) => card.Background = SrchHoverBrush;
+            card.MouseLeave += (_, _) => card.Background = SrchNormBrush;
+            card.MouseLeftButtonUp += async (_, _) =>
+            {
+                if (capturedPage != (int)_currentPage)
+                {
+                    _currentPage = (uint)capturedPage;
+                    UpdateNavButtons();
+                    await RenderCurrentPageAsync();
+                }
+            };
+
+            SearchResultsPanel.Children.Add(card);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Crop
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void LoadCropBoxForCurrentPage()
+    {
+        if (!_adjPanelReady) return;
+        _suppressCropInput = true;
+        _cropTop = _cropBottom = _cropLeft = _cropRight = 0;
+
+        if (_editDocument != null && _currentPage < (uint)_editDocument.Pages.Count)
+        {
+            var page = _editDocument.Pages[(int)_currentPage];
+            var mb = page.MediaBox;
+            if (page.Elements.ContainsKey("/CropBox"))
+            {
+                var cb = page.CropBox;
+                _cropLeft   = Math.Max(0, Math.Round(cb.X1 - mb.X1));
+                _cropBottom = Math.Max(0, Math.Round(cb.Y1 - mb.Y1));
+                _cropRight  = Math.Max(0, Math.Round(mb.X2 - cb.X2));
+                _cropTop    = Math.Max(0, Math.Round(mb.Y2 - cb.Y2));
+            }
+        }
+
+        TxtCropTop.Text    = ((int)_cropTop).ToString();
+        TxtCropBottom.Text = ((int)_cropBottom).ToString();
+        TxtCropLeft.Text   = ((int)_cropLeft).ToString();
+        TxtCropRight.Text  = ((int)_cropRight).ToString();
+        _suppressCropInput = false;
+    }
+
+    private void UpdateCropOverlay()
+    {
+        CropCanvas.Children.Clear();
+        double w = CropCanvas.Width;
+        double h = CropCanvas.Height;
+        if (double.IsNaN(w) || double.IsNaN(h) || w <= 0 || h <= 0) return;
+        if (_currentPagePdfWidth <= 0 || _currentPagePdfHeight <= 0) return;
+
+        double scaleX = w / _currentPagePdfWidth;
+        double scaleY = h / _currentPagePdfHeight;
+
+        double topPx    = Math.Clamp(_cropTop    * scaleY, 0, h);
+        double bottomPx = Math.Clamp(h - _cropBottom * scaleY, 0, h);
+        double leftPx   = Math.Clamp(_cropLeft   * scaleX, 0, w);
+        double rightPx  = Math.Clamp(w - _cropRight  * scaleX, 0, w);
+
+        var shadeBrush = new SolidColorBrush(Color.FromArgb(80, 0, 0, 0));
+
+        void AddShade(double x, double y, double rw, double rh)
+        {
+            if (rw <= 0 || rh <= 0) return;
+            var rect = new System.Windows.Shapes.Rectangle { Width = rw, Height = rh, Fill = shadeBrush };
+            Canvas.SetLeft(rect, x);
+            Canvas.SetTop(rect,  y);
+            CropCanvas.Children.Add(rect);
+        }
+
+        AddShade(0,       0,        w,            topPx);
+        AddShade(0,       bottomPx, w,            h - bottomPx);
+        AddShade(0,       topPx,    leftPx,       bottomPx - topPx);
+        AddShade(rightPx, topPx,    w - rightPx,  bottomPx - topPx);
+
+        void AddDashedLine(double x1, double y1, double x2, double y2)
+        {
+            var line = new System.Windows.Shapes.Line
+            {
+                X1 = x1, Y1 = y1, X2 = x2, Y2 = y2,
+                Stroke = Brushes.Yellow,
+                StrokeThickness = 1.5,
+                StrokeDashArray = new DoubleCollection(new double[] { 6, 4 }),
+            };
+            CropCanvas.Children.Add(line);
+        }
+
+        if (_cropTop    > 0) AddDashedLine(0,      topPx,    w,      topPx);
+        if (_cropBottom > 0) AddDashedLine(0,      bottomPx, w,      bottomPx);
+        if (_cropLeft   > 0) AddDashedLine(leftPx, 0,        leftPx, h);
+        if (_cropRight  > 0) AddDashedLine(rightPx, 0,       rightPx, h);
+    }
+
+    private void CropInput_Changed(object sender, TextChangedEventArgs e)
+    {
+        if (_suppressCropInput || !_adjPanelReady) return;
+        if (double.TryParse(TxtCropTop.Text,    out double t)) _cropTop    = Math.Max(0, t);
+        if (double.TryParse(TxtCropBottom.Text, out double b)) _cropBottom = Math.Max(0, b);
+        if (double.TryParse(TxtCropLeft.Text,   out double l)) _cropLeft   = Math.Max(0, l);
+        if (double.TryParse(TxtCropRight.Text,  out double r)) _cropRight  = Math.Max(0, r);
+        UpdateCropOverlay();
+    }
+
+    private async Task ApplyCropToPages(IEnumerable<int> pageIndices, bool reset = false)
+    {
+        if (_editDocument is null) return;
+        foreach (int pi in pageIndices)
+        {
+            var page = _editDocument.Pages[pi];
+            if (reset)
+            {
+                page.Elements.Remove("/CropBox");
+            }
+            else
+            {
+                var mb = page.MediaBox;
+                double x1 = mb.X1 + _cropLeft;
+                double y1 = mb.Y1 + _cropBottom;
+                double x2 = mb.X2 - _cropRight;
+                double y2 = mb.Y2 - _cropTop;
+                if (x2 <= x1 || y2 <= y1) continue;
+                page.CropBox = new PdfSharp.Pdf.PdfRectangle(
+                    new PdfSharp.Drawing.XPoint(x1, y1),
+                    new PdfSharp.Drawing.XPoint(x2, y2));
+            }
+        }
+        SetStatus("Crop 적용 중…");
+        await ReloadRenderDocumentAsync();
+        StartThumbnailGeneration();
+
+        // Clear crop inputs and overlay — the page is already cropped visually.
+        _suppressCropInput = true;
+        _cropTop = _cropBottom = _cropLeft = _cropRight = 0;
+        TxtCropTop.Text = TxtCropBottom.Text = TxtCropLeft.Text = TxtCropRight.Text = "0";
+        _suppressCropInput = false;
+        CropCanvas.Children.Clear();
+
+        SetStatus("Crop 완료.");
+    }
+
+    private async void BtnCropApplyPage_Click(object sender, RoutedEventArgs e)
+        => await ApplyCropToPages(new[] { (int)_currentPage });
+
+    private async void BtnCropApplyAll_Click(object sender, RoutedEventArgs e)
+        => await ApplyCropToPages(Enumerable.Range(0, _editDocument!.Pages.Count));
+
+    private async void BtnCropApplyOdd_Click(object sender, RoutedEventArgs e)
+        => await ApplyCropToPages(Enumerable.Range(0, _editDocument!.Pages.Count).Where(i => i % 2 == 0));
+
+    private async void BtnCropApplyEven_Click(object sender, RoutedEventArgs e)
+        => await ApplyCropToPages(Enumerable.Range(0, _editDocument!.Pages.Count).Where(i => i % 2 == 1));
+
+    private async void BtnCropReset_Click(object sender, RoutedEventArgs e)
+    {
+        _suppressCropInput = true;
+        _cropTop = _cropBottom = _cropLeft = _cropRight = 0;
+        TxtCropTop.Text = TxtCropBottom.Text = TxtCropLeft.Text = TxtCropRight.Text = "0";
+        _suppressCropInput = false;
+        UpdateCropOverlay();
+        await ApplyCropToPages(new[] { (int)_currentPage }, reset: true);
     }
 }
