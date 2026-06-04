@@ -38,6 +38,60 @@ public static class PdfMetaCopier
 
     // ── Text layer ─────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads the existing text layer of <paramref name="sourcePath"/> and returns
+    /// word-level <see cref="OcrRegion"/> lists per page, with coordinates scaled
+    /// to a rendered image <paramref name="renderWidth"/> pixels wide.
+    /// Returns an empty dictionary when there is no text or extraction fails.
+    /// </summary>
+    public static Dictionary<int, List<OcrRegion>> LoadTextRegions(
+        string sourcePath, int renderWidth = 1200)
+    {
+        var result = new Dictionary<int, List<OcrRegion>>();
+        try
+        {
+            using var pig = PigPdf.PdfDocument.Open(sourcePath);
+            for (int i = 0; i < pig.NumberOfPages; i++)
+            {
+                var page  = pig.GetPage(i + 1);
+                var words = NearestNeighbourWordExtractor.Instance
+                                .GetWords(page.Letters).ToList();
+                if (words.Count == 0) continue;
+
+                double pW    = page.MediaBox.Bounds.Width;
+                double pH    = page.MediaBox.Bounds.Height;
+                double scale = renderWidth / pW;
+
+                var regions = new List<OcrRegion>(words.Count);
+                foreach (var w in words)
+                {
+                    if (string.IsNullOrWhiteSpace(w.Text)) continue;
+                    var b = w.BoundingBox;
+                    int left   = (int)Math.Round(b.Left          * scale);
+                    int top    = (int)Math.Round((pH - b.Top)    * scale);
+                    int right  = (int)Math.Round(b.Right         * scale);
+                    int bottom = (int)Math.Round((pH - b.Bottom) * scale);
+                    if (right <= left || bottom <= top) continue;
+                    regions.Add(new OcrRegion
+                    {
+                        Text   = w.Text,
+                        Score  = 1f,
+                        Points = [
+                            new OcrPoint(left,  top),
+                            new OcrPoint(right, top),
+                            new OcrPoint(right, bottom),
+                            new OcrPoint(left,  bottom),
+                        ]
+                    });
+                }
+                if (regions.Count > 0)
+                    result[i] = regions;
+            }
+        }
+        catch { }
+        return result;
+    }
+
     private static Dictionary<int, OcrPageData> ExtractTextData(string sourcePath, PdfDocument dstDoc)
     {
         var result = new Dictionary<int, OcrPageData>();

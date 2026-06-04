@@ -107,6 +107,20 @@ public partial class PDFReaderPage : Page
     private const  double PageGap = 16; // px gap between pages in the StackPanel
 
     // ─── Thumbnail panel ──────────────────────────────────────────────────────
+    // ─── Undo / Redo ─────────────────────────────────────────────────────────
+    private record DrawingShapeData(DrawingShapeType Type, Color Stroke, Color Fill, bool HasFill,
+                                     string FilePath, uint Page, double X1, double Y1, double X2, double Y2);
+    private record UndoSnapshot(byte[] Pdf, Dictionary<int, AdjSettings> Adj, List<DrawingShapeData> Shapes);
+    private readonly List<UndoSnapshot> _undoStack = new();
+    private readonly List<UndoSnapshot> _redoStack = new();
+    private const int UndoMaxLevels = 15;
+    // Tracks which page already had its adj-change undo pushed in the current session.
+    // -1 = none yet; set to page idx on first adj change, reset by PushUndo().
+    private int _adjUndoPushedForPage = -1;
+    public bool CanUndo => _undoStack.Count > 0;
+    public bool CanRedo => _redoStack.Count > 0;
+    public event Action? UndoRedoChanged;
+
     private record ThumbEntry(System.Windows.Controls.Image Img, Border Container);
     private readonly List<ThumbEntry>  _thumbItems          = new();
     private readonly HashSet<int>      _thumbSelectedPages  = new();
@@ -176,6 +190,8 @@ public partial class PDFReaderPage : Page
 
         // DrawingCanvas stays below TextOverlayCanvas; it only captures input during active draw mode.
 
+        UndoRedoChanged += UpdateUndoRedoButtons;
+
         BookmarkService.Instance.Changed += (_, _) => Dispatcher.Invoke(RefreshBookmarkPanel);
         RefreshBookmarkPanel();
 
@@ -207,6 +223,15 @@ public partial class PDFReaderPage : Page
     public uint               TotalPages       => _totalPages;
     public AdjustedImageStore? AdjustedStore   { get; set; }
     public BitmapSource?       CurrentPageImage => PdfPageImage.Source as BitmapSource;
+
+    /// <summary>
+    /// When set, Save will call this delegate to retrieve OCR results for the
+    /// current file and embed them as an invisible text layer before writing to disk.
+    /// </summary>
+    public Func<string, IReadOnlyDictionary<int, OcrPageData>?>? OcrDataProvider { get; set; }
+
+    // Invoked after a save that baked image adjustments, so callers can reset GPU sessions.
+    public Action? OnAdjustmentsBaked { get; set; }
 
     // Renders the current page at high resolution for OCR (≈300 DPI for letter paper).
     public async Task<BitmapSource?> RenderPageForOcrAsync(uint page, uint width = 1600)
@@ -256,6 +281,15 @@ public partial class PDFReaderPage : Page
     // ═══════════════════════════════════════════════════════════════════════════
     //  File Operations
     // ═══════════════════════════════════════════════════════════════════════════
+
+    private void UpdateUndoRedoButtons()
+    {
+        BtnUndo.IsEnabled = CanUndo;
+        BtnRedo.IsEnabled = CanRedo;
+    }
+
+    private async void BtnUndo_Click(object sender, RoutedEventArgs e) => await UndoAsync();
+    private async void BtnRedo_Click(object sender, RoutedEventArgs e) => await RedoAsync();
 
     private void BtnFile_Click(object sender, RoutedEventArgs e)
     {
@@ -432,6 +466,11 @@ public partial class PDFReaderPage : Page
         _pageImagePaths.Clear();
         _searchHighlightQuery = null;
         _searchHighlightIndices.Clear();
+        // New file load clears undo/redo history.
+        _undoStack.Clear();
+        _redoStack.Clear();
+        _adjUndoPushedForPage = -1;
+        UndoRedoChanged?.Invoke();
         // A new PDF load invalidates any prior edit-temp (rotation etc.).
         // Don't clean up if _tempEditedPath IS the file being loaded (that would delete it mid-load).
         if (filePath != _tempEditedPath)
@@ -525,21 +564,75 @@ public partial class PDFReaderPage : Page
     {
         if (_editDocument is null || _currentFilePath is null) return;
 
+        bool hasAdj   = _adjSettings.Count > 0 && _renderDocument != null;
+        int  adjCount = hasAdj ? _adjSettings.Count : 0;
+        var  ocrData  = OcrDataProvider?.Invoke(_currentFilePath);
+        bool hasOcr   = ocrData is { Count: > 0 };
+        // total = 어노테이션(1) + 페이지별 이미지 조정(adjCount) + PDF저장(1) + OCR(0~1)
+        int  total    = 1 + adjCount + 1 + (hasOcr ? 1 : 0);
+        int  step     = 0;
+
+        var progress = new HoloPDFCreator.Dialogs.ProgressWindow("PDF 저장 중")
+        {
+            Owner = Window.GetWindow(this)
+        };
+        progress.Show();
+
         string? tmpPath = null;
+        var bakedResources = new List<(MemoryStream Ms, XImage Xi)>();
         try
         {
+            progress.Update(++step, total, "어노테이션 처리 중…");
             EmbedAnnotationsAndMemos();
 
-            // Write to temp first to avoid locking the open file.
+            if (hasAdj)
+            {
+                await BakeAdjustmentsIntoDocAsync(_editDocument, bakedResources,
+                    onPageDone: (done, pageTotal) =>
+                    {
+                        progress.Update(step + done, total,
+                            $"이미지 조정 적용 중… ({done} / {pageTotal} 페이지)");
+                    });
+                step += adjCount;
+                // WinRT baking may have invalidated DML sessions — reset them now so
+                // the next OCR run gets fresh sessions instead of a corrupted device.
+                OnAdjustmentsBaked?.Invoke();
+            }
+
+            progress.Update(++step, total, "PDF 파일 저장 중…");
             tmpPath = System.IO.Path.Combine(
                 System.IO.Path.GetDirectoryName(outputPath)!,
                 System.IO.Path.GetRandomFileName() + ".pdf");
 
-            _editDocument.Save(tmpPath);
+            await Task.Run(() => _editDocument.Save(tmpPath));
+
+            foreach (var (ms, xi) in bakedResources) { xi.Dispose(); ms.Dispose(); }
+            bakedResources.Clear();
 
             _editDocument.Dispose();
             _editDocument   = null;
             _renderDocument = null;
+
+            if (hasOcr)
+            {
+                progress.Update(++step, total, "OCR 텍스트 레이어 적용 중…");
+                string tmpOcr = System.IO.Path.Combine(
+                    System.IO.Path.GetDirectoryName(outputPath)!,
+                    System.IO.Path.GetRandomFileName() + ".pdf");
+                try
+                {
+                    await Task.Run(() =>
+                        SearchablePdfService.Save(tmpPath, tmpOcr, ocrData!,
+                                                  replaceExistingText: true));
+                }
+                catch
+                {
+                    if (File.Exists(tmpOcr)) File.Delete(tmpOcr);
+                    throw;
+                }
+                File.Delete(tmpPath);
+                tmpPath = tmpOcr;
+            }
 
             File.Move(tmpPath, outputPath, overwrite: true);
             tmpPath = null;
@@ -550,14 +643,216 @@ public partial class PDFReaderPage : Page
                 DrawingService.Instance.RenameFile(_currentFilePath, outputPath);
             }
 
+            _adjSettings.Clear();
+            AdjustedStore?.Clear();
+
+            progress.Close();
             await LoadPdfAsync(outputPath);
             SetStatus("Saved.");
         }
         catch (Exception ex)
         {
+            progress.Close();
+            foreach (var (ms, xi) in bakedResources) { xi?.Dispose(); ms?.Dispose(); }
             if (tmpPath != null && File.Exists(tmpPath)) File.Delete(tmpPath);
             MessageBox.Show($"Save failed:\n{ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
+    }
+
+    /// <summary>
+    /// Renders each page that has stored adjustments at high resolution, applies the
+    /// adjustments, and replaces the page's content stream with the result image.
+    /// The streams and XImages added to <paramref name="resources"/> must be kept
+    /// alive until after <see cref="PdfDocument.Save"/> is called.
+    /// </summary>
+    private async Task BakeAdjustmentsIntoDocAsync(
+        PdfDocument doc, List<(MemoryStream Ms, XImage Xi)> resources,
+        Action<int, int>? onPageDone = null)
+    {
+        var entries = _adjSettings.ToList();
+        int done = 0;
+        foreach (var (pageIdx, adjS) in entries)
+        {
+            if (pageIdx < 0 || pageIdx >= doc.PageCount) continue;
+
+            // Render the original page at high quality (≈200 DPI for A4).
+            System.Drawing.Bitmap? raw = null;
+            try
+            {
+                using var pdfPage     = _renderDocument!.GetPage((uint)pageIdx);
+                using var winRtStream = new InMemoryRandomAccessStream();
+                await pdfPage.RenderToStreamAsync(winRtStream,
+                    new WinPdf.PdfPageRenderOptions { DestinationWidth = 2400 });
+                winRtStream.Seek(0);
+                var renderMs = new MemoryStream();
+                await winRtStream.AsStream().CopyToAsync(renderMs);
+                renderMs.Position = 0;
+                raw = new System.Drawing.Bitmap(renderMs);
+            }
+            catch { continue; }
+
+            // Apply brightness / contrast / USM / etc.
+            using var adjusted = AdjApplySettingsFrom(raw, adjS);
+            raw.Dispose();
+
+            // Encode to JPEG at high quality to keep file size reasonable.
+            byte[] jpegBytes;
+            using (var encMs = new MemoryStream())
+            {
+                var codec = System.Drawing.Imaging.ImageCodecInfo.GetImageEncoders()
+                    .First(c => c.FormatID == System.Drawing.Imaging.ImageFormat.Jpeg.Guid);
+                var ep = new System.Drawing.Imaging.EncoderParameters(1);
+                ep.Param[0] = new System.Drawing.Imaging.EncoderParameter(
+                    System.Drawing.Imaging.Encoder.Quality, 92L);
+                adjusted.Save(encMs, codec, ep);
+                jpegBytes = encMs.ToArray();
+            }
+
+            // XImage.FromStream requires the stream to stay alive until after Save().
+            var imgMs = new MemoryStream(jpegBytes);
+            var xImg  = XImage.FromStream(imgMs);
+            resources.Add((imgMs, xImg));
+
+            // Determine draw dimensions, accounting for PDF page rotation.
+            // WinRT renders in display orientation; we bake that orientation directly.
+            var page = doc.Pages[pageIdx];
+            double ptW, ptH;
+            if (page.Rotate is 90 or 270)
+            {
+                ptW = page.Height.Point;
+                ptH = page.Width.Point;
+                page.Width  = XUnit.FromPoint(ptW);
+                page.Height = XUnit.FromPoint(ptH);
+                page.Rotate = 0;
+            }
+            else
+            {
+                ptW = page.Width.Point;
+                ptH = page.Height.Point;
+            }
+
+            // Discard original content streams and draw the adjusted image.
+            page.Elements.Remove("/Contents");
+            using var gfx = XGraphics.FromPdfPage(page);
+            gfx.DrawImage(xImg, 0, 0, ptW, ptH);
+
+            onPageDone?.Invoke(++done, entries.Count);
+        }
+    }
+
+    // ─── Undo / Redo implementation ──────────────────────────────────────────
+
+    private List<DrawingShapeData> SnapshotDrawings() =>
+        _currentFilePath is null ? new() :
+        DrawingService.Instance.ForFile(_currentFilePath)
+            .Select(s => new DrawingShapeData(s.ShapeType, s.Stroke, s.Fill, s.HasFill,
+                                               s.FilePath, s.PageNumber, s.X1, s.Y1, s.X2, s.Y2))
+            .ToList();
+
+    // Captures PDF bytes, image adjustment settings, and drawing shapes.
+    public void PushUndo()
+    {
+        byte[]? pdfSnap = _editPdfBytes;
+        if (pdfSnap == null)
+        {
+            string? path = _tempEditedPath ?? _currentFilePath;
+            if (path == null || !System.IO.File.Exists(path)) return;
+            try { pdfSnap = System.IO.File.ReadAllBytes(path); } catch { return; }
+        }
+        var adjSnap   = _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value);
+        var shapeSnap = SnapshotDrawings();
+        _undoStack.Add(new UndoSnapshot(pdfSnap, adjSnap, shapeSnap));
+        if (_undoStack.Count > UndoMaxLevels) _undoStack.RemoveAt(0);
+        _redoStack.Clear();
+        _adjUndoPushedForPage = -1;  // reset: next adj change on any page triggers a new push
+        UndoRedoChanged?.Invoke();
+    }
+
+    public async Task UndoAsync()
+    {
+        if (_undoStack.Count == 0) return;
+        if (_editPdfBytes != null)
+        {
+            var curAdj    = _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value);
+            var curShapes = SnapshotDrawings();
+            _redoStack.Add(new UndoSnapshot(_editPdfBytes, curAdj, curShapes));
+        }
+        var prev = _undoStack[^1]; _undoStack.RemoveAt(_undoStack.Count - 1);
+        await RestoreSnapshotAsync(prev);
+        UndoRedoChanged?.Invoke();
+    }
+
+    public async Task RedoAsync()
+    {
+        if (_redoStack.Count == 0) return;
+        if (_editPdfBytes != null)
+        {
+            var curAdj    = _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value);
+            var curShapes = SnapshotDrawings();
+            _undoStack.Add(new UndoSnapshot(_editPdfBytes, curAdj, curShapes));
+            if (_undoStack.Count > UndoMaxLevels) _undoStack.RemoveAt(0);
+        }
+        var next = _redoStack[^1]; _redoStack.RemoveAt(_redoStack.Count - 1);
+        await RestoreSnapshotAsync(next);
+        UndoRedoChanged?.Invoke();
+    }
+
+    private async Task RestoreSnapshotAsync(UndoSnapshot snapshot)
+    {
+        _pageTransitioning = true;
+        string tmpPath = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            System.IO.Path.GetRandomFileName() + ".pdf");
+        try
+        {
+            System.IO.File.WriteAllBytes(tmpPath, snapshot.Pdf);
+
+            _editDocument?.Dispose();
+            _editPdfBytes = snapshot.Pdf;
+            _editDocument = PdfReader.Open(new MemoryStream(snapshot.Pdf), PdfDocumentOpenMode.Modify);
+
+            var tmpFile = await StorageFile.GetFileFromPathAsync(tmpPath);
+            _renderDocument = await WinPdf.PdfDocument.LoadFromFileAsync(tmpFile);
+
+            CleanupTempEditedPath();
+            _tempEditedPath = tmpPath;
+
+            _totalPages = _renderDocument.PageCount;
+            _currentPage = Math.Min(_currentPage, _totalPages > 0 ? _totalPages - 1 : 0);
+
+            // Restore image adjustment settings for all pages.
+            _adjSettings.Clear();
+            foreach (var (k, v) in snapshot.Adj) _adjSettings[k] = v;
+            _adjUndoPushedForPage = -1;
+            AdjustedStore?.Clear();
+
+            // Restore drawing shapes for this file.
+            if (_currentFilePath != null)
+            {
+                DrawingService.Instance.ClearForFile(_currentFilePath);
+                foreach (var sd in snapshot.Shapes)
+                    DrawingService.Instance.Add(new DrawingShape
+                    {
+                        ShapeType  = sd.Type,
+                        Stroke     = sd.Stroke,
+                        Fill       = sd.Fill,
+                        HasFill    = sd.HasFill,
+                        FilePath   = sd.FilePath,
+                        PageNumber = sd.Page,
+                        X1 = sd.X1, Y1 = sd.Y1, X2 = sd.X2, Y2 = sd.Y2,
+                    });
+            }
+
+            UpdateNavButtons();
+            await RenderCurrentPageAsync();  // also calls LoadAdjSettingsForPage → updates sliders
+            StartThumbnailGeneration();
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"실행 취소 오류: {ex.Message}");
+            try { System.IO.File.Delete(tmpPath); } catch { }
+        }
+        finally { _pageTransitioning = false; }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -568,6 +863,8 @@ public partial class PDFReaderPage : Page
     {
         bool ctrl = Keyboard.IsKeyDown(Key.LeftCtrl) || Keyboard.IsKeyDown(Key.RightCtrl);
         if (ctrl && e.Key == Key.B) { AddBookmarkForCurrentPage(); e.Handled = true; }
+        if (ctrl && e.Key == Key.Z) { _ = UndoAsync(); e.Handled = true; }
+        if (ctrl && e.Key == Key.Y) { _ = RedoAsync(); e.Handled = true; }
         if (e.Key == Key.Delete && _thumbSelectedPages.Count > 0) { _ = DeleteSelectedPagesAsync(); e.Handled = true; }
     }
 
@@ -2986,10 +3283,18 @@ public partial class PDFReaderPage : Page
         TriggerLiveAdjust();
     }
 
-    private void SaveCurrentAdjSettings() => SaveCurrentAdjSettings((int)_currentPage);
+    // Called from slider/checkbox handlers — pushes undo on the first change per page
+    // per editing session so the full pre-adjustment state is always recoverable.
+    private void SaveCurrentAdjSettings() => SaveCurrentAdjSettings((int)_currentPage, true);
 
-    private void SaveCurrentAdjSettings(int page)
+    // withUndo=false is used by batch operations that call PushUndo() once before the loop.
+    private void SaveCurrentAdjSettings(int page, bool withUndo = false)
     {
+        if (withUndo && _adjUndoPushedForPage != page)
+        {
+            PushUndo();               // captures current pdf + adj state
+            _adjUndoPushedForPage = page;
+        }
         _adjSettings[page] = new AdjSettings(
             SliderBrightness.Value, SliderContrast.Value,
             SliderStroke.Value, SliderUsmAmount.Value,
@@ -3059,6 +3364,7 @@ public partial class PDFReaderPage : Page
 
     private void AdjReset_Click(object sender, RoutedEventArgs e)
     {
+        PushUndo();  // capture state before resetting adjustments
         _adjSettings.Remove((int)_currentPage);
         AdjustedStore?.Remove((int)_currentPage);
 
@@ -3085,6 +3391,7 @@ public partial class PDFReaderPage : Page
     private async void AdjApplyAll_Click(object sender, RoutedEventArgs e)
     {
         if (_renderDocument == null || AdjustedStore == null) return;
+        PushUndo();  // one undo entry covers the entire batch
         var win = new ProgressWindow($"Applying to {_totalPages} pages…") { Owner = Window.GetWindow(this) };
         win.Show();
         bool cancelled = false;
@@ -3100,7 +3407,7 @@ public partial class PDFReaderPage : Page
                 bmp.Dispose();
                 AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
                 adjusted.Dispose();
-                SaveCurrentAdjSettings(i);
+                SaveCurrentAdjSettings(i, false);
             }
         }
         finally { win.Close(); }
@@ -3114,6 +3421,7 @@ public partial class PDFReaderPage : Page
         if (_renderDocument == null || AdjustedStore == null) return;
         var indices = ParseAdjRange(TxtAdjRange.Text, (int)_totalPages);
         if (indices.Count == 0) { MessageBox.Show("유효한 페이지 범위를 입력하세요. 예: 1-3,5,7-9", "범위 오류"); return; }
+        PushUndo();  // one undo entry covers the entire batch
         var win = new ProgressWindow($"Applying to {indices.Count} pages…") { Owner = Window.GetWindow(this) };
         win.Show();
         try
@@ -3129,7 +3437,7 @@ public partial class PDFReaderPage : Page
                 bmp.Dispose();
                 AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
                 adjusted.Dispose();
-                SaveCurrentAdjSettings(i);
+                SaveCurrentAdjSettings(i, false);
             }
         }
         finally { win.Close(); }
@@ -3150,6 +3458,7 @@ public partial class PDFReaderPage : Page
         var indices = Enumerable.Range(0, (int)_totalPages)
                                 .Where(i => odd ? (i % 2 == 0) : (i % 2 == 1))
                                 .ToList();
+        PushUndo();  // one undo entry covers the entire batch
         string label = odd ? "홀수" : "짝수";
         var win = new ProgressWindow($"{label} 페이지 ({indices.Count}장) 적용 중…") { Owner = Window.GetWindow(this) };
         win.Show();
@@ -3167,7 +3476,7 @@ public partial class PDFReaderPage : Page
                 bmp.Dispose();
                 AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
                 adjusted.Dispose();
-                SaveCurrentAdjSettings(i);
+                SaveCurrentAdjSettings(i, false);
             }
         }
         finally { win.Close(); }
@@ -3789,6 +4098,7 @@ public partial class PDFReaderPage : Page
             X1 = px1, Y1 = py1, X2 = px2, Y2 = py2,
         };
 
+        PushUndo();
         DrawingService.Instance.Add(shape);
         _selectedShape = shape;
         RefreshDrawingCanvas();
@@ -4028,6 +4338,7 @@ public partial class PDFReaderPage : Page
         });
         panel.Children.Add(BuildColorSwatchRow(DrawColorPresets, shape.Stroke, c =>
         {
+            PushUndo();
             shape.Stroke = c;
             _lastStroke  = c;
             CloseShapeColorPopup();
@@ -4043,7 +4354,7 @@ public partial class PDFReaderPage : Page
                 Foreground = new SolidColorBrush(Color.FromRgb(0xA6, 0xAD, 0xC8)),
                 Margin = new Thickness(0, 8, 0, 4)
             });
-            panel.Children.Add(BuildFillSwatchRow(shape, () =>
+            panel.Children.Add(BuildFillSwatchRow(shape, PushUndo, () =>
             {
                 _lastFill    = shape.Fill;
                 _lastHasFill = shape.HasFill;
@@ -4069,6 +4380,7 @@ public partial class PDFReaderPage : Page
         };
         del.Click += (_, _) =>
         {
+            PushUndo();
             DrawingService.Instance.Remove(shape.Id);
             _selectedShape = null;
             CloseShapeColorPopup();
@@ -4135,7 +4447,7 @@ public partial class PDFReaderPage : Page
         return row;
     }
 
-    private static StackPanel BuildFillSwatchRow(DrawingShape shape, Action onChange)
+    private static StackPanel BuildFillSwatchRow(DrawingShape shape, Action beforeChange, Action onChange)
     {
         var row = new StackPanel { Orientation = Orientation.Horizontal };
 
@@ -4161,6 +4473,7 @@ public partial class PDFReaderPage : Page
         };
         transSwatch.MouseLeftButtonUp += (_, _) =>
         {
+            beforeChange();
             shape.HasFill = false;
             onChange();
         };
@@ -4183,6 +4496,7 @@ public partial class PDFReaderPage : Page
             };
             swatch.MouseLeftButtonUp += (_, _) =>
             {
+                beforeChange();
                 shape.Fill    = c;
                 shape.HasFill = true;
                 onChange();
@@ -4252,6 +4566,9 @@ public partial class PDFReaderPage : Page
     private async Task ReloadRenderDocumentAsync()
     {
         if (_editDocument is null) return;
+
+        // Snapshot current state before every structural change so Ctrl+Z can revert it.
+        PushUndo();
 
         _pageTransitioning = true;   // suppress scroll events during reload
         string tmpPath = System.IO.Path.Combine(

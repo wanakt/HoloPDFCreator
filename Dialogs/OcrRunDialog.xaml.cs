@@ -8,12 +8,12 @@ public enum OcrRunScope { Current, All, Range }
 
 public class OcrRunResult
 {
-    public OcrRunScope  Scope      { get; init; }
-    public int          FromPage   { get; init; }
-    public int          ToPage     { get; init; }
-    public OcrModelSize ModelSize  { get; init; }
-    public bool         UseGpu     { get; init; }
-    public int          Workers    { get; init; }
+    public OcrRunScope  Scope               { get; init; }
+    public int          FromPage            { get; init; }
+    public int          ToPage              { get; init; }
+    public OcrModelSize ModelSize           { get; init; }
+    public int          Workers             { get; init; }
+    public int          KoreanUpscaleTarget { get; init; }
 }
 
 public partial class OcrRunDialog : Window
@@ -25,7 +25,8 @@ public partial class OcrRunDialog : Window
 
     public OcrRunDialog(int totalPages, int currentPage,
                         OcrModelSize lastModelSize = OcrModelSize.Mobile,
-                        bool lastGpu = false, int lastWorkers = 2)
+                        int lastWorkers = 0,
+                        int lastKoreanUpscale = 2560)
     {
         InitializeComponent();
         _totalPages  = totalPages;
@@ -37,15 +38,14 @@ public partial class OcrRunDialog : Window
 
         RadioMobile.IsChecked = lastModelSize == OcrModelSize.Mobile;
         RadioFull.IsChecked   = lastModelSize == OcrModelSize.Full;
-        ChkGpu.IsChecked      = lastGpu;
 
-        CmbWorkers.SelectedIndex = lastWorkers switch
-        {
-            1 => 0,
-            4 => 2,
-            8 => 3,
-            _ => 1,   // default 2
-        };
+        TxtKoreanUpscale.Text = lastKoreanUpscale.ToString();
+
+        // Default workers: nearest option to cpu count (first run), or last-used value.
+        int workers = lastWorkers > 0 ? lastWorkers : Math.Min(Environment.ProcessorCount, 8);
+        CmbWorkers.SelectedIndex = workers <= 1 ? 0 :
+                                   workers <= 2 ? 1 :
+                                   workers <= 4 ? 2 : 3;
     }
 
     private void RadioScope_Checked(object sender, RoutedEventArgs e)
@@ -95,14 +95,16 @@ public partial class OcrRunDialog : Window
             _ => 2,
         };
 
+        int upscale = int.TryParse(TxtKoreanUpscale.Text, out int u) && u >= 128 ? u : 2560;
+
         Result = new OcrRunResult
         {
-            Scope     = scope,
-            FromPage  = from,
-            ToPage    = to,
-            ModelSize = RadioFull.IsChecked == true ? OcrModelSize.Full : OcrModelSize.Mobile,
-            UseGpu    = ChkGpu.IsChecked == true,
-            Workers   = workers,
+            Scope               = scope,
+            FromPage            = from,
+            ToPage              = to,
+            ModelSize           = RadioFull.IsChecked == true ? OcrModelSize.Full : OcrModelSize.Mobile,
+            Workers             = workers,
+            KoreanUpscaleTarget = upscale,
         };
         DialogResult = true;
     }

@@ -5,13 +5,14 @@
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <UseWPF>true</UseWPF>
     <RootNamespace>HoloPDFCreator</RootNamespace>
     <AssemblyName>HoloPDFCreator</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.24.4" />
     <PackageReference Include="PDFsharp-WPF" Version="6.1.1" />
     <PackageReference Include="PdfPig" Version="0.1.9" />
     <PackageReference Include="RapidOcrNet" Version="2.0.0" />

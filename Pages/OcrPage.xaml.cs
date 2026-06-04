@@ -77,7 +77,9 @@ public partial class OcrPage : Page
     // ─── OCR ─────────────────────────────────────────────────────────────────
     private readonly OcrService _ocrService = new();
     private readonly Dictionary<int, List<OcrRegion>> _pageRegions  = new();
+    private readonly Dictionary<int, (int w, int h)>  _regionDims   = new();
     private List<OcrRegion>    _currentRegions = new();
+
     private CancellationTokenSource? _batchCts;
     private readonly List<Border>    _resultCards    = new();
     private Border?                  _highlightedCard;
@@ -99,6 +101,33 @@ public partial class OcrPage : Page
     }
 
     // ─── Public API ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns OCR results for <paramref name="forFilePath"/> as page-indexed
+    /// <see cref="OcrPageData"/> ready for <see cref="SearchablePdfService"/>.
+    /// Returns null when no results exist for that file or none have image dims
+    /// (e.g. results loaded from an existing text layer rather than freshly run).
+    /// </summary>
+    // Called after PDF save with baked adjustments to dispose stale DML sessions.
+    // The next OCR run will recreate fresh sessions; if DML is still broken it
+    // will fall back to CPU automatically.
+    public void InvalidateOcrSessions() => _ocrService.InvalidateSessions();
+
+    public IReadOnlyDictionary<int, OcrPageData>? GetOcrData(string forFilePath)
+    {
+        if (_sourcePdfPath != forFilePath) return null;
+        var result = new Dictionary<int, OcrPageData>();
+        lock (_pageRegions)
+        {
+            foreach (var (idx, regions) in _pageRegions)
+            {
+                if (regions.Count == 0) continue;
+                if (!_regionDims.TryGetValue(idx, out var d) || d.w <= 0 || d.h <= 0) continue;
+                result[idx] = new OcrPageData(regions, d.w, d.h);
+            }
+        }
+        return result.Count > 0 ? result : null;
+    }
 
     public void ApplyAdjustedImages(AdjustedImageStore store)
     {
@@ -123,6 +152,7 @@ public partial class OcrPage : Page
     public void PrepareForImages(int expectedCount)
     {
         _pageRegions.Clear();
+        _regionDims.Clear();
         _previewCts.Cancel();
         _pdfThumbCts.Cancel();
         _pdfThumbCts = new CancellationTokenSource();
@@ -224,6 +254,7 @@ public partial class OcrPage : Page
         _pdfThumbCts.Cancel();
         _pdfThumbCts = new CancellationTokenSource();
         _pageRegions.Clear();
+        _regionDims.Clear();
         ClearItems();
         _sourcePdfPath  = null;
         _pdfPageCount   = 0;
@@ -265,6 +296,7 @@ public partial class OcrPage : Page
             UpdateButtonStates();
 
             _ = RenderPdfThumbnailsAsync(filePath, _pdfThumbCts.Token);
+            _ = TryLoadExistingTextLayerAsync(filePath);
 
             SetStatus(count > 1
                 ? $"Loaded page {initialPage + 1} of {count}. Click a thumbnail to navigate, or use 'Apply to All' to process all pages."
@@ -814,6 +846,7 @@ public partial class OcrPage : Page
         _pdfThumbCts = new CancellationTokenSource();
         _previewCts.Cancel();
         _pageRegions.Clear();
+        _regionDims.Clear();
         ClearItems();
         _lastPdfPath   = null;
         _sourcePdfPath = null;
@@ -836,29 +869,29 @@ public partial class OcrPage : Page
 
     private static void SetOcrStatus(string msg) { }
 
-    private OcrModelSize _lastModelSize = OcrModelSize.Mobile;
-    private bool         _lastGpu       = false;
-    private int          _lastWorkers   = 2;
+    private OcrModelSize _lastModelSize        = OcrModelSize.Mobile;
+    private int          _lastWorkers          = 0;   // 0 = auto (cpu count)
+    private int          _lastKoreanUpscale    = 2560;
 
     private void BtnRunOcr_Click(object sender, RoutedEventArgs e)
     {
         if (_items.Count == 0) return;
 
         var dlg = new OcrRunDialog(
-            totalPages:    _items.Count,
-            currentPage:   _selectedIndex + 1,
-            lastModelSize: _lastModelSize,
-            lastGpu:       _lastGpu,
-            lastWorkers:   _lastWorkers)
+            totalPages:        _items.Count,
+            currentPage:       _selectedIndex + 1,
+            lastModelSize:     _lastModelSize,
+            lastWorkers:       _lastWorkers,
+            lastKoreanUpscale: _lastKoreanUpscale)
         {
             Owner = Window.GetWindow(this)
         };
         if (dlg.ShowDialog() != true || dlg.Result == null) return;
 
         var result = dlg.Result;
-        _lastModelSize = result.ModelSize;
-        _lastGpu       = result.UseGpu;
-        _lastWorkers   = result.Workers;
+        _lastModelSize     = result.ModelSize;
+        _lastWorkers       = result.Workers;
+        _lastKoreanUpscale = result.KoreanUpscaleTarget;
 
         IEnumerable<int> indices = result.Scope switch
         {
@@ -869,7 +902,7 @@ public partial class OcrPage : Page
             _                   => Array.Empty<int>()
         };
 
-        _ = RunOcrOnPagesAsync(indices, result.ModelSize, result.UseGpu, result.Workers);
+        _ = RunOcrOnPagesAsync(indices, result.ModelSize, result.Workers);
     }
 
     private void BtnCancelOcr_Click(object sender, RoutedEventArgs e) => _batchCts?.Cancel();
@@ -893,7 +926,6 @@ public partial class OcrPage : Page
     private async Task RunOcrOnPagesAsync(
         IEnumerable<int> indices,
         OcrModelSize modelSize,
-        bool useGpu,
         int workers)
     {
         var idxList = indices.Where(i => i >= 0 && i < _items.Count).ToList();
@@ -918,36 +950,34 @@ public partial class OcrPage : Page
         // Yield to the render queue so the window actually paints before heavy work starts.
         await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Render);
 
+        var sw        = System.Diagnostics.Stopwatch.StartNew();
+        bool cancelled = false;
+
         try
         {
             var lang = SelectedOcrLanguage();
 
             if (!_ocrService.IsReady ||
-                _ocrService.UseGpu           != useGpu    ||
                 _ocrService.RequestedWorkers != workers   ||
                 _ocrService.CurrentLanguage  != lang      ||
                 _ocrService.CurrentModelSize != modelSize)
             {
                 SetOcrStatus("OCR 엔진 초기화 중…");
                 win.Update(0, idxList.Count, "OCR 엔진 초기화 중…");
-                var progress = new Progress<(int, int, string)>(p =>
+                var initProgress = new Progress<(int, int, string)>(p =>
                 {
                     SetOcrStatus($"[{p.Item1}/{p.Item2}] {p.Item3}");
                     win.Update(0, idxList.Count, $"초기화: {p.Item3}");
                 });
+
                 await _ocrService.InitializeAsync(
                     language:    lang,
-                    progress:    progress,
+                    progress:    initProgress,
                     ct:          ct,
                     parallelism: workers,
-                    useGpu:      useGpu,
                     modelSize:   modelSize);
-
-                if (_ocrService.GpuFallbackReason != null)
-                    MessageBox.Show(
-                        $"GPU(DirectML) 초기화에 실패하여 CPU 모드로 전환되었습니다.\n\n{_ocrService.GpuFallbackReason}",
-                        "GPU 초기화 실패", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
+            _ocrService.KoreanUpscaleTarget = _lastKoreanUpscale;
 
             // Build a pool of PDF document instances — one per worker — for fully parallel lazy rendering.
             // A single serialized document (pdfSem=1) becomes the throughput bottleneck once pre-loaded
@@ -996,8 +1026,6 @@ public partial class OcrPage : Page
             bool deskew = ChkDeskew.IsChecked == true;
             SetOcrStatus($"OCR 실행 중… (0/{idxList.Count})");
 
-            // Both GPU and CPU: N workers in parallel, semaphore in RunOcrRawAsync distributes
-            // work across the pool. GPU sessions run concurrently up to PoolSize.
             await Task.Run(() => Parallel.ForEachAsync(
                 idxList,
                 new ParallelOptions { MaxDegreeOfParallelism = workers, CancellationToken = ct },
@@ -1005,14 +1033,17 @@ public partial class OcrPage : Page
                 {
                     await LazyLoadPageAsync(idx, localCt).ConfigureAwait(false);
 
-                    Bitmap?       bmp    = _items[idx].Original;
+                    // OcrSource carries the adjusted image when the user applied Image Adjust;
+                    // prefer it so OCR reflects the adjustments. Fall back to Original only
+                    // when OcrSource is absent (direct-load path where only Original is set).
                     BitmapSource? wpfSrc = _items[idx].OcrSource;
+                    Bitmap?       bmp    = wpfSrc == null ? _items[idx].Original : null;
 
                     SkiaSharp.SKBitmap skBmp;
-                    if (bmp != null)
-                        skBmp = await Task.Run(() => OcrService.ConvertToSKBitmap(bmp), localCt).ConfigureAwait(false);
-                    else if (wpfSrc != null)
+                    if (wpfSrc != null)
                         skBmp = await Task.Run(() => OcrService.ConvertToSKBitmap(wpfSrc), localCt).ConfigureAwait(false);
+                    else if (bmp != null)
+                        skBmp = await Task.Run(() => OcrService.ConvertToSKBitmap(bmp), localCt).ConfigureAwait(false);
                     else return;
 
                     if (deskew)
@@ -1042,7 +1073,11 @@ public partial class OcrPage : Page
                     }
                     finally { skBmp.Dispose(); }
 
-                    lock (_pageRegions) _pageRegions[idx] = regions;
+                    lock (_pageRegions)
+                    {
+                        _pageRegions[idx] = regions;
+                        _regionDims[idx]  = (w, h);
+                    }
                     int current = System.Threading.Interlocked.Increment(ref done);
                     await Dispatcher.InvokeAsync(() =>
                     {
@@ -1058,6 +1093,7 @@ public partial class OcrPage : Page
         }
         catch (OperationCanceledException)
         {
+            cancelled = true;
             SetOcrStatus("취소됨.");
         }
         catch (Exception ex)
@@ -1068,12 +1104,45 @@ public partial class OcrPage : Page
         }
         finally
         {
+            sw.Stop();
             win.Close();
             _isProcessing            = false;
             BtnRunOcr.IsEnabled      = _selectedIndex >= 0;
             BtnCancelOcr.Visibility  = Visibility.Collapsed;
             OcrProgress.Visibility   = Visibility.Collapsed;
             UpdateButtonStates();
+        }
+
+        if (!cancelled)
+        {
+            int totalRegions = idxList.Sum(i =>
+                _pageRegions.TryGetValue(i, out var r) ? r.Count : 0);
+
+            string langStr = _ocrService.CurrentLanguage switch
+            {
+                OcrLanguage.Korean   => "한국어",
+                OcrLanguage.Chinese  => "중국어",
+                OcrLanguage.Japanese => "일본어",
+                _                    => "라틴",
+            };
+            string modelStr = modelSize == OcrModelSize.Full ? "Full (서버)" : "Mobile";
+            string elapsed  = sw.Elapsed.TotalSeconds < 60
+                ? $"{sw.Elapsed.TotalSeconds:F1}초"
+                : $"{(int)sw.Elapsed.TotalMinutes}분 {sw.Elapsed.Seconds}초";
+            string perPage  = idxList.Count > 0
+                ? $"{sw.Elapsed.TotalSeconds / idxList.Count:F1}초"
+                : "-";
+            int threadsUsed = Math.Max(1, Environment.ProcessorCount / workers);
+
+            MessageBox.Show(
+                $"처리 페이지:   {idxList.Count}페이지\n" +
+                $"검출 텍스트:   {totalRegions}개 영역\n" +
+                $"소요 시간:     {elapsed}\n" +
+                $"페이지당 평균: {perPage}\n\n" +
+                $"모델: {modelStr}  |  언어: {langStr}  |  워커: {workers} (스레드: {threadsUsed}×{workers})",
+                "OCR 완료",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
         }
     }
 
@@ -1258,24 +1327,21 @@ public partial class OcrPage : Page
         };
         if (fileDlg.ShowDialog() != true || fileDlg.FileNames.Length == 0) return;
 
-        // Ask for model/GPU/workers settings (scope is ignored — always All pages per file)
         var settingsDlg = new OcrRunDialog(
             totalPages:    1,
             currentPage:   1,
             lastModelSize: _lastModelSize,
-            lastGpu:       _lastGpu,
             lastWorkers:   _lastWorkers)
         { Owner = Window.GetWindow(this) };
         if (settingsDlg.ShowDialog() != true) return;
 
-        _lastModelSize = settingsDlg.Result!.ModelSize;
-        _lastGpu       = settingsDlg.Result!.UseGpu;
-        _lastWorkers   = settingsDlg.Result!.Workers;
+        _lastModelSize     = settingsDlg.Result!.ModelSize;
+        _lastWorkers       = settingsDlg.Result!.Workers;
+        _lastKoreanUpscale = settingsDlg.Result!.KoreanUpscaleTarget;
 
         await RunBatchOcrAndSaveAsync(
             fileDlg.FileNames,
             settingsDlg.Result!.ModelSize,
-            settingsDlg.Result!.UseGpu,
             settingsDlg.Result!.Workers,
             ChkDeskew.IsChecked == true);
     }
@@ -1283,7 +1349,6 @@ public partial class OcrPage : Page
     private async Task RunBatchOcrAndSaveAsync(
         string[] pdfPaths,
         OcrModelSize modelSize,
-        bool useGpu,
         int workers,
         bool deskew = false)
     {
@@ -1315,7 +1380,6 @@ public partial class OcrPage : Page
 
             // Initialize OCR engine if needed
             if (!_ocrService.IsReady          ||
-                _ocrService.UseGpu            != useGpu    ||
                 _ocrService.RequestedWorkers  != workers   ||
                 _ocrService.CurrentLanguage   != lang      ||
                 _ocrService.CurrentModelSize  != modelSize)
@@ -1328,14 +1392,9 @@ public partial class OcrPage : Page
                     progress:    progress,
                     ct:          ct,
                     parallelism: workers,
-                    useGpu:      useGpu,
                     modelSize:   modelSize);
-
-                if (_ocrService.GpuFallbackReason != null)
-                    MessageBox.Show(
-                        $"GPU 초기화 실패 — CPU 모드로 전환됩니다.\n\n{_ocrService.GpuFallbackReason}",
-                        "GPU 초기화 실패", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
+            _ocrService.KoreanUpscaleTarget = _lastKoreanUpscale;
 
             foreach (var pdfPath in pdfPaths)
             {
@@ -1602,6 +1661,7 @@ public partial class OcrPage : Page
                 Foreground = new SolidColorBrush(color)
             };
 
+            string committedText = r.Text;
             var tb = new TextBox
             {
                 Text            = r.Text,
@@ -1609,9 +1669,30 @@ public partial class OcrPage : Page
                 Foreground      = new SolidColorBrush(MediaColor.FromRgb(0xCD, 0xD6, 0xF4)),
                 Background      = System.Windows.Media.Brushes.Transparent,
                 BorderThickness = new Thickness(0),
-                IsReadOnly      = true,
+                IsReadOnly      = false,
                 TextWrapping    = TextWrapping.Wrap,
-                Padding         = new Thickness(0)
+                AcceptsReturn   = true,
+                Padding         = new Thickness(0),
+                ToolTip         = "클릭하여 텍스트 수정 · Enter로 줄바꿈 · 다른 곳 클릭 시 저장"
+            };
+
+            // Visual feedback when editing
+            tb.GotFocus  += (_, _) =>
+                tb.Background = new SolidColorBrush(MediaColor.FromArgb(80, 0x31, 0x32, 0x44));
+            tb.LostFocus += (_, _) =>
+            {
+                tb.Background = System.Windows.Media.Brushes.Transparent;
+                string newText = tb.Text;
+                if (newText != committedText && capturedI < _currentRegions.Count)
+                {
+                    _currentRegions[capturedI].Text = newText;
+                    committedText = newText;
+                }
+            };
+            // Ctrl+Enter also commits and moves focus away
+            tb.PreviewKeyDown += (_, e) =>
+            {
+                if (e.Key == Key.Escape) { tb.Text = committedText; ResultsPanel.Focus(); e.Handled = true; }
             };
 
             var header = new DockPanel { Margin = new Thickness(0, 0, 0, 4) };
@@ -1764,6 +1845,35 @@ public partial class OcrPage : Page
     }
 
     private static void SetStatus(string msg) { }
+
+    // ─── Existing text layer auto-load ────────────────────────────────────────
+
+    private async Task TryLoadExistingTextLayerAsync(string filePath)
+    {
+        // Run PdfPig extraction off the UI thread; it can be slow on large files.
+        var regions = await Task.Run(() => PdfMetaCopier.LoadTextRegions(filePath, 1200))
+                                .ConfigureAwait(true); // resume on UI thread
+
+        // Abort if the user navigated away or opened a different file.
+        if (_sourcePdfPath != filePath || regions.Count == 0) return;
+
+        foreach (var (idx, r) in regions)
+        {
+            // Don't overwrite pages the user has already OCR'd in this session.
+            if (!_pageRegions.ContainsKey(idx))
+                _pageRegions[idx] = r;
+        }
+
+        // Refresh the currently displayed page if it now has regions.
+        if (_selectedIndex >= 0 &&
+            _pageRegions.TryGetValue(_selectedIndex, out var cur) &&
+            _currentRegions.Count == 0)
+        {
+            _currentRegions = cur;
+            DrawOverlays();
+            ShowResults();
+        }
+    }
 
     // ─── PDF thumbnail rendering ──────────────────────────────────────────────
 

@@ -11,8 +11,8 @@ public readonly record struct OcrPoint(int X, int Y);
 
 public class OcrRegion
 {
-    public string    Text   { get; init; } = "";
-    public float     Score  { get; init; }
+    public string     Text   { get; set; }  = "";
+    public float      Score  { get; init; }
     public OcrPoint[] Points { get; init; } = [];
 }
 
@@ -34,13 +34,11 @@ public class OcrService : IDisposable
     private readonly ConcurrentQueue<RapidOcr> _pool = new();
     private SemaphoreSlim? _sem;
 
-    public int          PoolSize          { get; private set; } = 1;
-    public int          RequestedWorkers  { get; private set; } = 1;
-    public OcrLanguage  CurrentLanguage   { get; private set; } = OcrLanguage.Latin;
-    public OcrModelSize CurrentModelSize  { get; private set; } = OcrModelSize.Mobile;
-    public bool         UseGpu            { get; private set; } = false;
-    public string?      GpuFallbackReason { get; private set; }
-    public bool         IsReady           => !_pool.IsEmpty;
+    public int          PoolSize         { get; private set; } = 1;
+    public int          RequestedWorkers { get; private set; } = 1;
+    public OcrLanguage  CurrentLanguage  { get; private set; } = OcrLanguage.Latin;
+    public OcrModelSize CurrentModelSize { get; private set; } = OcrModelSize.Mobile;
+    public bool         IsReady          => !_pool.IsEmpty;
 
     private record ModelConfig(string RecFile, string KeysFile, string ModelVer = "v5");
 
@@ -59,17 +57,14 @@ public class OcrService : IDisposable
         IProgress<(int current, int total, string message)>? progress = null,
         CancellationToken ct = default,
         int parallelism = 2,
-        bool useGpu = false,
         OcrModelSize modelSize = OcrModelSize.Mobile)
     {
         DisposePool();
 
-        CurrentLanguage   = language;
-        CurrentModelSize  = modelSize;
-        UseGpu            = useGpu;
-        RequestedWorkers  = Math.Max(1, parallelism);
-        GpuFallbackReason = null;
-        PoolSize          = RequestedWorkers;
+        CurrentLanguage  = language;
+        CurrentModelSize = modelSize;
+        RequestedWorkers = Math.Max(1, parallelism);
+        PoolSize         = RequestedWorkers;
 
         int steps = PoolSize + 1;
         progress?.Report((1, steps, "OCR 엔진 초기화 중…"));
@@ -108,67 +103,29 @@ public class OcrService : IDisposable
         if (useCustomPaths && !File.Exists(recPath))
             throw new FileNotFoundException($"OCR model not found: {recPath}");
 
-        SessionOptions? gpuOpts = null;
-        if (useGpu)
-        {
-            try
-            {
-                gpuOpts = BuildGpuOptions();
-                progress?.Report((1, steps, "GPU (DirectML) 초기화 성공"));
-            }
-            catch (Exception ex)
-            {
-                UseGpu            = false;
-                GpuFallbackReason = ex.Message;
-                progress?.Report((1, steps, "GPU 초기화 실패 — CPU로 전환"));
-            }
-        }
-
-        SessionOptions? cpuOpts = UseGpu ? null : BuildCpuOptions();
-
+        using var cpuOpts = BuildCpuOptions(PoolSize);
         for (int i = 0; i < PoolSize; i++)
         {
             ct.ThrowIfCancellationRequested();
-            SessionOptions? opts = gpuOpts ?? cpuOpts;
             var ocr = await Task.Run(() =>
             {
-                var instance = new RapidOcr();
-                if (useCustomPaths)
-                {
-                    if (opts != null) instance.InitModels(detPath, clsPath, recPath, keysPath, opts);
-                    else              instance.InitModels(detPath, clsPath, recPath, keysPath);
-                }
-                else
-                {
-                    if (opts != null) instance.InitModels(opts);
-                    else              instance.InitModels();
-                }
-                return instance;
+                var inst = new RapidOcr();
+                if (useCustomPaths) inst.InitModels(detPath, clsPath, recPath, keysPath, cpuOpts);
+                else                inst.InitModels(cpuOpts);
+                return inst;
             }, ct).ConfigureAwait(false);
             _pool.Enqueue(ocr);
-            progress?.Report((i + 2, steps, $"워커 {i + 1}/{PoolSize} 초기화 완료"));
+            progress?.Report((i + 2, steps, $"워커 {i + 1}/{PoolSize} 완료"));
         }
 
         _sem = new SemaphoreSlim(PoolSize, PoolSize);
-        gpuOpts?.Dispose();
-        cpuOpts?.Dispose();
-        progress?.Report((steps, steps, $"준비 완료 (워커 {PoolSize}개, {(UseGpu ? "GPU" : "CPU")})"));
+        progress?.Report((steps, steps, $"준비 완료 (워커 {PoolSize}개)"));
     }
 
-    private static SessionOptions BuildGpuOptions()
+    private static SessionOptions BuildCpuOptions(int poolSize)
     {
         var opts = new SessionOptions();
-        opts.EnableMemoryPattern = false;
-        opts.IntraOpNumThreads   = 1;
-        opts.AppendExecutionProvider_DML(0);
-        return opts;
-    }
-
-    private static SessionOptions BuildCpuOptions()
-    {
-        var opts = new SessionOptions();
-        opts.IntraOpNumThreads = 1;
-        opts.InterOpNumThreads = 1;
+        opts.IntraOpNumThreads = Math.Max(1, Environment.ProcessorCount / poolSize);
         return opts;
     }
 
@@ -196,6 +153,30 @@ public class OcrService : IDisposable
     private static readonly RapidOcrOptions _ocrOptions =
         RapidOcrOptions.Default with { ReturnWordBox = true };
 
+    // The detection model (ch_PP-OCRv5_mobile_det) is Chinese-trained, so it
+    // assigns lower confidence scores to Korean (Hangul) regions.
+    // ImgResize is bumped to 2560 so the model-internal resize never shrinks the
+    // upscaled input; MaxSideLen is set high so it doesn't act as a hard cap.
+    private static readonly RapidOcrOptions _koreanOcrOptions =
+        RapidOcrOptions.Default with
+        {
+            ReturnWordBox  = true,
+            BoxScoreThresh = 0.2f,
+            BoxThresh      = 0.1f,
+            TextScore      = 0.3f,
+            UnClipRatio    = 2.0f,
+            MaxSideLen     = 4096,
+            ImgResize      = 2560,
+        };
+
+    // Korean images are pre-upscaled so each Hangul syllable block reaches at
+    // least ~20-24 px — the minimum the Chinese detector needs.  Coordinates are
+    // scaled back to the original pixel space so overlays align with the display.
+    public int KoreanUpscaleTarget { get; set; } = 2560;
+
+    private RapidOcrOptions ActiveOptions =>
+        CurrentLanguage == OcrLanguage.Korean ? _koreanOcrOptions : _ocrOptions;
+
     public async Task<List<OcrRegion>> RunOcrRawAsync(
         SKBitmap skBmp, int imgW, int imgH, CancellationToken ct = default)
     {
@@ -203,19 +184,62 @@ public class OcrService : IDisposable
             throw new InvalidOperationException("OCR engine not initialized.");
 
         bool insertSpaces = CurrentLanguage == OcrLanguage.Latin;
+        var options = ActiveOptions;
+
+        SKBitmap input = skBmp;
+        float invScale = 1f;
+        if (CurrentLanguage == OcrLanguage.Korean)
+        {
+            int longSide = Math.Max(skBmp.Width, skBmp.Height);
+            if (longSide > 0 && longSide < KoreanUpscaleTarget)
+            {
+                float s = (float)KoreanUpscaleTarget / longSide;
+                int nw = (int)(skBmp.Width  * s);
+                int nh = (int)(skBmp.Height * s);
+                input    = new SKBitmap(nw, nh, skBmp.ColorType, skBmp.AlphaType);
+                invScale = 1f / s;
+                using var c = new SKCanvas(input);
+                c.DrawBitmap(skBmp, new SKRect(0, 0, nw, nh));
+            }
+        }
 
         await _sem.WaitAsync(ct).ConfigureAwait(false);
         _pool.TryDequeue(out var ocr);
         try
         {
-            return await Task.Run(() =>
+            var regions = await Task.Run(() =>
             {
-                var result = ocr!.Detect(skBmp, _ocrOptions);
-                return MapResult(result, imgW, imgH, insertSpaces);
+                var result = ocr!.Detect(input, options);
+                // If Detect returns null instead of throwing (some DML failures are silent),
+                // throw explicitly so the GPU-fallback catch in the caller can handle it.
+                if (result is null || result.TextBlocks is null)
+                    throw new InvalidOperationException("Detect returned null result.");
+                return MapResult(result, input.Width, input.Height, insertSpaces);
             }, ct).ConfigureAwait(false);
+
+            // Map coordinates back to the original (pre-upscale) pixel space.
+            if (invScale != 1f)
+            {
+                for (int i = 0; i < regions.Count; i++)
+                {
+                    var r = regions[i];
+                    regions[i] = new OcrRegion
+                    {
+                        Text   = r.Text,
+                        Score  = r.Score,
+                        Points = r.Points
+                            .Select(p => new OcrPoint(
+                                (int)MathF.Round(p.X * invScale),
+                                (int)MathF.Round(p.Y * invScale)))
+                            .ToArray()
+                    };
+                }
+            }
+            return regions;
         }
         finally
         {
+            if (!ReferenceEquals(input, skBmp)) input.Dispose();
             _pool.Enqueue(ocr!);
             _sem.Release();
         }
@@ -255,22 +279,74 @@ public class OcrService : IDisposable
 
     private static SKBitmap ToSKBitmap(BitmapSource src)
     {
+        int w = src.PixelWidth, h = src.PixelHeight;
+
+        // Fast path: Bgra32 / Pbgra32 can be copied directly into SKBitmap pixel buffer.
+        if (src.Format == System.Windows.Media.PixelFormats.Bgra32 ||
+            src.Format == System.Windows.Media.PixelFormats.Pbgra32)
+        {
+            var alphaType = src.Format == System.Windows.Media.PixelFormats.Pbgra32
+                ? SKAlphaType.Premul : SKAlphaType.Unpremul;
+            var skBmp = new SKBitmap(w, h, SKColorType.Bgra8888, alphaType);
+            src.CopyPixels(new System.Windows.Int32Rect(0, 0, w, h),
+                           skBmp.GetPixels(), skBmp.ByteCount, w * 4);
+            return EnsureOpaqueBgra(skBmp);
+        }
+
+        // Fallback: BMP encode + decode for other formats.
         var encoder = new BmpBitmapEncoder();
         encoder.Frames.Add(BitmapFrame.Create(src));
         using var ms = new MemoryStream();
         encoder.Save(ms);
         ms.Position = 0;
-        return SKBitmap.Decode(ms)
-               ?? throw new InvalidOperationException("SKBitmap.Decode returned null.");
+        var decoded = SKBitmap.Decode(ms)
+                      ?? throw new InvalidOperationException("SKBitmap.Decode returned null.");
+        return EnsureOpaqueBgra(decoded);
     }
 
-    private static SKBitmap ToSKBitmap(System.Drawing.Bitmap bmp)
+    private static unsafe SKBitmap ToSKBitmap(System.Drawing.Bitmap bmp)
     {
-        using var ms = new MemoryStream();
-        bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Bmp);
-        ms.Position = 0;
-        return SKBitmap.Decode(ms)
-               ?? throw new InvalidOperationException("SKBitmap.Decode returned null.");
+        var skBmp = new SKBitmap(bmp.Width, bmp.Height, SKColorType.Bgra8888, SKAlphaType.Opaque);
+        var data  = bmp.LockBits(
+            new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height),
+            System.Drawing.Imaging.ImageLockMode.ReadOnly,
+            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try
+        {
+            int rowBytes = bmp.Width * 4;
+            byte* src = (byte*)data.Scan0;
+            byte* dst = (byte*)skBmp.GetPixels().ToPointer();
+            if (data.Stride == rowBytes)
+                Buffer.MemoryCopy(src, dst, skBmp.ByteCount, skBmp.ByteCount);
+            else
+                for (int y = 0; y < bmp.Height; y++)
+                    Buffer.MemoryCopy(src + y * data.Stride, dst + y * rowBytes, rowBytes, rowBytes);
+        }
+        finally
+        {
+            bmp.UnlockBits(data);
+        }
+        return skBmp;
+    }
+
+    // Validates dimensions and composites any semi-transparent pixels onto white.
+    // SkiaSharp always decodes to Bgra8888 internally; when the source has real
+    // alpha the premultiplied values would corrupt the ONNX float normalisation.
+    private static SKBitmap EnsureOpaqueBgra(SKBitmap src)
+    {
+        if (src.Width <= 0 || src.Height <= 0)
+            throw new InvalidOperationException(
+                $"Decoded image has invalid dimensions {src.Width}×{src.Height}.");
+
+        if (src.AlphaType == SKAlphaType.Opaque)
+            return src;
+
+        var dst = new SKBitmap(src.Width, src.Height, SKColorType.Bgra8888, SKAlphaType.Opaque);
+        using var canvas = new SKCanvas(dst);
+        canvas.Clear(SKColors.White);
+        canvas.DrawBitmap(src, 0, 0);
+        src.Dispose();
+        return dst;
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
@@ -281,6 +357,8 @@ public class OcrService : IDisposable
         _sem = null;
         while (_pool.TryDequeue(out var ocr)) ocr.Dispose();
     }
+
+    public void InvalidateSessions() => DisposePool();
 
     public void Dispose() => DisposePool();
 }

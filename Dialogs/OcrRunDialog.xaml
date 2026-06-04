@@ -96,26 +96,30 @@
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
-            <!-- GPU -->
-            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                <CheckBox x:Name="ChkGpu" Content="GPU (DirectML)"
-                          ToolTip="DirectX 12 GPU 가속 사용"/>
-            </StackPanel>
-
             <!-- Workers -->
-            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
                 <TextBlock Text="Workers:" VerticalAlignment="Center"
                            Foreground="#A6ADC8" Margin="0,0,8,0"/>
                 <ComboBox x:Name="CmbWorkers"
                           Background="#313244" Foreground="#CDD6F4"
                           BorderBrush="#45475A" BorderThickness="1"
                           Padding="6,4" FontSize="13"
-                          Width="65" SelectedIndex="1">
+                          Width="65">
                     <ComboBoxItem Content="1"/>
                     <ComboBoxItem Content="2"/>
                     <ComboBoxItem Content="4"/>
                     <ComboBoxItem Content="8"/>
                 </ComboBox>
+            </StackPanel>
+
+            <!-- Korean upscale -->
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBlock Text="한국어 업스케일:" VerticalAlignment="Center"
+                           Foreground="#A6ADC8" FontSize="12" Margin="0,0,6,0"
+                           ToolTip="한국어 OCR 시 이미지 확대 목표 크기 (px). 낮을수록 빠름, 높을수록 정확."/>
+                <TextBox x:Name="TxtKoreanUpscale" Width="52" Text="2560"
+                         PreviewTextInput="NumericOnly"
+                         ToolTip="권장: 1280(빠름) / 2560(기본) / 3840(정확)"/>
             </StackPanel>
         </Grid>
 

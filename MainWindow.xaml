@@ -14,13 +14,16 @@
     </Window.Resources>
 
     <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="220"/>
             <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
 
         <!-- Sidebar -->
-        <Border Grid.Column="0"
+        <Border Grid.Row="0" Grid.Column="0"
                 Background="#181825"
                 BorderBrush="#313244"
                 BorderThickness="0,0,1,0">
@@ -78,7 +81,7 @@
 
         <!-- Content Frame -->
         <Frame x:Name="ContentFrame"
-               Grid.Column="1"
+               Grid.Row="0" Grid.Column="1"
                NavigationUIVisibility="Hidden"
                Background="#1E1E2E"/>
     </Grid>

@@ -39,6 +39,26 @@
                 Padding="12,8">
             <WrapPanel Orientation="Horizontal" VerticalAlignment="Center">
 
+                <!-- Undo / Redo -->
+                <Button x:Name="BtnUndo"
+                        Content="↩"
+                        Style="{StaticResource SecondaryButton}"
+                        IsEnabled="False"
+                        Click="BtnUndo_Click"
+                        Padding="14,10"
+                        FontSize="15"
+                        Margin="0,0,4,0"
+                        ToolTip="실행 취소 (Ctrl+Z)"/>
+                <Button x:Name="BtnRedo"
+                        Content="↪"
+                        Style="{StaticResource SecondaryButton}"
+                        IsEnabled="False"
+                        Click="BtnRedo_Click"
+                        Padding="14,10"
+                        FontSize="15"
+                        Margin="0,0,12,0"
+                        ToolTip="다시 실행 (Ctrl+Y)"/>
+
                 <!-- File Button + ContextMenu -->
                 <Button x:Name="BtnFile"
                         Content="📁 File ▾"

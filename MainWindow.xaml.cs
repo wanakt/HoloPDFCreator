@@ -14,7 +14,9 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        _pdfReaderPage.AdjustedStore = _adjustedStore;
+        _pdfReaderPage.AdjustedStore      = _adjustedStore;
+        _pdfReaderPage.OcrDataProvider    = path => _ocrPage.GetOcrData(path);
+        _pdfReaderPage.OnAdjustmentsBaked = () => _ocrPage.InvalidateOcrSessions();
         ContentFrame.Navigate(_pdfReaderPage);
 
         Loaded += async (_, _) =>
