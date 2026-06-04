@@ -1669,19 +1669,22 @@ public partial class OcrPage : Page
                 Foreground      = new SolidColorBrush(MediaColor.FromRgb(0xCD, 0xD6, 0xF4)),
                 Background      = System.Windows.Media.Brushes.Transparent,
                 BorderThickness = new Thickness(0),
-                IsReadOnly      = false,
                 TextWrapping    = TextWrapping.Wrap,
                 AcceptsReturn   = true,
                 Padding         = new Thickness(0),
-                ToolTip         = "클릭하여 텍스트 수정 · Enter로 줄바꿈 · 다른 곳 클릭 시 저장"
+                ToolTip         = "클릭하여 수정 · Enter로 줄바꿈 · Escape로 취소",
             };
 
-            // Visual feedback when editing
             tb.GotFocus  += (_, _) =>
+            {
                 tb.Background = new SolidColorBrush(MediaColor.FromArgb(80, 0x31, 0x32, 0x44));
+                tb.BorderThickness = new Thickness(1);
+                tb.BorderBrush = new SolidColorBrush(color);
+            };
             tb.LostFocus += (_, _) =>
             {
-                tb.Background = System.Windows.Media.Brushes.Transparent;
+                tb.Background      = System.Windows.Media.Brushes.Transparent;
+                tb.BorderThickness = new Thickness(0);
                 string newText = tb.Text;
                 if (newText != committedText && capturedI < _currentRegions.Count)
                 {
@@ -1689,7 +1692,6 @@ public partial class OcrPage : Page
                     committedText = newText;
                 }
             };
-            // Ctrl+Enter also commits and moves focus away
             tb.PreviewKeyDown += (_, e) =>
             {
                 if (e.Key == Key.Escape) { tb.Text = committedText; ResultsPanel.Focus(); e.Handled = true; }
