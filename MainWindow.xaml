@@ -5,11 +5,11 @@
         Height="780" Width="1280"
         MinHeight="600" MinWidth="900"
         WindowStartupLocation="CenterScreen"
-        Background="#1E1E2E">
+        Background="{StaticResource BgGradient}">
 
     <Window.Resources>
         <Style TargetType="TextBlock">
-            <Setter Property="Foreground" Value="#CDD6F4"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
         </Style>
     </Window.Resources>
 
@@ -18,34 +18,48 @@
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="220"/>
+            <ColumnDefinition Width="224"/>
             <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
 
-        <!-- Sidebar -->
+        <!-- ══════════════ SIDEBAR (frosted glass) ══════════════ -->
         <Border Grid.Row="0" Grid.Column="0"
-                Background="#181825"
-                BorderBrush="#313244"
+                Background="{StaticResource GlassStrong}"
+                BorderBrush="{StaticResource GlassBorder}"
                 BorderThickness="0,0,1,0">
             <DockPanel>
 
                 <!-- App Title -->
-                <StackPanel DockPanel.Dock="Top" Margin="16,24,16,16">
-                    <TextBlock Text="HoloPDF"
-                               FontSize="22" FontWeight="Bold"
-                               Foreground="#89B4FA"/>
-                    <TextBlock Text="Creator"
-                               FontSize="22" FontWeight="Bold"
-                               Foreground="#CDD6F4"/>
-                    <Rectangle Height="1" Fill="#313244" Margin="0,16,0,0"/>
+                <StackPanel DockPanel.Dock="Top" Margin="20,26,16,16">
+                    <StackPanel Orientation="Horizontal">
+                        <Border Width="34" Height="34" CornerRadius="9"
+                                Background="{StaticResource AccentGradient}"
+                                Margin="0,0,10,0">
+                            <Border.Effect>
+                                <DropShadowEffect Color="#89B4FA" BlurRadius="16" ShadowDepth="0" Opacity="0.6"/>
+                            </Border.Effect>
+                            <TextBlock Text="◈" FontSize="18" Foreground="#15103A"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock Text="HoloPDF"
+                                       FontSize="19" FontWeight="Bold"
+                                       Foreground="{StaticResource TextPrimary}"/>
+                            <TextBlock Text="Creator"
+                                       FontSize="11" FontWeight="SemiBold"
+                                       Foreground="{StaticResource AccentPurple}"
+                                       Margin="1,-2,0,0"/>
+                        </StackPanel>
+                    </StackPanel>
+                    <Rectangle Height="1" Fill="{StaticResource GlassBorder}" Margin="0,18,0,0"/>
                 </StackPanel>
 
                 <!-- NAVIGATION label -->
                 <TextBlock DockPanel.Dock="Top"
                            Text="NAVIGATION"
                            FontSize="10" FontWeight="SemiBold"
-                           Foreground="#585B70"
-                           Margin="24,0,16,8"/>
+                           Foreground="{StaticResource TextMuted}"
+                           Margin="24,4,16,8"/>
 
                 <!-- Nav Buttons -->
                 <StackPanel DockPanel.Dock="Top">
@@ -72,7 +86,7 @@
                 <TextBlock DockPanel.Dock="Bottom"
                            Text="v1.0.0"
                            FontSize="11"
-                           Foreground="#45475A"
+                           Foreground="{StaticResource TextMuted}"
                            HorizontalAlignment="Center"
                            Margin="0,8,0,16"/>
 
@@ -83,6 +97,6 @@
         <Frame x:Name="ContentFrame"
                Grid.Row="0" Grid.Column="1"
                NavigationUIVisibility="Hidden"
-               Background="#1E1E2E"/>
+               Background="Transparent"/>
     </Grid>
 </Window>

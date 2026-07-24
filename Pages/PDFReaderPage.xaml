@@ -1,7 +1,7 @@
 <Page x:Class="HoloPDFCreator.Pages.PDFReaderPage"
       xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-      Background="#1E1E2E"
+      Background="{StaticResource BgGradient}"
       Title="PDF Reader"
       PreviewKeyDown="Page_PreviewKeyDown">
 
@@ -33,8 +33,8 @@
 
         <!-- ══════════════ TOOLBAR ══════════════ -->
         <Border Grid.Row="0"
-                Background="#181825"
-                BorderBrush="#313244"
+                Background="{StaticResource GlassStrong}"
+                BorderBrush="{StaticResource GlassBorder}"
                 BorderThickness="0,0,0,1"
                 Padding="12,8">
             <WrapPanel Orientation="Horizontal" VerticalAlignment="Center">
@@ -144,7 +144,7 @@
                         Margin="6,0,4,0"
                         Padding="10,7"/>
 
-                <Border Background="#313244" CornerRadius="6" Padding="12,6" Margin="2,0">
+                <Border Background="{StaticResource GlassSurface}" CornerRadius="6" Padding="12,6" Margin="2,0">
                     <TextBlock x:Name="TxtPageInfo"
                                Text="No document"
                                FontSize="13"
@@ -168,7 +168,7 @@
                         Margin="6,0,4,0"
                         Padding="10,7"/>
 
-                <Border Background="#313244" CornerRadius="6" Padding="10,6" Margin="2,0">
+                <Border Background="{StaticResource GlassSurface}" CornerRadius="6" Padding="10,6" Margin="2,0">
                     <TextBlock x:Name="TxtZoom"
                                Text="100%"
                                FontSize="13"
@@ -264,7 +264,7 @@
                             <!-- Folded corner -->
                             <Polyline Points="15,2 19,6 15,6 15,2"
                                       Stroke="#CDD6F4" StrokeThickness="1.4"
-                                      Fill="#313244"/>
+                                      Fill="{StaticResource GlassBorder}"/>
                         </Canvas>
                     </Viewbox>
                 </Button>
@@ -327,8 +327,8 @@
 
                 <!-- ══════════════ BOOKMARK PANEL ══════════════ -->
                 <Border Grid.Column="0"
-                        Background="#181825"
-                        BorderBrush="#313244"
+                        Background="{StaticResource GlassStrong}"
+                        BorderBrush="{StaticResource GlassBorder}"
                         BorderThickness="0,0,1,0">
                     <Grid>
                         <Grid.RowDefinitions>
@@ -336,8 +336,8 @@
                             <RowDefinition Height="*"/>
                         </Grid.RowDefinitions>
                         <Border Grid.Row="0"
-                                Background="#13131F"
-                                BorderBrush="#313244"
+                                Background="{StaticResource GlassHeader}"
+                                BorderBrush="{StaticResource GlassBorder}"
                                 BorderThickness="0,0,0,1"
                                 Padding="8,4,4,4">
                             <Grid>
@@ -361,7 +361,7 @@
                                       Grid.Row="1"
                                       VerticalScrollBarVisibility="Auto"
                                       HorizontalScrollBarVisibility="Disabled"
-                                      Background="#181825">
+                                      Background="{StaticResource GlassStrong}">
                             <StackPanel x:Name="BookmarkPanel" Background="Transparent" Margin="4,4,4,4"/>
                         </ScrollViewer>
                         <!-- Drag overlay: sits above ScrollViewer, captures mouse during bookmark drag -->
@@ -374,8 +374,8 @@
 
                 <!-- ══════════════ THUMBNAIL PANEL ══════════════ -->
                 <Border Grid.Column="1"
-                        Background="#181825"
-                        BorderBrush="#313244"
+                        Background="{StaticResource GlassStrong}"
+                        BorderBrush="{StaticResource GlassBorder}"
                         BorderThickness="0,0,1,0">
                     <Grid>
                         <Grid.RowDefinitions>
@@ -383,8 +383,8 @@
                             <RowDefinition Height="*"/>
                         </Grid.RowDefinitions>
                         <Border Grid.Row="0"
-                                Background="#13131F"
-                                BorderBrush="#313244"
+                                Background="{StaticResource GlassHeader}"
+                                BorderBrush="{StaticResource GlassBorder}"
                                 BorderThickness="0,0,0,1"
                                 Padding="8,6">
                             <Grid>
@@ -409,7 +409,7 @@
                                       Grid.Row="1"
                                       VerticalScrollBarVisibility="Auto"
                                       HorizontalScrollBarVisibility="Disabled"
-                                      Background="#181825"
+                                      Background="{StaticResource GlassStrong}"
                                       AllowDrop="True">
                             <WrapPanel x:Name="ThumbPanel" Orientation="Horizontal" Margin="4,4,4,4">
                                 <TextBlock Text="Open a PDF to see pages"
@@ -424,12 +424,12 @@
                               Width="5"
                               HorizontalAlignment="Stretch"
                               VerticalAlignment="Stretch"
-                              Background="#2A2A3E"
+                              Background="{StaticResource GlassHover}"
                               Cursor="SizeWE"/>
 
                 <ScrollViewer x:Name="PdfScrollViewer"
                               Grid.Column="3"
-                              Background="#1E1E2E"
+                              Background="{StaticResource GlassPanel}"
                               HorizontalScrollBarVisibility="Auto"
                               VerticalScrollBarVisibility="Hidden"
                               Padding="20"
@@ -440,8 +440,8 @@
                     <!-- Drop zone -->
                     <Border x:Name="DropZone"
                             Width="600" Height="400"
-                            Background="#181825"
-                            BorderBrush="#313244"
+                            Background="{StaticResource GlassStrong}"
+                            BorderBrush="{StaticResource GlassBorder}"
                             BorderThickness="2"
                             CornerRadius="16"
                             AllowDrop="True"
@@ -527,8 +527,8 @@
 
             <!-- ══════════════ ADJUST PANEL ══════════════ -->
             <Border Grid.Column="2"
-                    Background="#181825"
-                    BorderBrush="#313244"
+                    Background="{StaticResource GlassStrong}"
+                    BorderBrush="{StaticResource GlassBorder}"
                     BorderThickness="1,0,0,0"
                     ClipToBounds="True">
                 <Grid>
@@ -537,8 +537,8 @@
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
                     <Border Grid.Row="0"
-                            Background="#13131F"
-                            BorderBrush="#313244"
+                            Background="{StaticResource GlassHeader}"
+                            BorderBrush="{StaticResource GlassBorder}"
                             BorderThickness="0,0,0,1"
                             Padding="12,4,4,4">
                         <Grid>
@@ -571,7 +571,7 @@
                                   Unchecked="AdjAutoLevel_Changed"
                                   Margin="0,0,0,8"/>
 
-                        <Rectangle Height="1" Fill="#45475A" Margin="0,0,0,8"/>
+                        <Rectangle Height="1" Fill="{StaticResource GlassBorder}" Margin="0,0,0,8"/>
 
                         <!-- Brightness -->
                         <TextBlock Text="Brightness" FontSize="11" Foreground="#A6ADC8" Margin="0,0,0,2"/>
@@ -624,10 +624,10 @@
                                        VerticalAlignment="Center" TextAlignment="Right"/>
                         </Grid>
 
-                        <Rectangle Height="1" Fill="#45475A" Margin="0,0,0,8"/>
+                        <Rectangle Height="1" Fill="{StaticResource GlassBorder}" Margin="0,0,0,8"/>
 
                         <!-- Unsharp Mask box -->
-                        <Border BorderBrush="#45475A" BorderThickness="1"
+                        <Border BorderBrush="{StaticResource GlassBorder}" BorderThickness="1"
                                 CornerRadius="4" Padding="8,6,8,6" Margin="0,0,0,8">
                             <StackPanel>
                                 <TextBlock Text="Unsharp Mask" FontSize="11" FontWeight="SemiBold"
@@ -687,7 +687,7 @@
                                 Click="AdjReset_Click"
                                 Margin="0,0,0,12"/>
 
-                        <Rectangle Height="1" Fill="#313244" Margin="0,0,0,12"/>
+                        <Rectangle Height="1" Fill="{StaticResource GlassBorder}" Margin="0,0,0,12"/>
 
                         <!-- Apply buttons -->
                         <Button x:Name="BtnAdjApplyAll"
@@ -747,8 +747,8 @@
 
             <!-- ══════════════ SEARCH PANEL ══════════════ -->
             <Border Grid.Column="3"
-                    Background="#181825"
-                    BorderBrush="#313244"
+                    Background="{StaticResource GlassStrong}"
+                    BorderBrush="{StaticResource GlassBorder}"
                     BorderThickness="1,0,0,0"
                     ClipToBounds="True">
                 <Grid>
@@ -760,8 +760,8 @@
 
                     <!-- Header -->
                     <Border Grid.Row="0"
-                            Background="#13131F"
-                            BorderBrush="#313244"
+                            Background="{StaticResource GlassHeader}"
+                            BorderBrush="{StaticResource GlassBorder}"
                             BorderThickness="0,0,0,1"
                             Padding="10,6">
                         <Grid>
@@ -785,8 +785,8 @@
 
                     <!-- Input area -->
                     <Border Grid.Row="1"
-                            Background="#1E1E2E"
-                            BorderBrush="#313244"
+                            Background="{StaticResource GlassPanel}"
+                            BorderBrush="{StaticResource GlassBorder}"
                             BorderThickness="0,0,0,1"
                             Padding="8,8">
                         <StackPanel>
@@ -797,10 +797,10 @@
                                 </Grid.ColumnDefinitions>
                                 <TextBox x:Name="TxtSearchBox"
                                          Grid.Column="0"
-                                         Background="#313244"
+                                         Background="{StaticResource GlassSurface}"
                                          Foreground="#CDD6F4"
                                          CaretBrush="#CDD6F4"
-                                         BorderBrush="#45475A"
+                                         BorderBrush="{StaticResource GlassBorder}"
                                          BorderThickness="1"
                                          Padding="6,5"
                                          FontSize="12"
@@ -832,7 +832,7 @@
                     <ScrollViewer Grid.Row="2"
                                   VerticalScrollBarVisibility="Auto"
                                   HorizontalScrollBarVisibility="Disabled"
-                                  Background="#181825">
+                                  Background="{StaticResource GlassStrong}">
                         <StackPanel x:Name="SearchResultsPanel" Margin="4,4,4,8"/>
                     </ScrollViewer>
                 </Grid>
@@ -840,8 +840,8 @@
 
             <!-- ══════════════ CROP PANEL ══════════════ -->
             <Border Grid.Column="4"
-                    Background="#181825"
-                    BorderBrush="#313244"
+                    Background="{StaticResource GlassStrong}"
+                    BorderBrush="{StaticResource GlassBorder}"
                     BorderThickness="1,0,0,0"
                     ClipToBounds="True">
                 <Grid>
@@ -852,8 +852,8 @@
 
                     <!-- Header -->
                     <Border Grid.Row="0"
-                            Background="#13131F"
-                            BorderBrush="#313244"
+                            Background="{StaticResource GlassHeader}"
+                            BorderBrush="{StaticResource GlassBorder}"
                             BorderThickness="0,0,0,1"
                             Padding="10,6">
                         <Grid>
@@ -982,8 +982,8 @@
 
             <!-- ══════════════ MEMO PANEL ══════════════ -->
             <Border Grid.Column="1"
-                    Background="#181825"
-                    BorderBrush="#313244"
+                    Background="{StaticResource GlassStrong}"
+                    BorderBrush="{StaticResource GlassBorder}"
                     BorderThickness="1,0,0,0"
                     ClipToBounds="True">
                 <Grid>
@@ -995,8 +995,8 @@
                     <!-- Header + Search -->
                     <Border Grid.Row="0"
                             Padding="10,8"
-                            Background="#1E1E2E"
-                            BorderBrush="#313244"
+                            Background="{StaticResource GlassPanel}"
+                            BorderBrush="{StaticResource GlassBorder}"
                             BorderThickness="0,0,0,1">
                         <StackPanel>
                             <TextBlock Text="Memos"

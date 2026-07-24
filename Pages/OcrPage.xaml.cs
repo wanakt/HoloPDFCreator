@@ -60,9 +60,9 @@ public partial class OcrPage : Page
         [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif"];
 
     // Frozen brushes for item panel
-    private static readonly SolidColorBrush BrushNormal     = Frozen(0x1E, 0x1E, 0x2E);
-    private static readonly SolidColorBrush BrushHover      = Frozen(0x28, 0x28, 0x3C);
-    private static readonly SolidColorBrush BrushSelected   = Frozen(0x31, 0x32, 0x44);
+    private static readonly SolidColorBrush BrushNormal     = FrozenA(0x66, 0x19, 0x19, 0x34);
+    private static readonly SolidColorBrush BrushHover      = FrozenA(0x99, 0x34, 0x34, 0x60);
+    private static readonly SolidColorBrush BrushSelected   = FrozenA(0xCC, 0x2C, 0x2C, 0x50);
     private static readonly SolidColorBrush BrushDotDone    = Frozen(0xA6, 0xE3, 0xA1);
     private static readonly SolidColorBrush BrushDotPend    = Frozen(0x45, 0x47, 0x5A);
     private static readonly SolidColorBrush BrushMarkBorder = Frozen(0x89, 0xB4, 0xFA);
@@ -70,6 +70,13 @@ public partial class OcrPage : Page
     private static SolidColorBrush Frozen(byte r, byte g, byte b)
     {
         var br = new SolidColorBrush(MediaColor.FromRgb(r, g, b));
+        br.Freeze();
+        return br;
+    }
+
+    private static SolidColorBrush FrozenA(byte a, byte r, byte g, byte b)
+    {
+        var br = new SolidColorBrush(MediaColor.FromArgb(a, r, g, b));
         br.Freeze();
         return br;
     }
@@ -931,6 +938,11 @@ public partial class OcrPage : Page
         var idxList = indices.Where(i => i >= 0 && i < _items.Count).ToList();
         if (idxList.Count == 0) return;
 
+        // Never spin up more worker sessions than there are pages: a single page
+        // then gets a pool of 1 → all CPU cores work on that one image (see
+        // OcrService.BuildCpuOptions), instead of 1 idle-heavy thread.
+        int effWorkers = Math.Min(Math.Max(1, workers), idxList.Count);
+
         _batchCts?.Cancel();
         _batchCts = new CancellationTokenSource();
         var ct = _batchCts.Token;
@@ -958,7 +970,7 @@ public partial class OcrPage : Page
             var lang = SelectedOcrLanguage();
 
             if (!_ocrService.IsReady ||
-                _ocrService.RequestedWorkers != workers   ||
+                _ocrService.RequestedWorkers != effWorkers ||
                 _ocrService.CurrentLanguage  != lang      ||
                 _ocrService.CurrentModelSize != modelSize)
             {
@@ -974,7 +986,7 @@ public partial class OcrPage : Page
                     language:    lang,
                     progress:    initProgress,
                     ct:          ct,
-                    parallelism: workers,
+                    parallelism: effWorkers,
                     modelSize:   modelSize);
             }
             _ocrService.KoreanUpscaleTarget = _lastKoreanUpscale;
@@ -986,7 +998,7 @@ public partial class OcrPage : Page
             var pdfDocPool = new System.Collections.Concurrent.ConcurrentQueue<WinPdf.PdfDocument>();
             if (pdfPath != null)
             {
-                for (int d = 0; d < workers; d++)
+                for (int d = 0; d < effWorkers; d++)
                 {
                     var sf = await StorageFile.GetFileFromPathAsync(pdfPath);
                     pdfDocPool.Enqueue(await WinPdf.PdfDocument.LoadFromFileAsync(sf));
@@ -1028,7 +1040,7 @@ public partial class OcrPage : Page
 
             await Task.Run(() => Parallel.ForEachAsync(
                 idxList,
-                new ParallelOptions { MaxDegreeOfParallelism = workers, CancellationToken = ct },
+                new ParallelOptions { MaxDegreeOfParallelism = effWorkers, CancellationToken = ct },
                 async (idx, localCt) =>
                 {
                     await LazyLoadPageAsync(idx, localCt).ConfigureAwait(false);
@@ -1132,14 +1144,14 @@ public partial class OcrPage : Page
             string perPage  = idxList.Count > 0
                 ? $"{sw.Elapsed.TotalSeconds / idxList.Count:F1}초"
                 : "-";
-            int threadsUsed = Math.Max(1, Environment.ProcessorCount / workers);
+            int threadsUsed = Math.Max(1, Environment.ProcessorCount / effWorkers);
 
             MessageBox.Show(
                 $"처리 페이지:   {idxList.Count}페이지\n" +
                 $"검출 텍스트:   {totalRegions}개 영역\n" +
                 $"소요 시간:     {elapsed}\n" +
                 $"페이지당 평균: {perPage}\n\n" +
-                $"모델: {modelStr}  |  언어: {langStr}  |  워커: {workers} (스레드: {threadsUsed}×{workers})",
+                $"모델: {modelStr}  |  언어: {langStr}  |  워커: {effWorkers} (스레드: {threadsUsed}×{effWorkers})",
                 "OCR 완료",
                 MessageBoxButton.OK,
                 MessageBoxImage.Information);
@@ -1728,8 +1740,8 @@ public partial class OcrPage : Page
 
             var card = new Border
             {
-                Background      = new SolidColorBrush(MediaColor.FromRgb(0x1E, 0x1E, 0x2E)),
-                BorderBrush     = new SolidColorBrush(MediaColor.FromRgb(0x31, 0x32, 0x44)),
+                Background      = new SolidColorBrush(MediaColor.FromArgb(0x99, 0x19, 0x19, 0x34)),
+                BorderBrush     = new SolidColorBrush(MediaColor.FromArgb(0x2E, 0xFF, 0xFF, 0xFF)),
                 BorderThickness = new Thickness(1),
                 CornerRadius    = new CornerRadius(6),
                 Margin          = new Thickness(0, 0, 0, 6),
@@ -1738,7 +1750,7 @@ public partial class OcrPage : Page
             card.Child = row;
 
             card.MouseEnter += (_, _) => { card.BorderBrush = new SolidColorBrush(color); HighlightPolygon(capturedI); };
-            card.MouseLeave += (_, _) => { card.BorderBrush = new SolidColorBrush(MediaColor.FromRgb(0x31, 0x32, 0x44)); UnhighlightPolygon(capturedI); };
+            card.MouseLeave += (_, _) => { card.BorderBrush = new SolidColorBrush(MediaColor.FromArgb(0x2E, 0xFF, 0xFF, 0xFF)); UnhighlightPolygon(capturedI); };
 
             ResultsPanel.Children.Add(card);
             _resultCards.Add(card);
@@ -1773,10 +1785,10 @@ public partial class OcrPage : Page
     private void HighlightResultCard(int idx)
     {
         if (_highlightedCard != null)
-            _highlightedCard.Background = new SolidColorBrush(MediaColor.FromRgb(0x1E, 0x1E, 0x2E));
+            _highlightedCard.Background = new SolidColorBrush(MediaColor.FromArgb(0x99, 0x19, 0x19, 0x34));
         if (idx < _resultCards.Count)
         {
-            _resultCards[idx].Background = new SolidColorBrush(MediaColor.FromRgb(0x2A, 0x2A, 0x3E));
+            _resultCards[idx].Background = new SolidColorBrush(MediaColor.FromArgb(0x99, 0x34, 0x34, 0x60));
             _highlightedCard = _resultCards[idx];
         }
     }

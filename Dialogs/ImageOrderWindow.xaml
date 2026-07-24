@@ -4,7 +4,7 @@
         Title="Open Images"
         Width="720" Height="540"
         MinWidth="500" MinHeight="360"
-        Background="#1E1E2E"
+        Background="{StaticResource BgGradient}"
         Foreground="#CDD6F4"
         WindowStartupLocation="CenterOwner"
         ShowInTaskbar="False">
@@ -63,8 +63,8 @@
                 </Grid.RowDefinitions>
 
                 <Border Grid.Row="0"
-                        Background="#13131F"
-                        BorderBrush="#313244"
+                        Background="{StaticResource GlassHeader}"
+                        BorderBrush="{StaticResource GlassBorder}"
                         BorderThickness="1,1,1,0"
                         CornerRadius="6,6,0,0"
                         Padding="12,6">
@@ -88,8 +88,8 @@
                 </Border>
 
                 <Border Grid.Row="1"
-                        Background="#181825"
-                        BorderBrush="#313244"
+                        Background="{StaticResource GlassStrong}"
+                        BorderBrush="{StaticResource GlassBorder}"
                         BorderThickness="1,0,1,1"
                         CornerRadius="0,0,6,6">
                     <ListBox x:Name="FileListBox"

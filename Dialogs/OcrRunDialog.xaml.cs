@@ -41,8 +41,8 @@ public partial class OcrRunDialog : Window
 
         TxtKoreanUpscale.Text = lastKoreanUpscale.ToString();
 
-        // Default workers: nearest option to cpu count (first run), or last-used value.
-        int workers = lastWorkers > 0 ? lastWorkers : Math.Min(Environment.ProcessorCount, 8);
+        // Default workers: half the CPU core count (first run), or last-used value.
+        int workers = lastWorkers > 0 ? lastWorkers : Math.Max(1, Environment.ProcessorCount / 2);
         CmbWorkers.SelectedIndex = workers <= 1 ? 0 :
                                    workers <= 2 ? 1 :
                                    workers <= 4 ? 2 : 3;

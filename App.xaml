@@ -4,42 +4,101 @@
              StartupUri="MainWindow.xaml">
     <Application.Resources>
         <ResourceDictionary>
-            <SolidColorBrush x:Key="BgMain"      Color="#1E1E2E"/>
-            <SolidColorBrush x:Key="BgSide"      Color="#181825"/>
-            <SolidColorBrush x:Key="BgSurface"   Color="#313244"/>
-            <SolidColorBrush x:Key="BgSurface2"  Color="#45475A"/>
-            <SolidColorBrush x:Key="AccentBlue"  Color="#89B4FA"/>
-            <SolidColorBrush x:Key="AccentGreen" Color="#A6E3A1"/>
-            <SolidColorBrush x:Key="TextPrimary"  Color="#CDD6F4"/>
-            <SolidColorBrush x:Key="TextSecondary" Color="#A6ADC8"/>
-            <SolidColorBrush x:Key="DangerRed"   Color="#F38BA8"/>
+
+            <!-- ════════════════════════════════════════════════════════════
+                 VIBRANT GLASS DESIGN SYSTEM
+                 Deep gradient backdrop + translucent frosted panels +
+                 neon (blue→purple) accents with glow.
+                 ════════════════════════════════════════════════════════════ -->
+
+            <!-- ── Backdrop gradient (windows & pages) ── -->
+            <LinearGradientBrush x:Key="BgGradient" StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Color="#241046" Offset="0"/>
+                <GradientStop Color="#1A2356" Offset="0.55"/>
+                <GradientStop Color="#0C2F52" Offset="1"/>
+            </LinearGradientBrush>
+
+            <!-- A second, more saturated gradient for hero/sidebar strips -->
+            <LinearGradientBrush x:Key="BgGradientVivid" StartPoint="0,0" EndPoint="0,1">
+                <GradientStop Color="#3A1A6E" Offset="0"/>
+                <GradientStop Color="#1E2A66" Offset="0.6"/>
+                <GradientStop Color="#103A5E" Offset="1"/>
+            </LinearGradientBrush>
+
+            <!-- ── Frosted glass surfaces (alpha-blended over the gradient) ── -->
+            <SolidColorBrush x:Key="GlassStrong"  Color="#C0141430"/>
+            <SolidColorBrush x:Key="GlassPanel"   Color="#99191934"/>
+            <SolidColorBrush x:Key="GlassHeader"  Color="#B30E0E22"/>
+            <SolidColorBrush x:Key="GlassSurface" Color="#802C2C50"/>
+            <SolidColorBrush x:Key="GlassHover"   Color="#99343460"/>
+            <SolidColorBrush x:Key="GlassMenu"    Color="#F2191934"/>
+
+            <!-- ── Glass edges (subtle light rim) ── -->
+            <SolidColorBrush x:Key="GlassBorder"       Color="#2EFFFFFF"/>
+            <SolidColorBrush x:Key="GlassBorderStrong" Color="#4DFFFFFF"/>
+
+            <!-- ── Neon accents ── -->
+            <SolidColorBrush x:Key="AccentBlue"   Color="#89B4FA"/>
+            <SolidColorBrush x:Key="AccentPurple" Color="#CBA6F7"/>
+            <SolidColorBrush x:Key="AccentCyan"   Color="#89DCEB"/>
+            <SolidColorBrush x:Key="AccentGreen"  Color="#A6E3A1"/>
+            <SolidColorBrush x:Key="DangerRed"    Color="#F38BA8"/>
+
+            <LinearGradientBrush x:Key="AccentGradient" StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Color="#89B4FA" Offset="0"/>
+                <GradientStop Color="#A6A0F8" Offset="0.5"/>
+                <GradientStop Color="#CBA6F7" Offset="1"/>
+            </LinearGradientBrush>
+
+            <!-- ── Text ── -->
+            <SolidColorBrush x:Key="TextPrimary"   Color="#ECEFFF"/>
+            <SolidColorBrush x:Key="TextSecondary" Color="#AEB4DC"/>
+            <SolidColorBrush x:Key="TextMuted"     Color="#7B80A8"/>
+
+            <!-- ── Legacy aliases (kept so existing references still resolve) ── -->
+            <SolidColorBrush x:Key="BgMain"     Color="#241046"/>
+            <SolidColorBrush x:Key="BgSide"     Color="#C0141430"/>
+            <SolidColorBrush x:Key="BgSurface"  Color="#802C2C50"/>
+            <SolidColorBrush x:Key="BgSurface2" Color="#2EFFFFFF"/>
+
+            <!-- ── Reusable neon glow ── -->
+            <DropShadowEffect x:Key="NeonGlow"      Color="#89B4FA" BlurRadius="18" ShadowDepth="0" Opacity="0.55"/>
+            <DropShadowEffect x:Key="SoftCardShadow" Color="#000000" BlurRadius="16" ShadowDepth="0" Opacity="0.45"/>
+
+            <!-- ════════════════════════════ BUTTONS ════════════════════════════ -->
 
             <Style x:Key="PrimaryButton" TargetType="Button">
-                <Setter Property="Background"   Value="#89B4FA"/>
-                <Setter Property="Foreground"   Value="#1E1E2E"/>
+                <Setter Property="Background"      Value="{StaticResource AccentGradient}"/>
+                <Setter Property="Foreground"      Value="#15103A"/>
                 <Setter Property="BorderThickness" Value="0"/>
-                <Setter Property="Padding"      Value="14,7"/>
-                <Setter Property="FontSize"     Value="13"/>
-                <Setter Property="FontWeight"   Value="SemiBold"/>
-                <Setter Property="Cursor"       Value="Hand"/>
+                <Setter Property="Padding"         Value="14,7"/>
+                <Setter Property="FontSize"        Value="13"/>
+                <Setter Property="FontWeight"      Value="SemiBold"/>
+                <Setter Property="Cursor"          Value="Hand"/>
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="Button">
-                            <Border Background="{TemplateBinding Background}"
-                                    CornerRadius="6"
+                            <Border x:Name="Bd"
+                                    Background="{TemplateBinding Background}"
+                                    CornerRadius="8"
                                     Padding="{TemplateBinding Padding}">
-                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+                                <Border.Effect>
+                                    <DropShadowEffect Color="#89B4FA" BlurRadius="16" ShadowDepth="0" Opacity="0.5"/>
+                                </Border.Effect>
+                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                  VerticalAlignment="Center"/>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#74C7EC"/>
+                                    <Setter TargetName="Bd" Property="Opacity" Value="0.88"/>
                                 </Trigger>
                                 <Trigger Property="IsPressed" Value="True">
-                                    <Setter Property="Background" Value="#89DCEB"/>
+                                    <Setter TargetName="Bd" Property="Opacity" Value="0.72"/>
                                 </Trigger>
                                 <Trigger Property="IsEnabled" Value="False">
-                                    <Setter Property="Background" Value="#45475A"/>
-                                    <Setter Property="Foreground" Value="#585B70"/>
+                                    <Setter TargetName="Bd" Property="Background" Value="#3A3A55"/>
+                                    <Setter TargetName="Bd" Property="Effect" Value="{x:Null}"/>
+                                    <Setter Property="Foreground" Value="#6B6F94"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -48,30 +107,35 @@
             </Style>
 
             <Style x:Key="SecondaryButton" TargetType="Button">
-                <Setter Property="Background"      Value="#313244"/>
-                <Setter Property="Foreground"      Value="#CDD6F4"/>
-                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="Background"      Value="{StaticResource GlassSurface}"/>
+                <Setter Property="Foreground"      Value="{StaticResource TextPrimary}"/>
+                <Setter Property="BorderThickness" Value="1"/>
                 <Setter Property="Padding"         Value="14,7"/>
                 <Setter Property="FontSize"        Value="13"/>
                 <Setter Property="Cursor"          Value="Hand"/>
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="Button">
-                            <Border Background="{TemplateBinding Background}"
-                                    CornerRadius="6"
+                            <Border x:Name="Bd"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="{StaticResource GlassBorder}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="8"
                                     Padding="{TemplateBinding Padding}">
-                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                  VerticalAlignment="Center"/>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#45475A"/>
+                                    <Setter TargetName="Bd" Property="Background"  Value="{StaticResource GlassHover}"/>
+                                    <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource AccentBlue}"/>
                                 </Trigger>
                                 <Trigger Property="IsPressed" Value="True">
-                                    <Setter Property="Background" Value="#585B70"/>
+                                    <Setter TargetName="Bd" Property="Background" Value="#B33A3A66"/>
                                 </Trigger>
                                 <Trigger Property="IsEnabled" Value="False">
-                                    <Setter Property="Background" Value="#313244"/>
-                                    <Setter Property="Foreground" Value="#585B70"/>
+                                    <Setter TargetName="Bd" Property="Opacity" Value="0.4"/>
+                                    <Setter Property="Foreground" Value="#6B6F94"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -80,31 +144,36 @@
             </Style>
 
             <Style x:Key="SecondaryToggleButton" TargetType="ToggleButton">
-                <Setter Property="Background"      Value="#313244"/>
-                <Setter Property="Foreground"      Value="#CDD6F4"/>
-                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="Background"      Value="{StaticResource GlassSurface}"/>
+                <Setter Property="Foreground"      Value="{StaticResource TextPrimary}"/>
+                <Setter Property="BorderThickness" Value="1"/>
                 <Setter Property="Padding"         Value="14,7"/>
                 <Setter Property="FontSize"        Value="13"/>
                 <Setter Property="Cursor"          Value="Hand"/>
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="ToggleButton">
-                            <Border Background="{TemplateBinding Background}"
-                                    CornerRadius="6"
+                            <Border x:Name="Bd"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="{StaticResource GlassBorder}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="8"
                                     Padding="{TemplateBinding Padding}">
-                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                  VerticalAlignment="Center"/>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#45475A"/>
+                                    <Setter TargetName="Bd" Property="Background" Value="{StaticResource GlassHover}"/>
                                 </Trigger>
                                 <Trigger Property="IsChecked" Value="True">
-                                    <Setter Property="Background" Value="#89B4FA"/>
-                                    <Setter Property="Foreground" Value="#1E1E2E"/>
+                                    <Setter TargetName="Bd" Property="Background" Value="{StaticResource AccentGradient}"/>
+                                    <Setter TargetName="Bd" Property="BorderBrush" Value="Transparent"/>
+                                    <Setter Property="Foreground" Value="#15103A"/>
                                 </Trigger>
                                 <Trigger Property="IsEnabled" Value="False">
-                                    <Setter Property="Background" Value="#313244"/>
-                                    <Setter Property="Foreground" Value="#585B70"/>
+                                    <Setter TargetName="Bd" Property="Opacity" Value="0.4"/>
+                                    <Setter Property="Foreground" Value="#6B6F94"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -114,7 +183,7 @@
 
             <Style x:Key="NavButton" TargetType="Button">
                 <Setter Property="Background"            Value="Transparent"/>
-                <Setter Property="Foreground"            Value="#A6ADC8"/>
+                <Setter Property="Foreground"            Value="{StaticResource TextSecondary}"/>
                 <Setter Property="BorderThickness"       Value="0"/>
                 <Setter Property="Padding"               Value="16,12"/>
                 <Setter Property="FontSize"              Value="14"/>
@@ -125,7 +194,9 @@
                         <ControlTemplate TargetType="Button">
                             <Border x:Name="Bd"
                                     Background="{TemplateBinding Background}"
-                                    CornerRadius="8"
+                                    BorderBrush="Transparent"
+                                    BorderThickness="1"
+                                    CornerRadius="10"
                                     Padding="{TemplateBinding Padding}"
                                     Margin="8,2">
                                 <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
@@ -133,11 +204,11 @@
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#2A2A3E"/>
-                                    <Setter Property="Foreground" Value="#CDD6F4"/>
+                                    <Setter TargetName="Bd" Property="Background" Value="{StaticResource GlassSurface}"/>
+                                    <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
                                 </Trigger>
                                 <Trigger Property="IsPressed" Value="True">
-                                    <Setter Property="Background" Value="#313244"/>
+                                    <Setter TargetName="Bd" Property="Background" Value="{StaticResource GlassHover}"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -145,32 +216,103 @@
                 </Setter>
             </Style>
 
-            <Style x:Key="NavButtonActive" TargetType="Button" BasedOn="{StaticResource NavButton}">
-                <Setter Property="Background" Value="#2A2A3E"/>
-                <Setter Property="Foreground" Value="#89B4FA"/>
-            </Style>
-
-            <Style TargetType="TextBox">
-                <Setter Property="Background"   Value="#313244"/>
-                <Setter Property="Foreground"   Value="#CDD6F4"/>
-                <Setter Property="BorderBrush"  Value="#45475A"/>
-                <Setter Property="BorderThickness" Value="1"/>
-                <Setter Property="Padding"      Value="8,6"/>
-                <Setter Property="FontSize"     Value="13"/>
-                <Setter Property="CaretBrush"   Value="#89B4FA"/>
+            <Style x:Key="NavButtonActive" TargetType="Button">
+                <Setter Property="Foreground"            Value="#ECEFFF"/>
+                <Setter Property="BorderThickness"       Value="0"/>
+                <Setter Property="Padding"               Value="16,12"/>
+                <Setter Property="FontSize"              Value="14"/>
+                <Setter Property="Cursor"                Value="Hand"/>
+                <Setter Property="HorizontalContentAlignment" Value="Left"/>
                 <Setter Property="Template">
                     <Setter.Value>
-                        <ControlTemplate TargetType="TextBox">
-                            <Border Background="{TemplateBinding Background}"
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="Bd"
+                                    Background="{StaticResource GlassHover}"
+                                    BorderBrush="{StaticResource GlassBorderStrong}"
+                                    BorderThickness="1"
+                                    CornerRadius="10"
+                                    Padding="{TemplateBinding Padding}"
+                                    Margin="8,2">
+                                <Border.Effect>
+                                    <DropShadowEffect Color="#89B4FA" BlurRadius="14" ShadowDepth="0" Opacity="0.45"/>
+                                </Border.Effect>
+                                <Grid>
+                                    <Border HorizontalAlignment="Left" Width="3" CornerRadius="2"
+                                            Background="{StaticResource AccentGradient}" Margin="-8,2,0,2"/>
+                                    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                      VerticalAlignment="Center"/>
+                                </Grid>
+                            </Border>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <!-- Default (icon / bare) button -->
+            <Style TargetType="Button">
+                <Setter Property="Background"      Value="Transparent"/>
+                <Setter Property="Foreground"      Value="{StaticResource TextPrimary}"/>
+                <Setter Property="BorderBrush"     Value="Transparent"/>
+                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="Cursor"          Value="Hand"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="Bd"
+                                    Background="{TemplateBinding Background}"
                                     BorderBrush="{TemplateBinding BorderBrush}"
                                     BorderThickness="{TemplateBinding BorderThickness}"
                                     CornerRadius="6"
                                     Padding="{TemplateBinding Padding}">
+                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                  VerticalAlignment="Center"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="Bd" Property="Background" Value="{StaticResource GlassSurface}"/>
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter TargetName="Bd" Property="Background" Value="{StaticResource GlassHover}"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.35"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <!-- ════════════════════════════ INPUTS ════════════════════════════ -->
+
+            <Style TargetType="TextBox">
+                <Setter Property="Background"      Value="{StaticResource GlassSurface}"/>
+                <Setter Property="Foreground"      Value="{StaticResource TextPrimary}"/>
+                <Setter Property="BorderBrush"     Value="{StaticResource GlassBorder}"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="Padding"         Value="8,6"/>
+                <Setter Property="FontSize"        Value="13"/>
+                <Setter Property="CaretBrush"      Value="#89B4FA"/>
+                <Setter Property="SelectionBrush"  Value="#89B4FA"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="TextBox">
+                            <Border x:Name="Bd"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="7"
+                                    Padding="{TemplateBinding Padding}">
                                 <ScrollViewer x:Name="PART_ContentHost"/>
                             </Border>
                             <ControlTemplate.Triggers>
-                                <Trigger Property="IsFocused" Value="True">
-                                    <Setter Property="BorderBrush" Value="#89B4FA"/>
+                                <Trigger Property="IsKeyboardFocused" Value="True">
+                                    <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource AccentBlue}"/>
+                                    <Setter TargetName="Bd" Property="Effect">
+                                        <Setter.Value>
+                                            <DropShadowEffect Color="#89B4FA" BlurRadius="10" ShadowDepth="0" Opacity="0.5"/>
+                                        </Setter.Value>
+                                    </Setter>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -182,30 +324,43 @@
                 <Setter Property="Foreground" Value="#89B4FA"/>
             </Style>
 
-            <Style TargetType="Button">
-                <Setter Property="Background"      Value="Transparent"/>
-                <Setter Property="BorderBrush"     Value="Transparent"/>
-                <Setter Property="BorderThickness" Value="0"/>
-                <Setter Property="Cursor"          Value="Hand"/>
+            <Style TargetType="Label">
+                <Setter Property="Foreground" Value="{StaticResource TextSecondary}"/>
+                <Setter Property="FontSize"   Value="12"/>
+            </Style>
+
+            <!-- ════════════════════════════ SCROLLBAR ════════════════════════════ -->
+
+            <Style TargetType="ScrollBar">
+                <Setter Property="Background" Value="Transparent"/>
+                <Setter Property="Width"      Value="10"/>
                 <Setter Property="Template">
                     <Setter.Value>
-                        <ControlTemplate TargetType="Button">
-                            <Border Background="{TemplateBinding Background}"
-                                    BorderBrush="{TemplateBinding BorderBrush}"
-                                    BorderThickness="{TemplateBinding BorderThickness}"
-                                    CornerRadius="4"
-                                    Padding="{TemplateBinding Padding}">
-                                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
-                            </Border>
+                        <ControlTemplate TargetType="ScrollBar">
+                            <Grid Background="Transparent">
+                                <Track x:Name="PART_Track" IsDirectionReversed="True">
+                                    <Track.Thumb>
+                                        <Thumb>
+                                            <Thumb.Template>
+                                                <ControlTemplate TargetType="Thumb">
+                                                    <Border CornerRadius="5" Margin="2"
+                                                            Background="#5A6A86CF"/>
+                                                </ControlTemplate>
+                                            </Thumb.Template>
+                                        </Thumb>
+                                    </Track.Thumb>
+                                    <Track.IncreaseRepeatButton>
+                                        <RepeatButton Command="ScrollBar.PageDownCommand" Opacity="0" Focusable="False"/>
+                                    </Track.IncreaseRepeatButton>
+                                    <Track.DecreaseRepeatButton>
+                                        <RepeatButton Command="ScrollBar.PageUpCommand" Opacity="0" Focusable="False"/>
+                                    </Track.DecreaseRepeatButton>
+                                </Track>
+                            </Grid>
                             <ControlTemplate.Triggers>
-                                <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#2A2A3E"/>
-                                </Trigger>
-                                <Trigger Property="IsPressed" Value="True">
-                                    <Setter Property="Background" Value="#313244"/>
-                                </Trigger>
-                                <Trigger Property="IsEnabled" Value="False">
-                                    <Setter Property="Opacity" Value="0.35"/>
+                                <Trigger Property="Orientation" Value="Horizontal">
+                                    <Setter Property="Height" Value="10"/>
+                                    <Setter Property="Width"  Value="Auto"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -213,15 +368,6 @@
                 </Setter>
             </Style>
 
-            <Style TargetType="Label">
-                <Setter Property="Foreground" Value="#A6ADC8"/>
-                <Setter Property="FontSize"   Value="12"/>
-            </Style>
-
-            <Style TargetType="ScrollBar">
-                <Setter Property="Background" Value="#181825"/>
-                <Setter Property="Width"      Value="8"/>
-            </Style>
         </ResourceDictionary>
     </Application.Resources>
 </Application>
