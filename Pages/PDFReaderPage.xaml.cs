@@ -77,15 +77,22 @@ public partial class PDFReaderPage : Page
         return new Point(u, v);
     }
 
-    private Point ToCanvas(double u, double v, double canvasW, double canvasH)
+    private Point ToCanvas(double u, double v, double canvasW, double canvasH) =>
+        ToCanvas(_currentPageGeometry, u, v, canvasW, canvasH);
+
+    private static Point ToCanvas(PageGeometry g, double u, double v, double canvasW, double canvasH)
     {
-        var (x, y) = SearchablePdfService.UserToImage(u, v, canvasW, canvasH, _currentPageGeometry);
+        var (x, y) = SearchablePdfService.UserToImage(u, v, canvasW, canvasH, g);
         return new Point(x, y);
     }
 
     // A rectangle in PDF user space → canvas (axis-aligned for any /Rotate).
     private Rect ToCanvasRect(double left, double bottom, double right, double top, double canvasW, double canvasH) =>
-        new(ToCanvas(left, bottom, canvasW, canvasH), ToCanvas(right, top, canvasW, canvasH));
+        ToCanvasRect(_currentPageGeometry, left, bottom, right, top, canvasW, canvasH);
+
+    private static Rect ToCanvasRect(PageGeometry g, double left, double bottom, double right, double top,
+                                     double canvasW, double canvasH) =>
+        new(ToCanvas(g, left, bottom, canvasW, canvasH), ToCanvas(g, right, top, canvasW, canvasH));
 
     // ─── Adjust panel state ───────────────────────────────────────────────────
     private bool _suppressAdjSlider;
@@ -228,7 +235,6 @@ public partial class PDFReaderPage : Page
         foreach (var panel in new[] { PrevPagesPanel, NextPagesPanel })
         {
             panel.MouseMove                  += SidePages_MouseMove;
-            panel.MouseLeave                 += (_, _) => _sidePageHoverTimer?.Stop();
             panel.PreviewMouseLeftButtonDown += SidePages_PreviewMouseLeftButtonDown;
         }
         PdfPageBorder.Effect = new System.Windows.Media.Effects.DropShadowEffect
@@ -1982,13 +1988,48 @@ public partial class PDFReaderPage : Page
 
         UpdateGlobalScrollBar();
 
-        // The page under the middle of the view is the current page (the one with the text
-        // layer, annotations and drawings). It used to change only once the current page
-        // had scrolled out of view completely, so the next page could not be selected
-        // until it filled most of the view.
-        double centre = PdfScrollViewer.VerticalOffset + PdfScrollViewer.ViewportHeight / 2;
-        if (PageAtContentY(centre) is int page && page != (int)_currentPage)
-            await ActivatePageAsync(page);
+        // The current page (the one with the text layer, annotations and drawings) is the
+        // page under the pointer; without a pointer over the view, the page in its middle.
+        // Using only the middle made a page the pointer had just activated switch back.
+        if (Mouse.LeftButton == MouseButtonState.Pressed) return;   // selecting / drawing
+        double y = PointerOverView(out double py)
+            ? py
+            : PdfScrollViewer.VerticalOffset + PdfScrollViewer.ViewportHeight / 2;
+        if (PageAtContentY(y) is int page && page != (int)_currentPage)
+            await RequestActivationAsync(page);
+    }
+
+    // Where the pointer is relative to an element. One place, so tests can supply it.
+    private Func<IInputElement, Point> _pointerPosition = el => Mouse.GetPosition(el);
+
+    private bool PointerOver(FrameworkElement el)
+    {
+        var pt = _pointerPosition(el);
+        return pt.X >= 0 && pt.Y >= 0 && pt.X <= el.ActualWidth && pt.Y <= el.ActualHeight;
+    }
+
+    // Pointer position in content coordinates, if it is over the view.
+    private bool PointerOverView(out double contentY)
+    {
+        contentY = 0;
+        if (!PointerOver(PdfScrollViewer)) return false;
+        contentY = _pointerPosition((UIElement)PdfScrollViewer.Content).Y;
+        return true;
+    }
+
+    // One switch at a time; the latest request wins.
+    private int _pendingActivation = -1;
+
+    private async Task RequestActivationAsync(int page)
+    {
+        _pendingActivation = page;
+        if (_pageTransitioning) return;   // taken up when the running switch ends
+        while (_pendingActivation >= 0)
+        {
+            int next = _pendingActivation;
+            _pendingActivation = -1;
+            if (next != (int)_currentPage) await ActivatePageAsync(next);
+        }
     }
 
     // ── Neighbouring pages ───────────────────────────────────────────────────
@@ -2032,7 +2073,6 @@ public partial class PDFReaderPage : Page
         if (target == null) return;
         double screenY = ContentY(target) - PdfScrollViewer.VerticalOffset;
 
-        _sidePageHoverTimer?.Stop();
         _pageTransitioning = true;
         try
         {
@@ -2051,53 +2091,32 @@ public partial class PDFReaderPage : Page
         finally { _pageTransitioning = false; }
     }
 
-    private System.Windows.Threading.DispatcherTimer? _sidePageHoverTimer;
-    private int _sidePageHovered = -1;
-
     // By position, not IsMouseOver: that is only updated once a mouse move was processed,
     // so a press right after the pointer arrived would be missed.
     private int? SidePageUnderMouse() =>
-        SidePages().Where(sp =>
-        {
-            var pt = Mouse.GetPosition(sp.Element);
-            return pt.X >= 0 && pt.Y >= 0 && pt.X <= sp.Element.ActualWidth && pt.Y <= sp.Element.ActualHeight;
-        }).Select(sp => (int?)sp.Page).FirstOrDefault();
+        SidePages().Where(sp => PointerOver(sp.Element)).Select(sp => (int?)sp.Page).FirstOrDefault();
 
-    // Resting on a preview for a moment activates it, so it is ready before the click.
-    private void SidePages_MouseMove(object sender, MouseEventArgs e)
+    // Moving onto another page makes it the current page, so everything works there.
+    private async void SidePages_MouseMove(object sender, MouseEventArgs e)
     {
-        if (e.LeftButton == MouseButtonState.Pressed || _pageTransitioning) return;
-        if (SidePageUnderMouse() is not int page) return;
-        _sidePageHovered = page;
-        _sidePageHoverTimer ??= new System.Windows.Threading.DispatcherTimer(
-            TimeSpan.FromMilliseconds(120), System.Windows.Threading.DispatcherPriority.Input,
-            async (_, _) =>
-            {
-                _sidePageHoverTimer!.Stop();
-                if (SidePageUnderMouse() == _sidePageHovered && Mouse.LeftButton != MouseButtonState.Pressed)
-                    await ActivatePageAsync(_sidePageHovered);
-            }, Dispatcher);
-        _sidePageHoverTimer.Stop();
-        _sidePageHoverTimer.Start();
+        if (e.LeftButton == MouseButtonState.Pressed) return;
+        if (SidePageUnderMouse() is int page) await RequestActivationAsync(page);
     }
 
-    // Pressing on a preview activates it at once and starts the selection (or drawing) there.
+    // A press that arrives before the switch: switch now, then start the selection (or
+    // drawing) where it was pressed.
     private async void SidePages_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         if (SidePageUnderMouse() is not int page) return;
         e.Handled = true;
+        for (int i = 0; i < 50 && _pageTransitioning; i++) await Task.Delay(10);
         await ActivatePageAsync(page);
         if (page != (int)_currentPage || Mouse.LeftButton != MouseButtonState.Pressed) return;
-        bool Over(FrameworkElement el)
-        {
-            var pt = Mouse.GetPosition(el);
-            return pt.X >= 0 && pt.Y >= 0 && pt.X <= el.ActualWidth && pt.Y <= el.ActualHeight;
-        }
         if (_drawMode != DrawMode.None)
         {
-            if (Over(DrawingCanvas)) DrawingCanvas_MouseDown(DrawingCanvas, e);
+            if (PointerOver(DrawingCanvas)) DrawingCanvas_MouseDown(DrawingCanvas, e);
         }
-        else if (Over(TextOverlayCanvas))
+        else if (PointerOver(TextOverlayCanvas))
         {
             TextOverlayCanvas_MouseDown(TextOverlayCanvas, e);
         }
@@ -2200,20 +2219,31 @@ public partial class PDFReaderPage : Page
         return Math.Max(1, (int)Math.Ceiling(viewH / pageH));
     }
 
-    // Render a single page from the document into an Image element.
-    private async Task<System.Windows.Controls.Image> RenderPageImageAsync(uint pageIndex)
+    // A neighbouring page: its image with its annotations, memos and drawings on top
+    // (display only; pointing at the page makes it the current page for editing).
+    private async Task<FrameworkElement> RenderPageImageAsync(uint pageIndex)
     {
-        var finalSrc2 = await _images.GetAsync((int)pageIndex, (int)(RenderBaseWidth * _zoomLevel));
-
+        var src = await _images.GetAsync((int)pageIndex, (int)(RenderBaseWidth * _zoomLevel));
+        double w = RenderBaseWidth * _zoomLevel;
         var img = new System.Windows.Controls.Image
         {
-            Source  = finalSrc2,
-            Width   = RenderBaseWidth * _zoomLevel,
+            Source  = src,
+            Width   = w,
             Height  = double.NaN,
             Stretch = System.Windows.Media.Stretch.Uniform
         };
         RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
-        return img;
+        if (src == null || _editDocument == null || pageIndex >= _editDocument.Pages.Count) return img;
+
+        double h    = w * src.PixelHeight / src.PixelWidth;
+        var    geom = SearchablePdfService.GeometryOf(_editDocument.Pages[(int)pageIndex]);
+        var    grid = new Grid { Width = w, Height = h };
+        grid.Children.Add(img);
+        Canvas Layer() { var c = new Canvas { Width = w, Height = h, IsHitTestVisible = false }; grid.Children.Add(c); return c; }
+        DrawAnnotationsInto(Layer(), pageIndex, geom, null);
+        DrawShapesInto(Layer(), pageIndex, geom, null);
+        DrawMemosInto(Layer(), pageIndex, geom);
+        return grid;
     }
 
     // Render N prev pages into PrevPagesPanel (oldest page first at top).
@@ -3147,14 +3177,22 @@ public partial class PDFReaderPage : Page
     {
         AnnotationCanvas.Children.Clear();
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
+        DrawAnnotationsInto(AnnotationCanvas, _currentPage, _currentPageGeometry, _selectedAnnotation?.Id);
+    }
 
-        foreach (var ann in AnnotationService.Instance.ForPage(_currentFilePath, _currentPage))
+    // Draws the page's highlights/underlines/strike-outs on a canvas of the page's size.
+    private void DrawAnnotationsInto(Canvas canvas, uint page, PageGeometry geom, int? selectedId)
+    {
+        if (_currentFilePath is null) return;
+        var AnnotationCanvas = canvas;   // the drawing code below targets this canvas
+
+        foreach (var ann in AnnotationService.Instance.ForPage(_currentFilePath, page))
         {
-            bool sel = _selectedAnnotation?.Id == ann.Id;
+            bool sel = selectedId == ann.Id;
 
             foreach (var span in ann.Spans)
             {
-                var    rc  = ToCanvasRect(span.Left, span.Bottom, span.Right, span.Top,
+                var    rc  = ToCanvasRect(geom, span.Left, span.Bottom, span.Right, span.Top,
                                           AnnotationCanvas.Width, AnnotationCanvas.Height);
                 double cl  = rc.Left, cr = rc.Right, ct = rc.Top, cb = rc.Bottom;
                 double mid = (ct + cb) / 2;
@@ -4029,10 +4067,17 @@ public partial class PDFReaderPage : Page
     {
         MemoCanvas.Children.Clear();
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
+        DrawMemosInto(MemoCanvas, _currentPage, _currentPageGeometry);
+    }
 
-        foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, _currentPage))
+    private void DrawMemosInto(Canvas canvas, uint page, PageGeometry geom)
+    {
+        if (_currentFilePath is null) return;
+        var MemoCanvas = canvas;
+
+        foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, page))
         {
-            var    at = ToCanvas(memo.X, memo.Y, MemoCanvas.Width, MemoCanvas.Height);
+            var    at = ToCanvas(geom, memo.X, memo.Y, MemoCanvas.Width, MemoCanvas.Height);
             double cx = at.X, cy = at.Y;
 
             var icon = new Border
@@ -4508,13 +4553,20 @@ public partial class PDFReaderPage : Page
     {
         DrawingCanvas.Children.Clear();
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
+        DrawShapesInto(DrawingCanvas, _currentPage, _currentPageGeometry, _selectedShape?.Id);
+    }
 
-        foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, _currentPage))
+    private void DrawShapesInto(Canvas canvas, uint page, PageGeometry geom, int? selectedId)
+    {
+        if (_currentFilePath is null) return;
+        var DrawingCanvas = canvas;
+
+        foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, page))
         {
-            bool sel = _selectedShape?.Id == shape.Id;
+            bool sel = selectedId == shape.Id;
 
-            var    c1  = ToCanvas(shape.X1, shape.Y1, DrawingCanvas.Width, DrawingCanvas.Height);
-            var    c2  = ToCanvas(shape.X2, shape.Y2, DrawingCanvas.Width, DrawingCanvas.Height);
+            var    c1  = ToCanvas(geom, shape.X1, shape.Y1, DrawingCanvas.Width, DrawingCanvas.Height);
+            var    c2  = ToCanvas(geom, shape.X2, shape.Y2, DrawingCanvas.Width, DrawingCanvas.Height);
             double cx1 = c1.X, cy1 = c1.Y, cx2 = c2.X, cy2 = c2.Y;
 
             var mode = shape.ShapeType switch
