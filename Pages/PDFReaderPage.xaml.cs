@@ -222,6 +222,15 @@ public partial class PDFReaderPage : Page
         SubscribeSession(_session);
         InitializeComponent();
         _adjPanelReady = true;
+
+        // Pages above/below the current one are plain images; pointing at one makes it
+        // the current page so its text layer, annotations and drawings work there too.
+        foreach (var panel in new[] { PrevPagesPanel, NextPagesPanel })
+        {
+            panel.MouseMove                  += SidePages_MouseMove;
+            panel.MouseLeave                 += (_, _) => _sidePageHoverTimer?.Stop();
+            panel.PreviewMouseLeftButtonDown += SidePages_PreviewMouseLeftButtonDown;
+        }
         PdfPageBorder.Effect = new System.Windows.Media.Effects.DropShadowEffect
         {
             Color       = System.Windows.Media.Colors.Black,
@@ -1973,49 +1982,129 @@ public partial class PDFReaderPage : Page
 
         UpdateGlobalScrollBar();
 
-        double prevH = PrevPagesPanel.ActualHeight;
+        // The page under the middle of the view is the current page (the one with the text
+        // layer, annotations and drawings). It used to change only once the current page
+        // had scrolled out of view completely, so the next page could not be selected
+        // until it filled most of the view.
+        double centre = PdfScrollViewer.VerticalOffset + PdfScrollViewer.ViewportHeight / 2;
+        if (PageAtContentY(centre) is int page && page != (int)_currentPage)
+            await ActivatePageAsync(page);
+    }
 
-        // Forward page transition: user scrolled completely past current page into the next.
-        if (e.VerticalChange > 0 &&
-            _currentPage < _totalPages - 1 &&
-            NextPagesPanel.Children.Count > 0)
+    // ── Neighbouring pages ───────────────────────────────────────────────────
+
+    // Rendered previews above/below the current page: (page index, element).
+    private IEnumerable<(int Page, FrameworkElement Element)> SidePages()
+    {
+        int n = PrevPagesPanel.Children.Count;
+        for (int k = 0; k < n; k++)
+            if (PrevPagesPanel.Children[k] is FrameworkElement fe)
+                yield return ((int)_currentPage - (n - k), fe);
+        for (int k = 0; k < NextPagesPanel.Children.Count; k++)
+            if (NextPagesPanel.Children[k] is FrameworkElement fe)
+                yield return ((int)_currentPage + 1 + k, fe);
+    }
+
+    private double ContentY(FrameworkElement element) =>
+        element.TranslatePoint(new Point(0, 0), (UIElement)PdfScrollViewer.Content).Y;
+
+    // The page whose area (gap above it included) holds content position y.
+    private int? PageAtContentY(double y)
+    {
+        if (PdfPageBorder.Visibility != Visibility.Visible) return null;
+        double top = ContentY(PdfPageBorder);
+        if (y >= top - PageGap && y <= top + PdfPageBorder.ActualHeight) return (int)_currentPage;
+        foreach (var (page, el) in SidePages())
         {
-            double boundary = prevH + PdfPageBorder.ActualHeight + PageGap;
-            if (PdfScrollViewer.VerticalOffset >= boundary)
-            {
-                double newOffset = PdfScrollViewer.VerticalOffset - boundary;
-                _pageTransitioning = true;
-                _currentPage++;
-                UpdateNavButtons();
-                await RenderCurrentPageAsync();
-                await Dispatcher.InvokeAsync(() => { },
-                    System.Windows.Threading.DispatcherPriority.Render);
-                double prevHNew = PrevPagesPanel.ActualHeight;
-                PdfScrollViewer.ScrollToVerticalOffset(prevHNew + Math.Max(0, newOffset));
-                _pageTransitioning = false;
-            }
+            double t = ContentY(el);
+            if (y >= t - PageGap && y <= t + el.ActualHeight) return page;
         }
+        return null;
+    }
 
-        // Backward page transition: user scrolled past the top of the prev-page previews.
-        if (e.VerticalChange < 0 &&
-            _currentPage > 0 &&
-            PrevPagesPanel.Children.Count > 0 &&
-            PdfScrollViewer.VerticalOffset <= 0)
+    /// <summary>
+    /// Makes a neighbouring page the current page, keeping it where it is on screen.
+    /// </summary>
+    private async Task ActivatePageAsync(int page)
+    {
+        if (_pageTransitioning || page == (int)_currentPage || page < 0 || page >= (int)_totalPages) return;
+        var target = SidePages().FirstOrDefault(sp => sp.Page == page).Element;
+        if (target == null) return;
+        double screenY = ContentY(target) - PdfScrollViewer.VerticalOffset;
+
+        _sidePageHoverTimer?.Stop();
+        _pageTransitioning = true;
+        try
         {
-            _pageTransitioning = true;
-            _currentPage--;
+            _currentPage = (uint)page;
             UpdateNavButtons();
-            await RenderCurrentPageAsync();
-            await Dispatcher.InvokeAsync(() => { },
-                System.Windows.Threading.DispatcherPriority.Render);
-            double prevHNew = PrevPagesPanel.ActualHeight;
-            double bottomTarget = prevHNew + PdfPageBorder.ActualHeight - PdfScrollViewer.ViewportHeight;
-            PdfScrollViewer.ScrollToVerticalOffset(Math.Max(prevHNew, bottomTarget));
-            _pageTransitioning = false;
+            await RenderCurrentPageAsync();   // rebuilds the previews around the new page
+            // The pages below are added a moment later; without them the content may be too
+            // short for the offset we need and the view would jump.
+            for (int i = 0; i < 20 && _currentPage + 1 < _totalPages && NextPagesPanel.Children.Count == 0; i++)
+                await Task.Delay(15);
+            await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Render);
+            PdfScrollViewer.ScrollToVerticalOffset(Math.Max(0, ContentY(PdfPageBorder) - screenY));
+            await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Render);
+            UpdateGlobalScrollBar();
+        }
+        finally { _pageTransitioning = false; }
+    }
+
+    private System.Windows.Threading.DispatcherTimer? _sidePageHoverTimer;
+    private int _sidePageHovered = -1;
+
+    // By position, not IsMouseOver: that is only updated once a mouse move was processed,
+    // so a press right after the pointer arrived would be missed.
+    private int? SidePageUnderMouse() =>
+        SidePages().Where(sp =>
+        {
+            var pt = Mouse.GetPosition(sp.Element);
+            return pt.X >= 0 && pt.Y >= 0 && pt.X <= sp.Element.ActualWidth && pt.Y <= sp.Element.ActualHeight;
+        }).Select(sp => (int?)sp.Page).FirstOrDefault();
+
+    // Resting on a preview for a moment activates it, so it is ready before the click.
+    private void SidePages_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (e.LeftButton == MouseButtonState.Pressed || _pageTransitioning) return;
+        if (SidePageUnderMouse() is not int page) return;
+        _sidePageHovered = page;
+        _sidePageHoverTimer ??= new System.Windows.Threading.DispatcherTimer(
+            TimeSpan.FromMilliseconds(120), System.Windows.Threading.DispatcherPriority.Input,
+            async (_, _) =>
+            {
+                _sidePageHoverTimer!.Stop();
+                if (SidePageUnderMouse() == _sidePageHovered && Mouse.LeftButton != MouseButtonState.Pressed)
+                    await ActivatePageAsync(_sidePageHovered);
+            }, Dispatcher);
+        _sidePageHoverTimer.Stop();
+        _sidePageHoverTimer.Start();
+    }
+
+    // Pressing on a preview activates it at once and starts the selection (or drawing) there.
+    private async void SidePages_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (SidePageUnderMouse() is not int page) return;
+        e.Handled = true;
+        await ActivatePageAsync(page);
+        if (page != (int)_currentPage || Mouse.LeftButton != MouseButtonState.Pressed) return;
+        bool Over(FrameworkElement el)
+        {
+            var pt = Mouse.GetPosition(el);
+            return pt.X >= 0 && pt.Y >= 0 && pt.X <= el.ActualWidth && pt.Y <= el.ActualHeight;
+        }
+        if (_drawMode != DrawMode.None)
+        {
+            if (Over(DrawingCanvas)) DrawingCanvas_MouseDown(DrawingCanvas, e);
+        }
+        else if (Over(TextOverlayCanvas))
+        {
+            TextOverlayCanvas_MouseDown(TextOverlayCanvas, e);
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  Rendering + Text Overlay    // ═══════════════════════════════════════════════════════════════════════════
     //  Rendering + Text Overlay
     // ═══════════════════════════════════════════════════════════════════════════
 
