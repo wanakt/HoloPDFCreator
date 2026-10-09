@@ -19,7 +19,7 @@ using WinPdf = Windows.Data.Pdf;
 
 namespace HoloPDFCreator.Pages;
 
-public partial class OcrPage : Page
+public partial class OcrPage : Page, IPageOcrStore
 {
     // ─── Data model ───────────────────────────────────────────────────────────
 
@@ -85,6 +85,13 @@ public partial class OcrPage : Page
     private readonly OcrService _ocrService = new();
     private readonly Dictionary<int, List<OcrRegion>> _pageRegions  = new();
     private readonly Dictionary<int, (int w, int h)>  _regionDims   = new();
+    // Page rotation / visible box when each page was OCR'd (PDF sources only).
+    private readonly Dictionary<int, PageGeometry>    _regionGeom   = new();
+    // Current rotation / visible box of every page of _sourcePdfPath.
+    private PageGeometry[]? _pageGeom;
+    // The document the results belong to: the reader's own file path, which stays
+    // the same while _sourcePdfPath (the temp file it renders from) changes per edit.
+    private string? _docKey;
     private List<OcrRegion>    _currentRegions = new();
 
     private CancellationTokenSource? _batchCts;
@@ -116,9 +123,9 @@ public partial class OcrPage : Page
     /// (e.g. results loaded from an existing text layer rather than freshly run).
     /// </summary>
 
-    public IReadOnlyDictionary<int, OcrPageData>? GetOcrData(string forFilePath)
+    public IReadOnlyDictionary<int, OcrPageData>? GetOcrData(string docKey)
     {
-        if (_sourcePdfPath != forFilePath) return null;
+        if (_docKey == null || !string.Equals(_docKey, docKey, StringComparison.OrdinalIgnoreCase)) return null;
         var result = new Dictionary<int, OcrPageData>();
         lock (_pageRegions)
         {
@@ -126,10 +133,75 @@ public partial class OcrPage : Page
             {
                 if (regions.Count == 0) continue;
                 if (!_regionDims.TryGetValue(idx, out var d) || d.w <= 0 || d.h <= 0) continue;
-                result[idx] = new OcrPageData(regions, d.w, d.h);
+                result[idx] = new OcrPageData(regions, d.w, d.h,
+                    _regionGeom.TryGetValue(idx, out var g) ? g : null);
             }
         }
         return result.Count > 0 ? result : null;
+    }
+
+    public void SetOcrData(string docKey, IReadOnlyDictionary<int, OcrPageData>? data)
+    {
+        if (_docKey == null || !string.Equals(_docKey, docKey, StringComparison.OrdinalIgnoreCase)) return;
+        lock (_pageRegions)
+        {
+            // Regions without image size come from the PDF's own text layer; they are
+            // read again from the edited file the next time the pages are loaded.
+            _pageRegions.Clear();
+            _regionDims.Clear();
+            _regionGeom.Clear();
+            if (data != null)
+            {
+                foreach (var (idx, d) in data)
+                {
+                    _pageRegions[idx] = d.Regions;
+                    _regionDims[idx]  = (d.ImgWidth, d.ImgHeight);
+                    if (d.Geometry is { } g) _regionGeom[idx] = g;
+                }
+            }
+        }
+        if (_selectedIndex >= 0)
+        {
+            _currentRegions = _pageRegions.TryGetValue(_selectedIndex, out var cur) ? cur : new();
+            DrawOverlays();
+            ShowResults();
+        }
+    }
+
+    /// <summary>
+    /// The regions of page <paramref name="idx"/> in pixels of a <paramref name="w"/> × <paramref name="h"/>
+    /// image of the page as it is now. Pages rotated or cropped in the reader after OCR are
+    /// mapped through PDF user space; otherwise the regions are only scaled.
+    /// </summary>
+    private List<OcrRegion> RegionsInImage(int idx, int w, int h)
+    {
+        if (!_pageRegions.TryGetValue(idx, out var regions)) return new();
+        // Text-layer regions (no recorded size) are already in display coordinates.
+        if (!_regionDims.TryGetValue(idx, out var d) || d.w <= 0 || d.h <= 0) return regions;
+
+        PageGeometry? from = _regionGeom.TryGetValue(idx, out var g0) ? g0 : null;
+        PageGeometry? to   = _pageGeom != null && idx < _pageGeom.Length ? _pageGeom[idx] : null;
+        if (d.w == w && d.h == h && (from == null || to == null || from == to)) return regions;
+
+        Func<double, double, (double X, double Y)> map = from is { } a && to is { } b && a != b
+            ? (x, y) =>
+              {
+                  var (u, v) = SearchablePdfService.ImageToUser(x, y, d.w, d.h, a);
+                  return SearchablePdfService.UserToImage(u, v, w, h, b);
+              }
+            : (x, y) => (x * w / d.w, y * h / d.h);
+
+        return regions.Select(r => new OcrRegion
+        {
+            Text   = r.Text,
+            Score  = r.Score,
+            Points = r.Points.Select(pt =>
+            {
+                var (x, y) = map(pt.X, pt.Y);
+                return new OcrPoint((int)Math.Round(x), (int)Math.Round(y));
+            }).ToArray(),
+            Words  = r.Words,
+        }).ToList();
     }
 
     public void ApplyAdjustedImages(AdjustedImageStore store)
@@ -156,6 +228,9 @@ public partial class OcrPage : Page
     {
         _pageRegions.Clear();
         _regionDims.Clear();
+        _regionGeom.Clear();
+        _docKey   = null;
+        _pageGeom = null;
         _previewCts.Cancel();
         _pdfThumbCts.Cancel();
         _pdfThumbCts = new CancellationTokenSource();
@@ -229,6 +304,9 @@ public partial class OcrPage : Page
         _lastImageSource = paths;
         _lastPdfPath     = null;
         ClearItems();
+        lock (_pageRegions) { _pageRegions.Clear(); _regionDims.Clear(); _regionGeom.Clear(); }
+        _docKey        = null;
+        _pageGeom      = null;
         _sourcePdfPath = null;
         _pdfPageCount  = 0;
         LoadImageFiles(paths);
@@ -249,15 +327,37 @@ public partial class OcrPage : Page
         SetStatus($"{_items.Count} image{(_items.Count == 1 ? "" : "s")} loaded.");
     }
 
-    public async Task LoadFromPdfAsync(string filePath, uint initialPage = 0)
+    /// <summary>
+    /// Loads the pages of <paramref name="filePath"/>. <paramref name="docKey"/> names the
+    /// document (the reader passes its own file path while <paramref name="filePath"/> is the
+    /// temp file it renders from); OCR results are kept when it is the same document.
+    /// </summary>
+    public async Task LoadFromPdfAsync(string filePath, uint initialPage = 0, string? docKey = null)
     {
         if (filePath == _lastPdfPath && _items.Count > 0) return;
         _lastPdfPath = filePath;
+        docKey ??= filePath;
 
         _pdfThumbCts.Cancel();
         _pdfThumbCts = new CancellationTokenSource();
-        _pageRegions.Clear();
-        _regionDims.Clear();
+        lock (_pageRegions)
+        {
+            if (string.Equals(docKey, _docKey, StringComparison.OrdinalIgnoreCase))
+            {
+                // Same document, new rendering: keep OCR results (the reader moved them
+                // along with its page edits), drop text-layer regions (re-read below).
+                foreach (int idx in _pageRegions.Keys.Where(k => !_regionDims.ContainsKey(k)).ToList())
+                    _pageRegions.Remove(idx);
+            }
+            else
+            {
+                _pageRegions.Clear();
+                _regionDims.Clear();
+                _regionGeom.Clear();
+            }
+        }
+        _docKey   = docKey;
+        _pageGeom = null;
         ClearItems();
         _sourcePdfPath  = null;
         _pdfPageCount   = 0;
@@ -293,6 +393,8 @@ public partial class OcrPage : Page
             _sourcePdfPath  = filePath;
             _pdfPageCount   = (int)count;
             _pdfInitialPage = initialPage;
+            try { _pageGeom = await Task.Run(() => SearchablePdfService.ReadPageGeometry(filePath)); }
+            catch { _pageGeom = null; }
 
             RefreshImageList();
             SelectItem((int)initialPage);
@@ -308,6 +410,7 @@ public partial class OcrPage : Page
         catch (Exception ex)
         {
             _lastPdfPath = null;
+            _docKey      = null;
             SetStatus($"PDF load failed: {ex.Message}");
             MessageBox.Show($"Could not load PDF:\n{ex.Message}", "Error",
                             MessageBoxButton.OK, MessageBoxImage.Error);
@@ -850,9 +953,12 @@ public partial class OcrPage : Page
         _previewCts.Cancel();
         _pageRegions.Clear();
         _regionDims.Clear();
+        _regionGeom.Clear();
         ClearItems();
         _lastPdfPath   = null;
         _sourcePdfPath = null;
+        _docKey        = null;
+        _pageGeom      = null;
         _pdfPageCount  = 0;
         _pdfInitialPage = 0;
 
@@ -1055,9 +1161,13 @@ public partial class OcrPage : Page
                         skBmp = await Task.Run(() => OcrService.ConvertToSKBitmap(bmp), localCt).ConfigureAwait(false);
                     else return;
 
+                    // Size of the page image itself: deskewing rotates onto a larger canvas,
+                    // and the regions are mapped back to this image below.
+                    int origW = skBmp.Width, origH = skBmp.Height;
+                    var rotSteps = new List<DeskewService.RotationStep>();
                     if (deskew)
                     {
-                        var corrected = await Task.Run(() => DeskewService.Deskew(skBmp), localCt).ConfigureAwait(false);
+                        var corrected = await Task.Run(() => DeskewService.Deskew(skBmp, rotSteps), localCt).ConfigureAwait(false);
                         if (!ReferenceEquals(corrected, skBmp)) skBmp.Dispose();
                         skBmp = corrected;
                     }
@@ -1072,7 +1182,7 @@ public partial class OcrPage : Page
                             double residual = DeskewService.ComputeAngleFromRegions(regions, w);
                             if (Math.Abs(residual) >= 0.2)
                             {
-                                var fine = await Task.Run(() => DeskewService.RotateByAngle(skBmp, -residual), localCt).ConfigureAwait(false);
+                                var fine = await Task.Run(() => DeskewService.RotateByAngle(skBmp, -residual, rotSteps), localCt).ConfigureAwait(false);
                                 if (!ReferenceEquals(fine, skBmp)) skBmp.Dispose();
                                 skBmp = fine;
                                 w = skBmp.Width; h = skBmp.Height;
@@ -1082,10 +1192,17 @@ public partial class OcrPage : Page
                     }
                     finally { skBmp.Dispose(); }
 
+                    // The page itself is not deskewed: put the regions back on its image.
+                    if (rotSteps.Count > 0)
+                        regions = regions.Select(r => DeskewService.MapBack(r, rotSteps)).ToList();
+
+                    var geom = _pageGeom;
                     lock (_pageRegions)
                     {
                         _pageRegions[idx] = regions;
-                        _regionDims[idx]  = (w, h);
+                        _regionDims[idx]  = (origW, origH);
+                        if (geom != null && idx < geom.Length) _regionGeom[idx] = geom[idx];
+                        else _regionGeom.Remove(idx);
                     }
                     int current = System.Threading.Interlocked.Increment(ref done);
                     await Dispatcher.InvokeAsync(() =>
@@ -1248,8 +1365,9 @@ public partial class OcrPage : Page
             {
                 for (int i = 0; i < total; i++)
                 {
-                    if (_pageRegions.TryGetValue(i, out var regions) && regions.Count > 0)
-                        ocrData[i] = new OcrPageData(regions, ocrDims[i].w, ocrDims[i].h);
+                    if (_pageRegions.TryGetValue(i, out var regions) && regions.Count > 0 && ocrDims[i].w > 0)
+                        ocrData[i] = new OcrPageData(RegionsInImage(i, ocrDims[i].w, ocrDims[i].h),
+                                                     ocrDims[i].w, ocrDims[i].h);
                 }
             }
 
@@ -1617,9 +1735,15 @@ public partial class OcrPage : Page
     private void DrawOverlays()
     {
         OverlayCanvas.Children.Clear();
-        for (int i = 0; i < _currentRegions.Count; i++)
+        // Same regions (and order) as _currentRegions, mapped onto the displayed image.
+        var shown = _currentRegions;
+        if (_selectedIndex >= 0 && _selectedIndex < _items.Count &&
+            ReferenceEquals(_pageRegions.GetValueOrDefault(_selectedIndex), _currentRegions) &&
+            ImgMain.Source is BitmapSource disp)
+            shown = RegionsInImage(_selectedIndex, disp.PixelWidth, disp.PixelHeight);
+        for (int i = 0; i < shown.Count; i++)
         {
-            var r         = _currentRegions[i];
+            var r         = shown[i];
             var color     = Palette[i % Palette.Length];
             int capturedI = i;
             if (r.Points.Length < 2) continue;

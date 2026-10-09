@@ -5,8 +5,21 @@ using PdfSharp.Pdf.IO;
 
 namespace HoloPDFCreator.Services;
 
-/// <summary>Per-page OCR data needed to build the invisible text layer.</summary>
-public record OcrPageData(List<OcrRegion> Regions, int ImgWidth, int ImgHeight);
+/// <summary>
+/// Per-page OCR data needed to build the invisible text layer. Regions are in pixels of
+/// an ImgWidth × ImgHeight image of the page. <paramref name="Geometry"/> is the page's
+/// rotation and visible box when that image was rendered; when set, the text layer is
+/// placed by it, so rotating or cropping the page afterwards keeps the text in place.
+/// Null means "the page as it is now" (e.g. a page built from the image itself).
+/// </summary>
+public record OcrPageData(List<OcrRegion> Regions, int ImgWidth, int ImgHeight,
+                          PageGeometry? Geometry = null);
+
+/// <summary>Visible page area in unrotated user space (points).</summary>
+public readonly record struct PdfPageBox(double X, double Y, double Width, double Height);
+
+/// <summary>How a page is displayed: its /Rotate and its visible box.</summary>
+public readonly record struct PageGeometry(int Rotation, PdfPageBox Box);
 
 public static class SearchablePdfService
 {
@@ -60,29 +73,40 @@ public static class SearchablePdfService
     private static bool StreamContainsBT(byte[] data) =>
         Encoding.Latin1.GetString(data).Contains("BT");
 
+    // Text objects: BT … ET as whole tokens.
+    private static readonly System.Text.RegularExpressions.Regex TextObject = new(
+        @"(?<![^\s\[\]()<>/{}])BT(?![^\s\[\]()<>/{}]).*?(?<![^\s\[\]()<>/{}])ET(?![^\s\[\]()<>/{}])",
+        System.Text.RegularExpressions.RegexOptions.Singleline);
+
+    // What may stand outside the text objects of an invisible text layer.
+    private static readonly System.Text.RegularExpressions.Regex LayerFiller = new(
+        @"^(?:\s|q|Q|cm|[-+]?\d*\.?\d+|%[^\n]*)*$");
+
     /// <summary>
-    /// Returns true if the stream contains text operators (BT) but no image invocation (Do).
-    /// Such streams are safe to strip when replacing the text layer.
+    /// True for a content stream that is only an invisible text layer and can be replaced
+    /// by new OCR results: ours (font /HoloPdfOcrF), or one whose every text object uses
+    /// render mode 3 (invisible) with nothing but q/Q/cm around it. Anything that draws —
+    /// visible text, paths, images — is kept; when unsure the stream is kept.
     /// </summary>
-    private static bool IsTextOnlyStream(byte[] data)
+    private static bool IsInvisibleTextLayer(byte[] data)
     {
         var s = Encoding.Latin1.GetString(data);
-        if (!s.Contains("BT")) return false;
-        for (int i = 1; i < s.Length - 1; i++)
-        {
-            if (s[i] == 'D' && s[i + 1] == 'o'
-                && char.IsWhiteSpace(s[i - 1])
-                && (i + 2 >= s.Length || char.IsWhiteSpace(s[i + 2])))
-                return false; // has Do operator → image/XObject present, not text-only
-        }
-        return true;
+        if (s.Contains(FontKey + " ")) return true;
+
+        var objects = TextObject.Matches(s);
+        if (objects.Count == 0) return false;
+        foreach (System.Text.RegularExpressions.Match m in objects)
+            if (!System.Text.RegularExpressions.Regex.IsMatch(m.Value, @"(?<![\d.])3\s+Tr\b") ||
+                System.Text.RegularExpressions.Regex.IsMatch(m.Value, @"(?<![\d.])[0-24-7]\s+Tr\b"))
+                return false;
+        return LayerFiller.IsMatch(TextObject.Replace(s, " "));
     }
 
     /// <summary>
-    /// Removes content streams that consist only of a text layer (BT…ET, no Do/image ops).
+    /// Removes the page's invisible text-layer streams (see <see cref="IsInvisibleTextLayer"/>).
     /// Called before embedding new OCR results when replacing an existing text layer.
     /// </summary>
-    private static void StripTextOnlyStreams(PdfPage page)
+    private static void StripTextLayerStreams(PdfPage page)
     {
         var contents = page.Elements["/Contents"];
         if (contents == null) return;
@@ -96,7 +120,7 @@ public static class SearchablePdfService
                 if (arr.Elements[i] is PdfReference refItem &&
                     refItem.Value is PdfDictionary d &&
                     d.Stream != null &&
-                    IsTextOnlyStream(d.Stream.UnfilteredValue))
+                    IsInvisibleTextLayer(d.Stream.UnfilteredValue))
                 {
                     arr.Elements.RemoveAt(i);
                 }
@@ -104,7 +128,7 @@ public static class SearchablePdfService
         }
         else if (resolved is PdfDictionary dict && dict.Stream != null)
         {
-            if (IsTextOnlyStream(dict.Stream.UnfilteredValue))
+            if (IsInvisibleTextLayer(dict.Stream.UnfilteredValue))
                 page.Elements.Remove("/Contents");
         }
     }
@@ -121,7 +145,8 @@ public static class SearchablePdfService
             if (pageIdx >= doc.PageCount || data.Regions.Count == 0) continue;
             var page = doc.Pages[pageIdx];
             var supp = new Dictionary<int, int>();
-            byte[] bytes = BuildContentStream(data, VisibleBox(page), page.Rotate, supp);
+            byte[] bytes = BuildContentStream(data, data.Geometry?.Box ?? VisibleBox(page),
+                                              data.Geometry?.Rotation ?? page.Rotate, supp);
             EnsureFontResource(doc, page, supp);
             AppendContentStream(doc, page, bytes);
         }
@@ -141,19 +166,16 @@ public static class SearchablePdfService
     {
         using var doc = PdfReader.Open(inputPath, PdfDocumentOpenMode.Modify);
 
-        if (replaceExistingText)
-        {
-            for (int i = 0; i < doc.PageCount; i++)
-                StripTextOnlyStreams(doc.Pages[i]);
-        }
-
         foreach (var (pageIdx, data) in pageData.OrderBy(kv => kv.Key))
         {
             if (pageIdx >= doc.PageCount || data.Regions.Count == 0) continue;
 
             var page = doc.Pages[pageIdx];
+            // Only pages that get new OCR text lose their previous invisible layer.
+            if (replaceExistingText) StripTextLayerStreams(page);
             var supp = new Dictionary<int, int>();
-            byte[] bytes = BuildContentStream(data, VisibleBox(page), page.Rotate, supp);
+            byte[] bytes = BuildContentStream(data, data.Geometry?.Box ?? VisibleBox(page),
+                                              data.Geometry?.Rotation ?? page.Rotate, supp);
             EnsureFontResource(doc, page, supp);
             AppendContentStream(doc, page, bytes);
         }
@@ -287,7 +309,7 @@ public static class SearchablePdfService
     private const double TextHeightScale = 0.43;
 
     private static byte[] BuildContentStream(
-        OcrPageData data, PageBox box, int rotation, Dictionary<int, int> supp)
+        OcrPageData data, PdfPageBox box, int rotation, Dictionary<int, int> supp)
     {
         var sb = new StringBuilder();
         sb.Append("q\nBT\n3 Tr\n");   // save state, begin text, invisible rendering mode
@@ -346,14 +368,11 @@ public static class SearchablePdfService
 
     // ── Coordinate transform ──────────────────────────────────────────────────
 
-    /// <summary>Visible page area in unrotated user space (points).</summary>
-    private readonly record struct PageBox(double X, double Y, double Width, double Height);
-
     /// <summary>
     /// The area a viewer shows (and the OCR image covers): CropBox clipped to
     /// MediaBox, or MediaBox when there is no CropBox. Never rotation-adjusted.
     /// </summary>
-    private static PageBox VisibleBox(PdfPage page)
+    public static PdfPageBox VisibleBox(PdfPage page)
     {
         var mb = page.MediaBox;
         double x1 = Math.Min(mb.X1, mb.X2), y1 = Math.Min(mb.Y1, mb.Y2);
@@ -365,8 +384,52 @@ public static class SearchablePdfService
             double cx2 = Math.Min(x2, Math.Max(cb.X1, cb.X2)), cy2 = Math.Min(y2, Math.Max(cb.Y1, cb.Y2));
             if (cx2 > cx1 && cy2 > cy1) { x1 = cx1; y1 = cy1; x2 = cx2; y2 = cy2; }
         }
-        return new PageBox(x1, y1, x2 - x1, y2 - y1);
+        return new PdfPageBox(x1, y1, x2 - x1, y2 - y1);
     }
+
+    /// <summary>Rotation and visible box of every page of <paramref name="pdfPath"/>.</summary>
+    public static PageGeometry[] ReadPageGeometry(string pdfPath)
+    {
+        using var doc = PdfReader.Open(pdfPath, PdfDocumentOpenMode.Import);
+        var result = new PageGeometry[doc.PageCount];
+        for (int i = 0; i < doc.PageCount; i++)
+            result[i] = new PageGeometry(Normalize(doc.Pages[i].Rotate), VisibleBox(doc.Pages[i]));
+        return result;
+    }
+
+    /// <summary>
+    /// Image pixel (x, y) of an imgW × imgH rendering of a page shown as <paramref name="g"/>
+    /// → unrotated user space (u, v). Same transform as <see cref="MapToPage"/>.
+    /// </summary>
+    public static (double U, double V) ImageToUser(double x, double y, int imgW, int imgH, PageGeometry g)
+    {
+        double nx = x / imgW, ny = y / imgH, W = g.Box.Width, H = g.Box.Height;
+        var (u, v) = Normalize(g.Rotation) switch
+        {
+            90  => (ny * W, nx * H),
+            180 => ((1 - nx) * W, ny * H),
+            270 => ((1 - ny) * W, (1 - nx) * H),
+            _   => (nx * W, (1 - ny) * H),
+        };
+        return (u + g.Box.X, v + g.Box.Y);
+    }
+
+    /// <summary>Inverse of <see cref="ImageToUser"/>.</summary>
+    public static (double X, double Y) UserToImage(double u, double v, int imgW, int imgH, PageGeometry g)
+    {
+        double W = g.Box.Width, H = g.Box.Height;
+        double ru = (u - g.Box.X) / W, rv = (v - g.Box.Y) / H;
+        var (nx, ny) = Normalize(g.Rotation) switch
+        {
+            90  => (rv, ru),
+            180 => (1 - ru, rv),
+            270 => (1 - rv, 1 - ru),
+            _   => (ru, 1 - rv),
+        };
+        return (nx * imgW, ny * imgH);
+    }
+
+    private static int Normalize(int rotation) => ((rotation % 360) + 360) % 360;
 
     /// <summary>
     /// Maps a region's bottom-left pixel + size (in the rendered, rotated image) to

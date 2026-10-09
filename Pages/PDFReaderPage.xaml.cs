@@ -115,7 +115,29 @@ public partial class PDFReaderPage : Page
                              Dictionary<int, uint> BmPages, Dictionary<int, string> PageImages);
     // A step holds either a full PDF snapshot (Pdf: a handle into _snapshotStore, i.e. a
     // temp file) or a small page edit that is reverted / re-applied in place (Edit).
-    private record UndoSnapshot(PdfSnapshotStore.Handle? Pdf, PageEdit? Edit, UndoState State);
+    // Map: how the step moved pages, for data that is not part of the undo state but has
+    // to follow its page (OCR results). Null when no page moved.
+    private record UndoSnapshot(PdfSnapshotStore.Handle? Pdf, PageEdit? Edit, UndoState State,
+                                PageMap? Map = null);
+
+    // NewToOld[i] = index before the step of the page now at i (-1 = page added by the step).
+    // DroppedOcr: OCR results of pages the step removed, by their old index, so undoing
+    // the step can put them back.
+    private sealed record PageMap(int[] NewToOld, int OldCount,
+                                  IReadOnlyDictionary<int, OcrPageData>? DroppedOcr = null)
+    {
+        public PageMap Inverse()
+        {
+            var inv = new int[OldCount];
+            Array.Fill(inv, -1);
+            for (int i = 0; i < NewToOld.Length; i++)
+                if (NewToOld[i] >= 0 && NewToOld[i] < OldCount) inv[NewToOld[i]] = i;
+            return new PageMap(inv, NewToOld.Length) { RestoredOcr = DroppedOcr };
+        }
+
+        // Set on an inverse map: results to add back at their (new) index.
+        public IReadOnlyDictionary<int, OcrPageData>? RestoredOcr { get; init; }
+    }
 
     private abstract record PageEdit;
     private sealed record RotateEdit(int[] Pages, int Angle) : PageEdit;
@@ -242,10 +264,10 @@ public partial class PDFReaderPage : Page
     public BitmapSource?       CurrentPageImage => PdfPageImage.Source as BitmapSource;
 
     /// <summary>
-    /// When set, Save will call this delegate to retrieve OCR results for the
-    /// current file and embed them as an invisible text layer before writing to disk.
+    /// OCR results of the open document. Save embeds them as an invisible text layer;
+    /// page edits and undo/redo move them along with their pages.
     /// </summary>
-    public Func<string, IReadOnlyDictionary<int, OcrPageData>?>? OcrDataProvider { get; set; }
+    public IPageOcrStore? OcrStore { get; set; }
 
     // Renders the current page at high resolution for OCR (≈300 DPI for letter paper).
     public async Task<BitmapSource?> RenderPageForOcrAsync(uint page, uint width = 1600)
@@ -580,7 +602,7 @@ public partial class PDFReaderPage : Page
 
         bool hasAdj   = _adjSettings.Count > 0 && _renderDocument != null;
         int  adjCount = hasAdj ? _adjSettings.Count : 0;
-        var  ocrData  = OcrDataProvider?.Invoke(_currentFilePath);
+        var  ocrData  = OcrStore?.GetOcrData(_currentFilePath);
         bool hasOcr   = ocrData is { Count: > 0 };
         // total = 어노테이션(1) + 페이지별 이미지 조정(adjCount) + PDF저장(1) + OCR(0~1)
         int  total    = 1 + adjCount + 1 + (hasOcr ? 1 : 0);
@@ -820,7 +842,66 @@ public partial class PDFReaderPage : Page
 
     // Records a page edit; <paramref name="before"/> is the state captured before the edit began.
     private void PushUndoEdit(PageEdit edit, UndoState before) =>
-        PushUndoEntry(new UndoSnapshot(null, edit, before));
+        PushUndoEntry(new UndoSnapshot(null, edit, before, PageMapFor(edit)));
+
+    // Called right after the edit was applied.
+    private PageMap? PageMapFor(PageEdit edit) => edit switch
+    {
+        ReorderEdit o  => new PageMap(o.NewOrder, o.NewOrder.Length),
+        InsertEdit ins => InsertMap(ins.At, ins.Count, _editDocument?.Pages.Count ?? 0),
+        _              => null,   // rotate / crop keep every page in place
+    };
+
+    private static PageMap InsertMap(int at, int count, int newCount)
+    {
+        var map = new int[newCount];
+        for (int i = 0; i < newCount; i++)
+            map[i] = i < at ? i : i < at + count ? -1 : i - count;
+        return new PageMap(map, newCount - count);
+    }
+
+    /// <summary>
+    /// Moves per-page data along with a page edit: adjustment settings, adjusted images
+    /// (dropped for <paramref name="reshaped"/> pages, whose rendering changed) and OCR
+    /// results. With <paramref name="ocrOnly"/> (undo/redo) the adjustments are left to
+    /// the restored undo state.
+    /// </summary>
+    /// <returns>OCR results of pages the map removed (old index → data), or null.</returns>
+    private IReadOnlyDictionary<int, OcrPageData>? MovePageData(PageMap? map, ISet<int>? reshaped = null, bool ocrOnly = false)
+    {
+        if (!ocrOnly)
+        {
+            if (map != null)
+            {
+                var moved = new Dictionary<int, AdjSettings>();
+                for (int i = 0; i < map.NewToOld.Length; i++)
+                    if (map.NewToOld[i] >= 0 && _adjSettings.TryGetValue(map.NewToOld[i], out var adj))
+                        moved[i] = adj;
+                _adjSettings.Clear();
+                foreach (var (k, v) in moved) _adjSettings[k] = v;
+            }
+            AdjustedStore?.Remap(map?.NewToOld, reshaped);
+        }
+
+        // OCR results carry the page geometry they were made with, so rotate/crop
+        // need no change; only moved pages do.
+        if (map == null || _currentFilePath == null || OcrStore == null) return null;
+        var ocr = OcrStore.GetOcrData(_currentFilePath);
+        if (ocr == null && map.RestoredOcr == null) return null;
+        ocr ??= new Dictionary<int, OcrPageData>();
+        var movedOcr = new Dictionary<int, OcrPageData>();
+        for (int i = 0; i < map.NewToOld.Length; i++)
+            if (map.NewToOld[i] >= 0 && ocr.TryGetValue(map.NewToOld[i], out var d))
+                movedOcr[i] = d;
+        if (map.RestoredOcr != null)
+            foreach (var (i, d) in map.RestoredOcr)
+                if (i < map.NewToOld.Length) movedOcr[i] = d;
+        OcrStore.SetOcrData(_currentFilePath, movedOcr);
+
+        var kept    = new HashSet<int>(map.NewToOld.Where(o => o >= 0));
+        var dropped = ocr.Where(kv => !kept.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value);
+        return dropped.Count > 0 ? dropped : null;
+    }
 
     private void PushUndoEntry(UndoSnapshot entry)
     {
@@ -837,6 +918,7 @@ public partial class PDFReaderPage : Page
         var prev = _undoStack[^1]; _undoStack.RemoveAt(_undoStack.Count - 1);
         if (MakeCounterpart(prev, counterpartReverts: false) is { } redo) _redoStack.Add(redo);
         await ApplyUndoEntryAsync(prev, revert: true);
+        if (prev.Map != null) MovePageData(prev.Map.Inverse(), ocrOnly: true);
         ReleaseEntry(prev);
         UndoRedoChanged?.Invoke();
     }
@@ -847,6 +929,7 @@ public partial class PDFReaderPage : Page
         var next = _redoStack[^1]; _redoStack.RemoveAt(_redoStack.Count - 1);
         if (MakeCounterpart(next, counterpartReverts: true) is { } undo) _undoStack.Add(undo);
         await ApplyUndoEntryAsync(next, revert: false);
+        if (next.Map != null) MovePageData(next.Map, ocrOnly: true);
         ReleaseEntry(next);
         UndoRedoChanged?.Invoke();
     }
@@ -856,8 +939,8 @@ public partial class PDFReaderPage : Page
     private UndoSnapshot? MakeCounterpart(UndoSnapshot entry, bool counterpartReverts)
     {
         if (entry.Edit != null && (counterpartReverts || entry.Edit is not InsertEdit))
-            return new UndoSnapshot(null, entry.Edit, CaptureState());
-        return _editPdfBytes != null ? CaptureSnapshot(_editPdfBytes) : null;
+            return new UndoSnapshot(null, entry.Edit, CaptureState(), entry.Map);
+        return _editPdfBytes != null ? CaptureSnapshot(_editPdfBytes) with { Map = entry.Map } : null;
     }
 
     private async Task ApplyUndoEntryAsync(UndoSnapshot entry, bool revert)
@@ -4707,6 +4790,7 @@ public partial class PDFReaderPage : Page
         SetStatus("회전 적용 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         PushUndoEdit(new RotateEdit(pages, angle), before);
+        MovePageData(null, pages.ToHashSet());
         StartThumbnailGeneration(i => i, pages.ToHashSet());
         SetStatus($"회전 완료 ({angle}°).");
     }
@@ -5290,7 +5374,13 @@ public partial class PDFReaderPage : Page
         _thumbLastClickedPage = -1;
 
         SetStatus("페이지 삭제 중…");
+        var topBefore = _undoStack.Count > 0 ? _undoStack[^1] : null;
         await ReloadRenderDocumentAsync();
+        var deleteMap = new PageMap(
+            Enumerable.Range(0, oldCount).Where(i => !deleted.Contains(i)).ToArray(), oldCount);
+        var droppedOcr = MovePageData(deleteMap);
+        if (_undoStack.Count > 0 && !ReferenceEquals(_undoStack[^1], topBefore))   // the step this delete pushed
+            _undoStack[^1] = _undoStack[^1] with { Map = deleteMap with { DroppedOcr = droppedOcr } };
         if (_currentFilePath != null)
             BookmarkService.Instance.RemapPages(_currentFilePath,
                 p => p < oldCount ? Math.Min(pageMap[p], newLast) : newLast);
@@ -5388,6 +5478,7 @@ public partial class PDFReaderPage : Page
         SetStatus("이미지 삽입 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);   // _editDocument.Save() runs here — resources alive
         PushUndoEdit(new InsertEdit(insertAt, insertedCount), before);
+        MovePageData(InsertMap(insertAt, insertedCount, _editDocument.Pages.Count));
         if (_currentFilePath != null)
             BookmarkService.Instance.RemapPages(_currentFilePath,
                 p => p >= insertAt ? p + insertedCount : p);
@@ -5598,6 +5689,7 @@ public partial class PDFReaderPage : Page
         SetStatus("페이지 순서 변경 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         PushUndoEdit(new ReorderEdit(newOrder.ToArray()), before);
+        MovePageData(new PageMap(newOrder.ToArray(), newOrder.Count));
         if (_currentFilePath != null)
         {
             var newIndex = new Dictionary<int, int>();
@@ -6073,7 +6165,10 @@ public partial class PDFReaderPage : Page
         SetStatus("Crop 적용 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         if (pages.Count > 0)
+        {
             PushUndoEdit(new CropEdit(pages.ToArray(), befores.ToArray(), afters.ToArray()), state);
+            MovePageData(null, pages.ToHashSet());
+        }
         StartThumbnailGeneration(i => i, pages.ToHashSet());
 
         // Clear crop inputs and overlay — the page is already cropped visually.
