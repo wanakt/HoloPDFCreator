@@ -6,7 +6,7 @@ public class Bookmark
 
     public int      Id         { get; }      = System.Threading.Interlocked.Increment(ref _counter);
     public string   FilePath   { get; init; } = "";
-    public uint     PageNumber { get; init; }
+    public uint     PageNumber { get; set;  }
     public string   Title      { get; set;  } = "";
     public DateTime CreatedAt  { get; }      = DateTime.Now;
     public int?     ParentId   { get; set;  }

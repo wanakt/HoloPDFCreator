@@ -58,8 +58,10 @@ public static class PdfMetaCopier
                                 .GetWords(page.Letters).ToList();
                 if (words.Count == 0) continue;
 
-                double pW    = page.MediaBox.Bounds.Width;
-                double pH    = page.MediaBox.Bounds.Height;
+                // PdfPig gives letter positions in the displayed page space (rotation
+                // applied, origin at the CropBox corner), the same area the page renders.
+                double pW    = page.Width;
+                double pH    = page.Height;
                 double scale = renderWidth / pW;
 
                 var regions = new List<OcrRegion>(words.Count);
@@ -105,8 +107,9 @@ public static class PdfMetaCopier
                 var words = NearestNeighbourWordExtractor.Instance.GetWords(page.Letters).ToList();
                 if (words.Count == 0) continue;
 
-                double pW = page.MediaBox.Bounds.Width;
-                double pH = page.MediaBox.Bounds.Height;
+                // Displayed page space (rotation applied, CropBox origin) — see LoadTextRegions.
+                double pW = page.Width;
+                double pH = page.Height;
                 int imgW = (int)Math.Max(1, Math.Round(pW));
                 int imgH = (int)Math.Max(1, Math.Round(pH));
 
@@ -149,19 +152,22 @@ public static class PdfMetaCopier
 
     private static void CopyOutlines(PdfDocument srcDoc, PdfDocument dstDoc)
     {
-        try { CopyOutlineLevel(srcDoc.Outlines, dstDoc.Outlines, srcDoc, dstDoc); }
+        try
+        {
+            var nodes = PdfOutlineReader.Read(srcDoc);
+            if (nodes.Count > 0) CopyOutlineLevel(nodes, dstDoc.Outlines, dstDoc);
+        }
         catch { }
     }
 
     private static void CopyOutlineLevel(
-        PdfOutlineCollection src,
+        List<OutlineNode> src,
         PdfOutlineCollection dst,
-        PdfDocument srcDoc,
         PdfDocument dstDoc)
     {
         foreach (var o in src)
         {
-            int pageIdx = FindPageIndex(o.DestinationPage, srcDoc);
+            int pageIdx = o.PageIndex;
             PdfPage? dstPage = (pageIdx >= 0 && pageIdx < dstDoc.PageCount)
                 ? dstDoc.Pages[pageIdx]
                 : (dstDoc.PageCount > 0 ? dstDoc.Pages[0] : null);
@@ -170,22 +176,12 @@ public static class PdfMetaCopier
 
             try
             {
-                var added = dst.Add(o.Title ?? "", dstPage, o.Opened, o.Style);
-                if (o.Outlines.Count > 0)
-                    CopyOutlineLevel(o.Outlines, added.Outlines, srcDoc, dstDoc);
+                var added = dst.Add(o.Title, dstPage, o.Open, o.Style);
+                if (o.Children.Count > 0)
+                    CopyOutlineLevel(o.Children, added.Outlines, dstDoc);
             }
             catch { }
         }
-    }
-
-    private static int FindPageIndex(PdfPage? page, PdfDocument srcDoc)
-    {
-        if (page == null) return -1;
-        for (int i = 0; i < srcDoc.PageCount; i++)
-        {
-            if (ReferenceEquals(srcDoc.Pages[i], page)) return i;
-        }
-        return -1;
     }
 
     // ── Annotations ────────────────────────────────────────────────────────────

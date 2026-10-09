@@ -3,8 +3,8 @@ using System.Windows.Media.Imaging;
 namespace HoloPDFCreator.Models;
 
 /// <summary>
-/// Shared store of adjusted page bitmaps produced by ImageAdjusterPage.
-/// PDFReaderPage reads from this to display adjusted images in-place.
+/// Shared store of adjusted page bitmaps produced by PDFReaderPage's adjust panel.
+/// OcrPage reads from this so OCR runs on the adjusted images.
 /// Keys are 0-based page indices.
 /// </summary>
 public class AdjustedImageStore

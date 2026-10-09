@@ -9,6 +9,17 @@ public sealed class BookmarkService
 
     private readonly List<Bookmark> _items = new();
 
+    // Files whose bookmark tree differs from the outline stored in the PDF.
+    // Only these get their /Outlines rewritten on save, so untouched outlines
+    // (including ones with named destinations or actions) are kept as-is.
+    private readonly HashSet<string> _dirtyFiles = new(StringComparer.OrdinalIgnoreCase);
+
+    public bool IsDirty(string filePath)    => _dirtyFiles.Contains(filePath);
+    public void MarkDirty(string filePath)  => _dirtyFiles.Add(filePath);
+    public void ClearDirty(string filePath) => _dirtyFiles.Remove(filePath);
+
+    private void MarkDirty(Bookmark b) => _dirtyFiles.Add(b.FilePath);
+
     public event EventHandler? Changed;
 
     public IReadOnlyList<Bookmark> All => _items;
@@ -27,11 +38,13 @@ public sealed class BookmarkService
     {
         b.SortOrder = _items.Count(x => x.ParentId == b.ParentId);
         _items.Add(b);
+        MarkDirty(b);
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
     public void Remove(int id)
     {
+        if (_items.FirstOrDefault(b => b.Id == id) is { } target) MarkDirty(target);
         RemoveDescendants(id);
         if (_items.RemoveAll(b => b.Id == id) > 0)
             Changed?.Invoke(this, EventArgs.Empty);
@@ -53,6 +66,7 @@ public sealed class BookmarkService
 
         int? oldParentId = bm.ParentId;
         bm.ParentId = newParentId;
+        MarkDirty(bm);
 
         // Recompact old siblings
         var oldSiblings = _items
@@ -75,6 +89,7 @@ public sealed class BookmarkService
         var bm = _items.FirstOrDefault(b => b.Id == id);
         if (bm == null) return;
         bm.IsExpanded = !bm.IsExpanded;
+        MarkDirty(bm);
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
@@ -103,6 +118,31 @@ public sealed class BookmarkService
     public void AddPdfOutlines(IEnumerable<Bookmark> outlines)
     {
         foreach (var b in outlines) _items.Add(b);
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>Drops every bookmark of the file (used after save, before re-importing the outline).</summary>
+    public void RemoveForFile(string filePath)
+    {
+        _items.RemoveAll(b => b.FilePath.Equals(filePath, StringComparison.OrdinalIgnoreCase));
+        _dirtyFiles.Remove(filePath);
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Re-targets bookmarks after pages were inserted, deleted or reordered.
+    /// <paramref name="map"/> takes an old 0-based page index and returns the new one.
+    /// </summary>
+    public void RemapPages(string filePath, Func<int, int> map)
+    {
+        bool any = false;
+        foreach (var b in ForFile(filePath))
+        {
+            b.PageNumber = (uint)Math.Max(0, map((int)b.PageNumber));
+            any = true;
+        }
+        if (!any) return;
+        _dirtyFiles.Add(filePath);
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
