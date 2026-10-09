@@ -103,6 +103,22 @@ public partial class OcrPage : Page
     private PageImageProvider? _images;
     private bool _ownsImages;
 
+    /// <summary>
+    /// Opens a PDF in the reader (the app's document) and shows it here; set by the main
+    /// window. PDFs dropped on this view go there, so OCR, adjustments and saving all work
+    /// on the same document. Without it the PDF is opened in this view only.
+    /// </summary>
+    public Func<string, Task>? OpenPdfInReader { get; set; }
+
+    /// <summary>
+    /// Saves the reader's document (original pages + OCR text layer, or without the OCR
+    /// layer when false); set by the main window and used while this view shows it.
+    /// </summary>
+    public Func<string, bool, Task<bool>>? SaveReaderDocument { get; set; }
+
+    // True while showing the reader's document (its session and page images).
+    private bool AttachedToReader => _images != null && !_ownsImages;
+
     private void UseImages(PageImageProvider? images, bool owned)
     {
         if (ReferenceEquals(images, _images)) return;
@@ -276,7 +292,10 @@ public partial class OcrPage : Page
         var folders = dropped.Where(Directory.Exists).ToArray();
 
         if (images.Length > 0) { LoadImageFiles(images); _lastPdfPath = null; }
-        foreach (var pdf    in pdfs)    await LoadFromPdfAsync(pdf);
+        if (pdfs.Length > 0 && OpenPdfInReader != null)
+            await OpenPdfInReader(pdfs[0]);
+        else
+            foreach (var pdf in pdfs) await LoadFromPdfAsync(pdf);
         foreach (var folder in folders) await LoadFolderAsync(folder, clearFirst: false);
     }
 
@@ -1122,8 +1141,10 @@ public partial class OcrPage : Page
 
         string? sourcePath = _sourcePdfPath;
 
-        string baseName = sourcePath != null
-            ? Path.GetFileNameWithoutExtension(sourcePath)
+        // The reader may render from a temp copy; name the file after the document itself.
+        string? docPath  = AttachedToReader ? _session.FilePath ?? sourcePath : sourcePath;
+        string baseName = docPath != null
+            ? Path.GetFileNameWithoutExtension(docPath)
             : "ocr_result";
 
         var dlg = new SaveFileDialog
@@ -1152,6 +1173,23 @@ public partial class OcrPage : Page
             keepOriginalText = answer == MessageBoxResult.Yes;
         }
 
+        // The reader's document: save it the reader's way — original pages (vector text,
+        // image quality, bookmarks, annotations) plus the OCR text layer.
+        if (AttachedToReader && SaveReaderDocument != null)
+        {
+            BtnSaveSearchablePdf.IsEnabled = false;
+            try
+            {
+                if (!await SaveReaderDocument(outputPath, !keepOriginalText)) return;   // the reader reported why
+                SetOcrStatus($"저장됨: {Path.GetFileName(outputPath)}");
+                MessageBox.Show($"저장 완료:\n{outputPath}", "완료",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            finally { UpdateButtonStates(); }
+            return;
+        }
+
+        // Images (and PDFs opened only in this view): build a PDF from the page images.
         BtnSaveSearchablePdf.IsEnabled = false;
 
         // Open source PDF for lazy-rendering pages that have no loaded image

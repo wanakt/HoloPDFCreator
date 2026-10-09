@@ -1,6 +1,5 @@
 using System.Windows;
 using System.Windows.Controls;
-using HoloPDFCreator.Models;
 using HoloPDFCreator.Pages;
 
 namespace HoloPDFCreator;
@@ -14,6 +13,20 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         ContentFrame.Navigate(_pdfReaderPage);
+
+        // The OCR view works on the reader's document: PDFs dropped there open in the
+        // reader, and its searchable-PDF save is the reader's save.
+        _ocrPage.OpenPdfInReader = async path =>
+        {
+            await _pdfReaderPage.LoadPdfAsync(path);
+            await ShowReaderDocumentInOcrAsync();
+        };
+        _ocrPage.SaveReaderDocument = async (path, includeOcr) =>
+        {
+            bool saved = await _pdfReaderPage.SaveAsAsync(path, includeOcr);
+            await ShowReaderDocumentInOcrAsync();   // the reader continues on the saved file
+            return saved;
+        };
 
         Loaded += async (_, _) =>
         {
@@ -46,11 +59,14 @@ public partial class MainWindow : Window
         ContentFrame.Navigate(_ocrPage);
         SetNavActive(BtnNavOcr);
 
-        if (_pdfReaderPage.EffectiveFilePath is string pdfPath)
-        {
-            // pdfPath may be the reader's temp file; the results belong to the document itself.
-            await _ocrPage.LoadFromPdfAsync(pdfPath, _pdfReaderPage.CurrentPage,
-                                            _pdfReaderPage.Session, _pdfReaderPage.Images);
-        }
+        await ShowReaderDocumentInOcrAsync();
+    }
+
+    private async Task ShowReaderDocumentInOcrAsync()
+    {
+        if (_pdfReaderPage.EffectiveFilePath is not string pdfPath) return;
+        // pdfPath may be the reader's temp file; the results belong to the document itself.
+        await _ocrPage.LoadFromPdfAsync(pdfPath, _pdfReaderPage.CurrentPage,
+                                        _pdfReaderPage.Session, _pdfReaderPage.Images);
     }
 }

@@ -684,13 +684,22 @@ public partial class PDFReaderPage : Page
         await SaveToPathAsync(dlg.FileName);
     }
 
-    private async Task SaveToPathAsync(string outputPath)
+    /// <summary>
+    /// Saves the document under <paramref name="outputPath"/> (and continues on that file),
+    /// with the OCR results as an invisible text layer unless <paramref name="includeOcr"/> is
+    /// false. The OCR view saves through this, so its "searchable PDF" keeps the original
+    /// pages instead of rebuilding them from images.
+    /// </summary>
+    /// <returns>False when nothing was saved (no document, or the save failed and was reported).</returns>
+    public Task<bool> SaveAsAsync(string outputPath, bool includeOcr = true) => SaveToPathAsync(outputPath, includeOcr);
+
+    private async Task<bool> SaveToPathAsync(string outputPath, bool includeOcr = true)
     {
-        if (_editDocument is null || _currentFilePath is null) return;
+        if (_editDocument is null || _currentFilePath is null) return false;
 
         bool hasAdj   = _adjSettings.Count > 0 && _renderDocument != null;
         int  adjCount = hasAdj ? _adjSettings.Count : 0;
-        var  ocrData  = _session.OcrForSave();
+        var  ocrData  = includeOcr ? _session.OcrForSave() : new Dictionary<int, OcrPageData>();
         bool hasOcr   = ocrData.Count > 0;
         // total = 어노테이션(1) + 페이지별 이미지 조정(adjCount) + PDF저장(1) + OCR(0~1)
         int  total    = 1 + adjCount + 1 + (hasOcr ? 1 : 0);
@@ -779,6 +788,7 @@ public partial class PDFReaderPage : Page
             progress.Close();
             await LoadPdfAsync(outputPath);
             SetStatus("Saved.");
+            return true;
         }
         catch (Exception ex)
         {
@@ -786,6 +796,7 @@ public partial class PDFReaderPage : Page
             foreach (var (ms, xi) in bakedResources) { xi?.Dispose(); ms?.Dispose(); }
             if (tmpPath != null && File.Exists(tmpPath)) File.Delete(tmpPath);
             MessageBox.Show($"Save failed:\n{ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            return false;
         }
     }
 
@@ -2062,9 +2073,14 @@ public partial class PDFReaderPage : Page
         catch { NextPagesPanel.Children.Clear(); }
     }
 
+    // Bumped per PopulateTextOverlayAsync call: when two page renders overlap, only the
+    // latest one fills the word list (both used to append, doubling every word).
+    private int _textOverlayGeneration;
+
     private async Task PopulateTextOverlayAsync(string pdfPath, int pageIndex,
                                                 double imageWidth, double imageHeight)
     {
+        int generation = ++_textOverlayGeneration;
         _pageWords.Clear();
         _pageLines.Clear();
         _readingOrder.Clear();
@@ -2148,6 +2164,15 @@ public partial class PDFReaderPage : Page
             catch { /* non-searchable PDF */ }
             return (result, rotDeg);
         });
+        if (generation != _textOverlayGeneration) return;   // a newer render took over
+
+        // Pages OCR'd in this session: select and search their OCR text (also scanned
+        // pages, before the text layer is saved into the file).
+        if (OcrWordsForPage(pageIndex, imageWidth, imageHeight) is { } ocrWords)
+        {
+            words        = ocrWords;
+            pageRotation = 0;   // only used when the OCR text runs horizontally on screen
+        }
 
         _currentPageRotation = pageRotation;
         _pageWords.AddRange(words);
@@ -2198,6 +2223,52 @@ public partial class PDFReaderPage : Page
 
         CropCanvas.Width  = imageWidth;
         CropCanvas.Height = imageHeight;
+    }
+
+    /// <summary>
+    /// Word boxes of the page's OCR results in pixels of the displayed image, or null when
+    /// the page has none, or when it was rotated since OCR (its text would run vertically).
+    /// Each OCR line is split into words, spread over the line box by character count.
+    /// </summary>
+    private List<WordBox>? OcrWordsForPage(int pageIndex, double imageWidth, double imageHeight)
+    {
+        if (!_session.OcrRegions.TryGetValue(pageIndex, out var regions) || regions.Count == 0) return null;
+        if (!_session.OcrSize.TryGetValue(pageIndex, out var size) || size.w <= 0 || size.h <= 0) return null;
+        if (_editDocument is null || pageIndex >= _editDocument.Pages.Count) return null;
+
+        var page = _editDocument.Pages[pageIndex];
+        var now  = new PageGeometry(((page.Rotate % 360) + 360) % 360, SearchablePdfService.VisibleBox(page));
+        PageGeometry? then = _session.OcrGeometry.TryGetValue(pageIndex, out var g) ? g : null;
+        if (then is { } t && t.Rotation != now.Rotation) return null;
+
+        int dw = (int)Math.Round(imageWidth), dh = (int)Math.Round(imageHeight);
+        (double X, double Y) Map(double x, double y)
+        {
+            if (then is not { } from) return (x * imageWidth / size.w, y * imageHeight / size.h);
+            var (u, v) = SearchablePdfService.ImageToUser(x, y, size.w, size.h, from);
+            return SearchablePdfService.UserToImage(u, v, dw, dh, now);
+        }
+
+        var result = new List<WordBox>();
+        foreach (var r in regions)
+        {
+            if (string.IsNullOrWhiteSpace(r.Text) || r.Points.Length == 0) continue;
+            var pts  = r.Points.Select(pt => Map(pt.X, pt.Y)).ToList();
+            double left = pts.Min(q => q.X), right  = pts.Max(q => q.X);
+            double top  = pts.Min(q => q.Y), bottom = pts.Max(q => q.Y);
+            if (right - left < 1 || bottom - top < 1) continue;
+
+            string text = r.Text.Trim();
+            double perChar = (right - left) / text.Length;
+            int pos = 0;
+            foreach (var word in text.Split(' '))
+            {
+                if (word.Length > 0)
+                    result.Add(new WordBox(word, left + pos * perChar, top, word.Length * perChar, bottom - top));
+                pos += word.Length + 1;
+            }
+        }
+        return result;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -5705,6 +5776,15 @@ public partial class PDFReaderPage : Page
         int total     = (int)_totalPages;
         if (total == 0 || (bytes == null && path == null)) return hits;
 
+        // Pages OCR'd in this session are searched by their OCR text.
+        var ocrText = new Dictionary<int, string>();
+        foreach (var (p, regions) in _session.OcrRegions)
+        {
+            if (!_session.OcrSize.ContainsKey(p)) continue;   // text-layer regions come from the PDF below
+            var t = string.Join(" ", regions.Select(r => r.Text.Trim()).Where(x => x.Length > 0));
+            if (t.Length > 0) ocrText[p] = t;
+        }
+
         await Task.Run(() =>
         {
             try
@@ -5721,14 +5801,19 @@ public partial class PDFReaderPage : Page
                         ct.ThrowIfCancellationRequested();
                         if (restrictToPages != null && !restrictToPages.Contains(p)) continue;
 
-                        var page  = doc.GetPage(p + 1);
-                        var words = NearestNeighbourWordExtractor.Instance
-                            .GetWords(page.Letters)
-                            .Select(w => w.Text)
-                            .ToList();
-                        if (words.Count == 0) continue;
-
-                        string text  = string.Join(" ", words);
+                        string text;
+                        if (ocrText.TryGetValue(p, out var fromOcr))
+                            text = fromOcr;
+                        else
+                        {
+                            var page  = doc.GetPage(p + 1);
+                            var words = NearestNeighbourWordExtractor.Instance
+                                .GetWords(page.Letters)
+                                .Select(w => w.Text)
+                                .ToList();
+                            if (words.Count == 0) continue;
+                            text = string.Join(" ", words);
+                        }
                         int    start = 0;
                         while (start < text.Length && hits.Count < 500)
                         {
