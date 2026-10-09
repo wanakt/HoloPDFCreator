@@ -401,7 +401,7 @@ public static class SearchablePdfService
     /// Image pixel (x, y) of an imgW × imgH rendering of a page shown as <paramref name="g"/>
     /// → unrotated user space (u, v). Same transform as <see cref="MapToPage"/>.
     /// </summary>
-    public static (double U, double V) ImageToUser(double x, double y, int imgW, int imgH, PageGeometry g)
+    public static (double U, double V) ImageToUser(double x, double y, double imgW, double imgH, PageGeometry g)
     {
         double nx = x / imgW, ny = y / imgH, W = g.Box.Width, H = g.Box.Height;
         var (u, v) = Normalize(g.Rotation) switch
@@ -415,7 +415,7 @@ public static class SearchablePdfService
     }
 
     /// <summary>Inverse of <see cref="ImageToUser"/>.</summary>
-    public static (double X, double Y) UserToImage(double u, double v, int imgW, int imgH, PageGeometry g)
+    public static (double X, double Y) UserToImage(double u, double v, double imgW, double imgH, PageGeometry g)
     {
         double W = g.Box.Width, H = g.Box.Height;
         double ru = (u - g.Box.X) / W, rv = (v - g.Box.Y) / H;
@@ -430,6 +430,15 @@ public static class SearchablePdfService
     }
 
     private static int Normalize(int rotation) => ((rotation % 360) + 360) % 360;
+
+    /// <summary>The page's current rotation and visible box.</summary>
+    public static PageGeometry GeometryOf(PdfPage page) => new(Normalize(page.Rotate), VisibleBox(page));
+
+    /// <summary>
+    /// Size of the page as displayed (rotation applied), in points.
+    /// </summary>
+    public static (double W, double H) DisplaySize(PageGeometry g) =>
+        g.Rotation is 90 or 270 ? (g.Box.Height, g.Box.Width) : (g.Box.Width, g.Box.Height);
 
     /// <summary>
     /// Maps a region's bottom-left pixel + size (in the rendered, rotated image) to

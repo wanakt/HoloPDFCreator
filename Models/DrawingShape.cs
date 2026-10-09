@@ -15,6 +15,7 @@ public class DrawingShape
     public bool             HasFill    { get; set; } = false;
     public string           FilePath   { get; set; } = "";
     public uint             PageNumber { get; set; }
+    public long             PageId     { get; set; }   // DocumentSession page id (0 = not yet assigned)
     // PDF-space coords
     public double X1 { get; set; }
     public double Y1 { get; set; }

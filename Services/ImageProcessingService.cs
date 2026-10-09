@@ -6,6 +6,39 @@ namespace HoloPDFCreator.Services;
 
 public static class ImageProcessingService
 {
+    /// <summary>Image width the stroke and unsharp-mask radii of an adjustment are set for.</summary>
+    public const double AdjustReferenceWidth = 1200;
+
+    /// <summary>
+    /// Applies a page adjustment. Pixel radii (stroke, unsharp mask) are scaled by
+    /// src.Width / <see cref="AdjustReferenceWidth"/>, so a thumbnail, the zoomed view, the
+    /// OCR input and the image baked on save all get the same look. Always returns a new bitmap.
+    /// </summary>
+    public static Bitmap ApplyAdjustments(Bitmap src, HoloPDFCreator.Models.AdjustSettings s)
+    {
+        double scale       = src.Width / AdjustReferenceWidth;
+        float brightness   = (float)s.Brightness / 100f;
+        float contrast     = (float)s.Contrast   / 100f;
+        float stroke       = (float)(s.Stroke * scale);
+        float usmAmount    = (float)s.UsmAmount;
+        int   usmRadius    = Math.Max(1, (int)Math.Round(s.UsmRadius * scale));
+        int   usmThreshold = (int)s.UsmThreshold;
+
+        var result = src;
+        void Step(Func<Bitmap, Bitmap> f)
+        {
+            var t = f(result);
+            if (!ReferenceEquals(result, src)) result.Dispose();
+            result = t;
+        }
+        if (Math.Abs(brightness) > 0.001f) Step(b => AdjustBrightness(b, brightness));
+        if (Math.Abs(contrast)   > 0.001f) Step(b => AdjustContrast(b, contrast));
+        if (s.AutoLevel)                   Step(AutoLevel);
+        if (stroke    > 0.01f)             Step(b => ThickenStrokes(b, stroke));
+        if (usmAmount > 0.01f)             Step(b => UnsharpMask(b, usmAmount, usmRadius, usmThreshold));
+        return ReferenceEquals(result, src) ? new Bitmap(src) : result;
+    }
+
     // ─── Public API ────────────────────────────────────────────────────────────
 
     /// <summary>

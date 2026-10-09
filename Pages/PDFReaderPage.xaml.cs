@@ -19,6 +19,7 @@ using Windows.Storage;
 using Windows.Storage.Streams;
 using PigPdf = UglyToad.PdfPig;
 using WinPdf = Windows.Data.Pdf;
+using AdjSettings = HoloPDFCreator.Models.AdjustSettings;
 
 namespace HoloPDFCreator.Pages;
 
@@ -43,36 +44,221 @@ public partial class PDFReaderPage : Page
         public double CenterY => Top  + Height / 2;
     }
 
-    private readonly List<WordBox>        _pageWords    = new();
-    private readonly List<List<int>>      _pageLines    = new();
-    private readonly List<int>            _readingOrder = new();
-    private readonly Dictionary<int, int> _wordToOrder  = new();
+    // ─── Pages on screen ──────────────────────────────────────────────────────
+    // Every page shown (the current one and the ones above/below it) has its own text
+    // layer, annotation/memo/drawing canvases and selection. Input handlers first make
+    // the page the event came from the one being worked on (_view); the code below
+    // reaches that page's state through the properties, so it is the same for all pages.
+    private sealed class PageView
+    {
+        public uint   Page;
+        public Image  Image = null!;
+        public Canvas Annotation = null!, Memo = null!, Drawing = null!, TextOverlay = null!;
+        public int    Generation;   // latest PopulateTextOverlayAsync for this page
 
-    private readonly HashSet<int> _selectedIndices  = new();
-    private int  _lastClickedOrder    = -1;
-    private int  _lastHoverIndex      = -1;
-    private int  _currentPageRotation = 0;
-    private bool _isVerticalText      = false;
+        public readonly List<WordBox>        Words        = new();
+        public readonly List<List<int>>      Lines        = new();
+        public readonly List<int>            ReadingOrder = new();
+        public readonly Dictionary<int, int> WordToOrder  = new();
+        public readonly Dictionary<int, int> WordToLine   = new();
+        public readonly HashSet<int>         Selected     = new();
+        public readonly HashSet<int>         SearchHits   = new();
+        public int        LastClickedOrder = -1, LastHoverIndex = -1, Rotation, DragAnchorOrder = -1;
+        public bool       IsVerticalText, IsDragging, IsDrawing;
+        public Point      DragStart, DrawStart;
+        public List<int>? DragAnchorLine;
+        public Shape?     RubberBand;
+        public double     PdfWidth, PdfHeight;
+        public PageGeometry Geometry;
+    }
+
+    private PageView _mainView = null!;   // the current page (PdfPageBorder)
+    private PageView _view     = null!;   // the page being worked on
+    private readonly List<PageView> _sideViews = new();
+    private IEnumerable<PageView> AllViews => _sideViews.Prepend(_mainView);
+
+    private Canvas TextOverlayCanvas => _view.TextOverlay;
+    private Canvas AnnotationCanvas  => _view.Annotation;
+    private Canvas MemoCanvas        => _view.Memo;
+    private Canvas DrawingCanvas     => _view.Drawing;
+    // The page the annotations, memos, drawings and selection being handled belong to.
+    private uint   ViewPage          => _view.Page;
+
+    private List<WordBox>        _pageWords       => _view.Words;
+    private List<List<int>>      _pageLines       => _view.Lines;
+    private List<int>            _readingOrder    => _view.ReadingOrder;
+    private Dictionary<int, int> _wordToOrder     => _view.WordToOrder;
+    private Dictionary<int, int> _wordToLine      => _view.WordToLine;
+    private HashSet<int>         _selectedIndices => _view.Selected;
+    private HashSet<int>         _searchHighlightIndices => _view.SearchHits;
+    private int  _lastClickedOrder    { get => _view.LastClickedOrder; set => _view.LastClickedOrder = value; }
+    private int  _lastHoverIndex      { get => _view.LastHoverIndex;   set => _view.LastHoverIndex   = value; }
+    private int  _currentPageRotation { get => _view.Rotation;         set => _view.Rotation         = value; }
+    private bool _isVerticalText      { get => _view.IsVerticalText;   set => _view.IsVerticalText   = value; }
 
     // ─── Drag state ───────────────────────────────────────────────────────────
-    private bool      _isDragging;
-    private Point     _dragStart;
-    private int       _dragAnchorOrder = -1;
-    private List<int>? _dragAnchorLine;   // column/line the drag started in (vertical-lock)
+    private bool       _isDragging      { get => _view.IsDragging;      set => _view.IsDragging      = value; }
+    private Point      _dragStart       { get => _view.DragStart;       set => _view.DragStart       = value; }
+    private int        _dragAnchorOrder { get => _view.DragAnchorOrder; set => _view.DragAnchorOrder = value; }
+    private List<int>? _dragAnchorLine  { get => _view.DragAnchorLine;  set => _view.DragAnchorLine  = value; }   // column/line the drag started in (vertical-lock)
 
     // ─── Annotation state ─────────────────────────────────────────────────────
     private TextAnnotation?              _selectedAnnotation;
     private Popup?                       _annotationPopup;
-    private readonly Dictionary<int,int> _wordToLine = new();
-    private double                       _currentPagePdfWidth;
-    private double                       _currentPagePdfHeight;
+    private double _currentPagePdfWidth  { get => _view.PdfWidth;  set => _view.PdfWidth  = value; }
+    private double _currentPagePdfHeight { get => _view.PdfHeight; set => _view.PdfHeight = value; }
+    // Rotation and visible box of the page: annotations, memos and drawings are kept in
+    // PDF user space and mapped to the canvas through it.
+    private PageGeometry _currentPageGeometry { get => _view.Geometry; set => _view.Geometry = value; }
+
+    /// <summary>Runs <paramref name="action"/> on <paramref name="view"/>'s state, then restores.</summary>
+    private void WithView(PageView view, Action action)
+    {
+        var saved = _view;
+        _view = view;
+        try { action(); }
+        finally { _view = saved; }
+    }
+
+    // Input from a page's canvas: work on that page. A press that starts a new selection
+    // clears what was selected on the other pages (one selection in the document).
+    private void UseViewOf(object sender, bool pressing = false)
+    {
+        var v = AllViews.FirstOrDefault(pv => ReferenceEquals(pv.TextOverlay, sender) || ReferenceEquals(pv.Drawing, sender));
+        if (v == null) return;
+        if (pressing) ClearSelectionExcept(v);
+        _view = v;
+    }
+
+    // Pages with selected words, top to bottom.
+    private List<PageView> SelectedViews() => AllViews.Where(v => v.Selected.Count > 0).OrderBy(v => v.Page).ToList();
+
+    private int SelectedWordCount => AllViews.Sum(v => v.Selected.Count);
+
+    private void ClearSelectionExcept(PageView? keep)
+    {
+        foreach (var v in AllViews)
+            if (!ReferenceEquals(v, keep) && v.Selected.Count > 0)
+                WithView(v, () => { _selectedIndices.Clear(); RefreshHighlights(); });
+    }
+
+    // Selected text of every page, in reading order, pages separated by a line break.
+    private string SelectedText() => string.Join("\n", SelectedViews().Select(v =>
+        string.Join(" ", v.ReadingOrder.Where(v.Selected.Contains).Select(i => v.Words[i].Text))));
+
+    // ── selection dragged across pages ───────────────────────────────────────
+
+    // The page whose text layer is under (or nearest to) a point given relative to `from`.
+    private PageView NearestView(PageView from, Point posInFrom)
+    {
+        PageView best = from; double bestDist = double.MaxValue;
+        foreach (var v in AllViews)
+        {
+            if (v.TextOverlay.ActualHeight <= 0) continue;
+            var pt = from.TextOverlay.TranslatePoint(posInFrom, v.TextOverlay);
+            double dist = pt.Y < 0 ? -pt.Y : pt.Y > v.TextOverlay.ActualHeight ? pt.Y - v.TextOverlay.ActualHeight : 0;
+            if (dist < bestDist) { bestDist = dist; best = v; }
+        }
+        return best;
+    }
+
+    /// <summary>
+    /// Extends the drag that started on <paramref name="anchor"/> (at reading-order index
+    /// <paramref name="anchorOrder"/>) to <paramref name="target"/> at <paramref name="posInTarget"/>:
+    /// the anchor page from the anchor to its end (or start), pages in between entirely,
+    /// the target page from its start (or end) to the pointer.
+    /// </summary>
+    private void ExtendSelectionAcrossPages(PageView anchor, int anchorOrder, PageView target, Point posInTarget)
+    {
+        int targetOrder = -1;
+        WithView(target, () => targetOrder = _readingOrder.Count > 0 ? GetNearestReadingOrder(posInTarget) : -1);
+        bool down = target.Page > anchor.Page;
+        uint lo = Math.Min(anchor.Page, target.Page), hi = Math.Max(anchor.Page, target.Page);
+
+        foreach (var v in AllViews)
+        {
+            var next = new HashSet<int>();
+            int n = v.ReadingOrder.Count;
+            if (n > 0)
+            {
+                (int from, int to) range =
+                    ReferenceEquals(v, anchor) ? (down ? (anchorOrder, n - 1) : (0, anchorOrder)) :
+                    ReferenceEquals(v, target) ? (targetOrder < 0 ? (1, 0) : down ? (0, targetOrder) : (targetOrder, n - 1)) :
+                    v.Page > lo && v.Page < hi ? (0, n - 1) : (1, 0);
+                for (int k = Math.Max(0, range.from); k <= range.to && k < n; k++) next.Add(v.ReadingOrder[k]);
+            }
+            if (!next.SetEquals(v.Selected))
+                WithView(v, () =>
+                {
+                    _selectedIndices.Clear();
+                    foreach (var i in next) _selectedIndices.Add(i);
+                    RefreshHighlights();
+                });
+        }
+    }
+
+    // Dragging near the top/bottom edge scrolls, so the selection can reach pages off screen.
+    private void AutoScrollWhileDragging(MouseEventArgs e)
+    {
+        var p = e.GetPosition(PdfScrollViewer);
+        const double edge = 24, step = 24;
+        if (p.Y < edge)                                 PdfScrollViewer.ScrollToVerticalOffset(PdfScrollViewer.VerticalOffset - step);
+        else if (p.Y > PdfScrollViewer.ActualHeight - edge) PdfScrollViewer.ScrollToVerticalOffset(PdfScrollViewer.VerticalOffset + step);
+    }
+
+    // Clicking a page focuses its text layer (for Ctrl+C / Ctrl+A); WPF would then scroll
+    // the whole page into view, pulling a page that only peeks in at the top or bottom
+    // into the middle. The page is already where the user clicked, so never scroll for it.
+    private static void KeepInPlaceOnFocus(PageView v)
+    {
+        v.TextOverlay.RequestBringIntoView += (_, e) => e.Handled = true;
+        v.Drawing.RequestBringIntoView     += (_, e) => e.Handled = true;
+    }
+
+    private void HookPageInput(PageView v)
+    {
+        KeepInPlaceOnFocus(v);
+        v.TextOverlay.MouseLeftButtonDown += TextOverlayCanvas_MouseDown;
+        v.TextOverlay.MouseMove           += TextOverlayCanvas_MouseMove;
+        v.TextOverlay.MouseLeftButtonUp   += TextOverlayCanvas_MouseUp;
+        v.TextOverlay.MouseLeave          += TextOverlayCanvas_MouseLeave;
+        v.TextOverlay.KeyDown             += TextOverlayCanvas_KeyDown;
+        v.TextOverlay.ContextMenuOpening  += TextOverlayCanvas_ContextMenuOpening;
+        v.Drawing.MouseLeftButtonDown     += DrawingCanvas_MouseDown;
+        v.Drawing.MouseMove               += DrawingCanvas_MouseMove;
+        v.Drawing.MouseLeftButtonUp       += DrawingCanvas_MouseUp;
+        ApplyDrawMode(v);
+    }
+
+    private Point ToPdf(Point canvas, double canvasW, double canvasH)
+    {
+        var (u, v) = SearchablePdfService.ImageToUser(canvas.X, canvas.Y, canvasW, canvasH, _currentPageGeometry);
+        return new Point(u, v);
+    }
+
+    private Point ToCanvas(double u, double v, double canvasW, double canvasH) =>
+        ToCanvas(_currentPageGeometry, u, v, canvasW, canvasH);
+
+    private static Point ToCanvas(PageGeometry g, double u, double v, double canvasW, double canvasH)
+    {
+        var (x, y) = SearchablePdfService.UserToImage(u, v, canvasW, canvasH, g);
+        return new Point(x, y);
+    }
+
+    // A rectangle in PDF user space → canvas (axis-aligned for any /Rotate).
+    private Rect ToCanvasRect(double left, double bottom, double right, double top, double canvasW, double canvasH) =>
+        ToCanvasRect(_currentPageGeometry, left, bottom, right, top, canvasW, canvasH);
+
+    private static Rect ToCanvasRect(PageGeometry g, double left, double bottom, double right, double top,
+                                     double canvasW, double canvasH) =>
+        new(ToCanvas(g, left, bottom, canvasW, canvasH), ToCanvas(g, right, top, canvasW, canvasH));
 
     // ─── Adjust panel state ───────────────────────────────────────────────────
     private bool _suppressAdjSlider;
     private bool _adjPanelReady;
     private System.Windows.Threading.DispatcherTimer? _adjDebounceTimer;
-    private record AdjSettings(double Brightness, double Contrast, double Stroke, double UsmAmount, double UsmRadius, double UsmThreshold, bool AutoLevel);
-    private readonly Dictionary<int, AdjSettings> _adjSettings = new();
+    // Per-page data lives in the session by page id; these views address it by page index.
+    private PageIndexed<AdjSettings> _adjSettings => _session.Adjust;
 
     // ─── Memo state ───────────────────────────────────────────────────────────
     private double _memoInsertPdfX;
@@ -110,34 +296,14 @@ public partial class PDFReaderPage : Page
     // ─── Undo / Redo ─────────────────────────────────────────────────────────
     private record DrawingShapeData(DrawingShapeType Type, Color Stroke, Color Fill, bool HasFill,
                                      string FilePath, uint Page, double X1, double Y1, double X2, double Y2);
-    // Cheap per-step state that every undo step restores.
-    private record UndoState(Dictionary<int, AdjSettings> Adj, List<DrawingShapeData> Shapes,
-                             Dictionary<int, uint> BmPages, Dictionary<int, string> PageImages);
+    // Cheap per-step state that every undo step restores: the page order (per-page data
+    // that is not undoable, like OCR results, follows its page id through it), the
+    // adjustments by page id, drawings and bookmark pages.
+    private record UndoState(long[] Order, Dictionary<long, AdjSettings> Adj,
+                             List<DrawingShapeData> Shapes, Dictionary<int, uint> BmPages);
     // A step holds either a full PDF snapshot (Pdf: a handle into _snapshotStore, i.e. a
     // temp file) or a small page edit that is reverted / re-applied in place (Edit).
-    // Map: how the step moved pages, for data that is not part of the undo state but has
-    // to follow its page (OCR results). Null when no page moved.
-    private record UndoSnapshot(PdfSnapshotStore.Handle? Pdf, PageEdit? Edit, UndoState State,
-                                PageMap? Map = null);
-
-    // NewToOld[i] = index before the step of the page now at i (-1 = page added by the step).
-    // DroppedOcr: OCR results of pages the step removed, by their old index, so undoing
-    // the step can put them back.
-    private sealed record PageMap(int[] NewToOld, int OldCount,
-                                  IReadOnlyDictionary<int, OcrPageData>? DroppedOcr = null)
-    {
-        public PageMap Inverse()
-        {
-            var inv = new int[OldCount];
-            Array.Fill(inv, -1);
-            for (int i = 0; i < NewToOld.Length; i++)
-                if (NewToOld[i] >= 0 && NewToOld[i] < OldCount) inv[NewToOld[i]] = i;
-            return new PageMap(inv, NewToOld.Length) { RestoredOcr = DroppedOcr };
-        }
-
-        // Set on an inverse map: results to add back at their (new) index.
-        public IReadOnlyDictionary<int, OcrPageData>? RestoredOcr { get; init; }
-    }
+    private record UndoSnapshot(PdfSnapshotStore.Handle? Pdf, PageEdit? Edit, UndoState State);
 
     private abstract record PageEdit;
     private sealed record RotateEdit(int[] Pages, int Angle) : PageEdit;
@@ -174,7 +340,7 @@ public partial class PDFReaderPage : Page
     // Maps page index in _editDocument → original image file path (image-only pages).
     // Used so ReorderThumbPagesAsync can re-draw image pages from source files instead
     // of copying PDF pages (PDFsharp-WPF AddPage silently drops image XObjects).
-    private readonly Dictionary<int, string> _pageImagePaths = new();
+    private PageIndexed<string> _pageImagePaths => _session.SourceImages;
     private static readonly SolidColorBrush ThumbBrushNormal     = Frozen(0x1E, 0x1E, 0x2E);
     private static readonly SolidColorBrush ThumbBrushSelected   = Frozen(0x31, 0x32, 0x44);
     private static readonly SolidColorBrush ThumbBrushHover      = Frozen(0x28, 0x28, 0x3C);
@@ -213,12 +379,26 @@ public partial class PDFReaderPage : Page
 
     // ─── Search highlight state ───────────────────────────────────────────────
     private string?      _searchHighlightQuery   = null;
-    private HashSet<int> _searchHighlightIndices = new();
 
     public PDFReaderPage()
     {
+        _images = new PageImageProvider(_session);
+        _images.PageImageChanged += OnPageImageChanged;
+        SubscribeSession(_session);
         InitializeComponent();
         _adjPanelReady = true;
+
+        // The current page's view is in the XAML; its text-layer events are wired there.
+        _mainView = new PageView
+        {
+            Image = PdfPageImage, Annotation = MainAnnotationCanvas, Memo = MainMemoCanvas,
+            Drawing = MainDrawingCanvas, TextOverlay = MainTextOverlayCanvas,
+        };
+        _view = _mainView;
+        KeepInPlaceOnFocus(_mainView);
+        MainDrawingCanvas.MouseLeftButtonDown += DrawingCanvas_MouseDown;
+        MainDrawingCanvas.MouseMove           += DrawingCanvas_MouseMove;
+        MainDrawingCanvas.MouseLeftButtonUp   += DrawingCanvas_MouseUp;
         PdfPageBorder.Effect = new System.Windows.Media.Effects.DropShadowEffect
         {
             Color       = System.Windows.Media.Colors.Black,
@@ -260,14 +440,126 @@ public partial class PDFReaderPage : Page
     public string?             EffectiveFilePath => _tempEditedPath ?? _currentFilePath;
     public uint               CurrentPage      => _currentPage;
     public uint               TotalPages       => _totalPages;
-    public AdjustedImageStore? AdjustedStore   { get; set; }
+    /// <summary>Renders (and caches) this document's page images; shared with the OCR view.</summary>
+    public PageImageProvider   Images          => _images;
     public BitmapSource?       CurrentPageImage => PdfPageImage.Source as BitmapSource;
 
+    private DocumentSession   _session = new();
+    private PageImageProvider _images;
+
     /// <summary>
-    /// OCR results of the open document. Save embeds them as an invisible text layer;
-    /// page edits and undo/redo move them along with their pages.
+    /// The open document's pages and per-page data (adjustments, source images, OCR
+    /// results), shared with the OCR view. Page edits change its page order.
     /// </summary>
-    public IPageOcrStore? OcrStore { get; set; }
+    public DocumentSession Session
+    {
+        get => _session;
+        set
+        {
+            if (ReferenceEquals(value, _session)) return;
+            UnsubscribeSession(_session);
+            _images.PageImageChanged -= OnPageImageChanged;
+            _images.Dispose();
+            _session = value;
+            _images  = new PageImageProvider(_session);
+            _images.PageImageChanged += OnPageImageChanged;
+            _images.SetDocument(_renderPath, _renderDocument);
+            SubscribeSession(_session);
+        }
+    }
+
+    private void SubscribeSession(DocumentSession s)
+    {
+        s.OrderChanged   += OnSessionOrderChanged;
+        s.Reset          += OnSessionReset;
+    }
+
+    private void UnsubscribeSession(DocumentSession s)
+    {
+        s.OrderChanged   -= OnSessionOrderChanged;
+        s.Reset          -= OnSessionReset;
+    }
+
+    // ── Page images changed (adjustment, rotate, crop): refresh their thumbnails ──
+    private readonly HashSet<long> _changedPageImages = new();
+    private bool _allPageImagesChanged;
+    private System.Windows.Threading.DispatcherTimer? _pageImageTimer;
+
+    private void OnPageImageChanged(long id) => Dispatcher.BeginInvoke(() => QueuePageImageRefresh(id));
+
+    private void QueuePageImageRefresh(long id)
+    {
+        if (id < 0) _allPageImagesChanged = true; else _changedPageImages.Add(id);
+        // Coalesce: slider drags change the same page many times a second.
+        _pageImageTimer ??= new System.Windows.Threading.DispatcherTimer(
+            TimeSpan.FromMilliseconds(250), System.Windows.Threading.DispatcherPriority.Background,
+            (_, _) => FlushPageImageChanges(), Dispatcher);
+        _pageImageTimer.Stop();
+        _pageImageTimer.Start();
+    }
+
+    private void FlushPageImageChanges()
+    {
+        _pageImageTimer?.Stop();
+        if (_renderDocument == null) { _changedPageImages.Clear(); _allPageImagesChanged = false; return; }
+        if (_images.IsStale) { _pageImageTimer?.Start(); return; }   // a page edit is in progress
+        IReadOnlyList<int>? pages = _allPageImagesChanged
+            ? null
+            : _changedPageImages.Select(id => _thumbIds.IndexOf(id)).Where(i => i >= 0).OrderBy(i => i).ToList();
+        _changedPageImages.Clear();
+        _allPageImagesChanged = false;
+        if (pages is { Count: 0 }) return;
+        _ = RenderThumbnailsAsync(_thumbCts.Token, pages);
+    }
+
+    // Page order changed (page edit or undo/redo): move what is still kept by page number.
+    private void OnSessionOrderChanged(long[] oldOrder, long[] newOrder)
+    {
+        var newIndex = new Dictionary<long, int>();
+        for (int i = 0; i < newOrder.Length; i++) newIndex[newOrder[i]] = i;
+
+        string? file = _session.FilePath;
+        if (file == null || newOrder.Length == 0) return;
+
+        // Bookmarks on a removed page move to the next page that is still there.
+        var oldToNew = new int[oldOrder.Length];
+        for (int j = oldOrder.Length - 1, next = newOrder.Length - 1; j >= 0; j--)
+        {
+            if (newIndex.TryGetValue(oldOrder[j], out int ni)) next = ni;
+            oldToNew[j] = next;
+        }
+        BookmarkService.Instance.RemapPages(file, p => p < oldToNew.Length ? oldToNew[p] : p);
+
+        // Annotations, memos and drawings belong to their page id: hidden while the page
+        // is deleted, back when it is restored.
+        uint PageOf(long id) => newIndex.TryGetValue(id, out int ni) ? (uint)ni : uint.MaxValue;
+        long IdOf(uint page) => page < oldOrder.Length ? oldOrder[page] : 0;
+        foreach (var a in AnnotationService.Instance.ForFile(file))
+        {
+            if (a.PageId == 0) a.PageId = IdOf(a.PageNumber);
+            if (a.PageId != 0) a.PageNumber = PageOf(a.PageId);
+        }
+        foreach (var m in MemoService.Instance.ForFile(file))
+        {
+            if (m.PageId == 0) m.PageId = IdOf(m.PageNumber);
+            if (m.PageId != 0) m.PageNumber = PageOf(m.PageId);
+        }
+        foreach (var d in DrawingService.Instance.ForFile(file))
+        {
+            if (d.PageId == 0) d.PageId = IdOf(d.PageNumber);
+            if (d.PageId != 0) d.PageNumber = PageOf(d.PageId);
+        }
+    }
+
+    // New page ids: page ids recorded on annotations no longer mean anything.
+    private void OnSessionReset()
+    {
+        string? file = _session.FilePath;
+        if (file == null) return;
+        foreach (var a in AnnotationService.Instance.ForFile(file)) a.PageId = 0;
+        foreach (var m in MemoService.Instance.ForFile(file))       m.PageId = 0;
+        foreach (var d in DrawingService.Instance.ForFile(file))    d.PageId = 0;
+    }
 
     // Renders the current page at high resolution for OCR (≈300 DPI for letter paper).
     public async Task<BitmapSource?> RenderPageForOcrAsync(uint page, uint width = 1600)
@@ -294,24 +586,12 @@ public partial class PDFReaderPage : Page
         catch { return null; }
     }
 
-    // Re-render the current page and update thumbnails with any adjusted-image overrides.
+    // Re-render the current page (and its side pages) after adjustments changed;
+    // thumbnails follow through PageImageChanged.
     public async Task RefreshWithAdjustedImagesAsync()
     {
         if (_renderDocument == null) return;
-        if (AdjustedStore == null || !AdjustedStore.HasAny) return;
         await RenderCurrentPageAsync();
-        RefreshAdjustedThumbnails();
-    }
-
-    private void RefreshAdjustedThumbnails()
-    {
-        if (AdjustedStore == null) return;
-        for (int i = 0; i < _thumbItems.Count; i++)
-        {
-            var overrideImg = AdjustedStore.Get(i);
-            if (overrideImg != null)
-                _thumbItems[i].Img.Source = overrideImg;
-        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -390,7 +670,6 @@ public partial class PDFReaderPage : Page
         if (_imageFiles.Count == 0) return;
 
         CleanupTempImagePdf();
-        AdjustedStore?.Clear();
 
         string tmpPath = System.IO.Path.Combine(
             System.IO.Path.GetTempPath(),
@@ -540,9 +819,14 @@ public partial class PDFReaderPage : Page
 
             var cleanFile = await StorageFile.GetFileFromPathAsync(renderTmp);
             _renderDocument = await WinPdf.PdfDocument.LoadFromFileAsync(cleanFile);
-            try { File.Delete(renderTmp); } catch { /* temp file, non-critical */ }
+            // The page images are rendered from this annotation-free copy; keep it until
+            // the next load (the original would show our annotations twice).
+            SetRenderFile(renderTmp, isLoadCopy: true);
+            _images.InvalidateAll();
 
             _totalPages = _renderDocument.PageCount;
+            // Same file with the same pages (e.g. reloaded after saving) keeps its page data.
+            _session.Open(filePath, (int)_totalPages);
 
             DropZone.Visibility      = Visibility.Collapsed;
             PdfPageBorder.Visibility = Visibility.Visible;
@@ -596,14 +880,30 @@ public partial class PDFReaderPage : Page
         await SaveToPathAsync(dlg.FileName);
     }
 
-    private async Task SaveToPathAsync(string outputPath)
+    /// <summary>
+    /// Saves the document under <paramref name="outputPath"/> (and continues on that file),
+    /// with the OCR results as an invisible text layer unless <paramref name="includeOcr"/> is
+    /// false. The OCR view saves through this, so its "searchable PDF" keeps the original
+    /// pages instead of rebuilding them from images.
+    /// </summary>
+    /// <returns>False when nothing was saved (no document, or the save failed and was reported).</returns>
+    public Task<bool> SaveAsAsync(string outputPath, bool includeOcr = true) => SaveToPathAsync(outputPath, includeOcr);
+
+    /// <summary>
+    /// Writes the document as <see cref="SaveAsAsync"/> would, into a separate file, and
+    /// keeps working on the current one (the OCR view's "searchable PDF" export).
+    /// </summary>
+    public Task<bool> SaveCopyAsync(string outputPath, bool includeOcr = true) => SaveToPathAsync(outputPath, includeOcr, asCopy: true);
+
+    private async Task<bool> SaveToPathAsync(string outputPath, bool includeOcr = true, bool asCopy = false)
     {
-        if (_editDocument is null || _currentFilePath is null) return;
+        if (_editDocument is null || _currentFilePath is null) return false;
+        if (asCopy && _editPdfBytes is null) return false;
 
         bool hasAdj   = _adjSettings.Count > 0 && _renderDocument != null;
         int  adjCount = hasAdj ? _adjSettings.Count : 0;
-        var  ocrData  = OcrStore?.GetOcrData(_currentFilePath);
-        bool hasOcr   = ocrData is { Count: > 0 };
+        var  ocrData  = includeOcr ? _session.OcrForSave() : new Dictionary<int, OcrPageData>();
+        bool hasOcr   = ocrData.Count > 0;
         // total = 어노테이션(1) + 페이지별 이미지 조정(adjCount) + PDF저장(1) + OCR(0~1)
         int  total    = 1 + adjCount + 1 + (hasOcr ? 1 : 0);
         int  step     = 0;
@@ -616,38 +916,49 @@ public partial class PDFReaderPage : Page
 
         string? tmpPath = null;
         var bakedResources = new List<(MemoryStream Ms, XImage Xi)>();
+        // A copy is written from the current state's bytes; the document itself stays untouched.
+        PdfDocument doc = asCopy
+            ? PdfReader.Open(new MemoryStream(_editPdfBytes!), PdfDocumentOpenMode.Modify)
+            : _editDocument;
         try
         {
             progress.Update(++step, total, "어노테이션 처리 중…");
-            EmbedAnnotationsAndMemos();
+            EmbedAnnotationsAndMemos(doc);
 
             if (hasAdj)
             {
-                await BakeAdjustmentsIntoDocAsync(_editDocument, bakedResources,
+                var baked = await BakeAdjustmentsIntoDocAsync(doc, bakedResources,
                     onPageDone: (done, pageTotal) =>
                     {
                         progress.Update(step + done, total,
                             $"이미지 조정 적용 중… ({done} / {pageTotal} 페이지)");
                     });
                 step += adjCount;
+                // Baked pages got a new frame; their OCR text goes through it too.
+                foreach (var (pi, before) in baked)
+                    if (ocrData.TryGetValue(pi, out var d)) ocrData[pi] = OcrOnBakedPage(d, before);
             }
 
             if (BookmarkService.Instance.IsDirty(_currentFilePath))
-                WriteBookmarksToOutlines(_editDocument, _currentFilePath);
+                WriteBookmarksToOutlines(doc, _currentFilePath);
 
             progress.Update(++step, total, "PDF 파일 저장 중…");
             tmpPath = System.IO.Path.Combine(
                 System.IO.Path.GetDirectoryName(outputPath)!,
                 System.IO.Path.GetRandomFileName() + ".pdf");
 
-            await Task.Run(() => _editDocument.Save(tmpPath));
+            await Task.Run(() => doc.Save(tmpPath));
 
             foreach (var (ms, xi) in bakedResources) { xi.Dispose(); ms.Dispose(); }
             bakedResources.Clear();
 
-            _editDocument.Dispose();
-            _editDocument   = null;
-            _renderDocument = null;
+            doc.Dispose();
+            if (!asCopy)
+            {
+                _editDocument   = null;
+                _renderDocument = null;
+                _images.SetDocument(null);
+            }
 
             if (hasOcr)
             {
@@ -658,7 +969,7 @@ public partial class PDFReaderPage : Page
                 try
                 {
                     await Task.Run(() =>
-                        SearchablePdfService.Save(tmpPath, tmpOcr, ocrData!,
+                        SearchablePdfService.Save(tmpPath, tmpOcr, ocrData,
                                                   replaceExistingText: true));
                 }
                 catch
@@ -673,29 +984,41 @@ public partial class PDFReaderPage : Page
             File.Move(tmpPath, outputPath, overwrite: true);
             tmpPath = null;
 
+            if (asCopy)
+            {
+                progress.Close();
+                SetStatus($"Saved a copy: {System.IO.Path.GetFileName(outputPath)}");
+                return true;
+            }
+
             if (!outputPath.Equals(_currentFilePath, StringComparison.OrdinalIgnoreCase))
             {
                 AnnotationService.Instance.RenameFile(_currentFilePath, outputPath);
+                MemoService.Instance.RenameFile(_currentFilePath, outputPath);
                 DrawingService.Instance.RenameFile(_currentFilePath, outputPath);
             }
 
             _adjSettings.Clear();
-            AdjustedStore?.Clear();
 
             // The saved file's outline now holds every bookmark; drop the in-memory
             // copies so LoadPdfAsync re-imports them once instead of duplicating.
             BookmarkService.Instance.RemoveForFile(outputPath);
+            // Same pages under the new name: OCR results and page ids stay.
+            _session.Rename(outputPath);
 
             progress.Close();
             await LoadPdfAsync(outputPath);
             SetStatus("Saved.");
+            return true;
         }
         catch (Exception ex)
         {
             progress.Close();
+            if (asCopy) doc.Dispose();
             foreach (var (ms, xi) in bakedResources) { xi?.Dispose(); ms?.Dispose(); }
             if (tmpPath != null && File.Exists(tmpPath)) File.Delete(tmpPath);
             MessageBox.Show($"Save failed:\n{ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            return false;
         }
     }
 
@@ -705,10 +1028,15 @@ public partial class PDFReaderPage : Page
     /// The streams and XImages added to <paramref name="resources"/> must be kept
     /// alive until after <see cref="PdfDocument.Save"/> is called.
     /// </summary>
-    private async Task BakeAdjustmentsIntoDocAsync(
+    /// <returns>
+    /// For each baked page, its geometry before baking: a baked page becomes its displayed
+    /// area (origin 0, no rotation, no crop), and coordinates move by <see cref="BakedPageMap"/>.
+    /// </returns>
+    private async Task<Dictionary<int, PageGeometry>> BakeAdjustmentsIntoDocAsync(
         PdfDocument doc, List<(MemoryStream Ms, XImage Xi)> resources,
         Action<int, int>? onPageDone = null)
     {
+        var baked = new Dictionary<int, PageGeometry>();
         var entries = _adjSettings.ToList();
         int done = 0;
         foreach (var (pageIdx, adjS) in entries)
@@ -732,7 +1060,7 @@ public partial class PDFReaderPage : Page
             catch { continue; }
 
             // Apply brightness / contrast / USM / etc.
-            using var adjusted = AdjApplySettingsFrom(raw, adjS);
+            using var adjusted = ImageProcessingService.ApplyAdjustments(raw, adjS);
             raw.Dispose();
 
             // Encode to JPEG at high quality to keep file size reasonable.
@@ -753,23 +1081,19 @@ public partial class PDFReaderPage : Page
             var xImg  = XImage.FromStream(imgMs);
             resources.Add((imgMs, xImg));
 
-            // Determine draw dimensions, accounting for PDF page rotation.
-            // WinRT renders in display orientation; we bake that orientation directly.
-            var page = doc.Pages[pageIdx];
-            double ptW, ptH;
-            if (page.Rotate is 90 or 270)
-            {
-                ptW = page.Height.Point;
-                ptH = page.Width.Point;
-                page.Width  = XUnit.FromPoint(ptW);
-                page.Height = XUnit.FromPoint(ptH);
-                page.Rotate = 0;
-            }
-            else
-            {
-                ptW = page.Width.Point;
-                ptH = page.Height.Point;
-            }
+            // WinRT rendered the displayed area (CropBox, rotation applied); that area
+            // becomes the whole page: MediaBox at the origin, no CropBox, no rotation.
+            var page    = doc.Pages[pageIdx];
+            var oldGeom = SearchablePdfService.GeometryOf(page);
+            var (ptW, ptH) = SearchablePdfService.DisplaySize(oldGeom);
+            TransformAnnotations(page, BakedPageMap(oldGeom));
+            page.Elements.Remove("/CropBox");
+            page.Rotate      = 0;
+            // PDFsharp keeps "landscape" from the old /Rotate and would then swap width and
+            // height for XGraphics, drawing the image shifted and scaled.
+            page.Orientation = PdfSharp.PageOrientation.Portrait;
+            page.MediaBox    = new PdfSharp.Pdf.PdfRectangle(new XPoint(0, 0), new XPoint(ptW, ptH));
+            baked[pageIdx] = oldGeom;
 
             // Discard original content streams and draw the adjusted image.
             page.Elements.Remove("/Contents");
@@ -778,6 +1102,63 @@ public partial class PDFReaderPage : Page
 
             onPageDone?.Invoke(++done, entries.Count);
         }
+        return baked;
+    }
+
+    /// <summary>
+    /// User space of a page before baking → user space of the baked page, whose origin is
+    /// the bottom-left of what was displayed (rotation and crop applied).
+    /// </summary>
+    private static Func<double, double, (double U, double V)> BakedPageMap(PageGeometry before)
+    {
+        var (w, h) = SearchablePdfService.DisplaySize(before);
+        return (u, v) =>
+        {
+            var (x, y) = SearchablePdfService.UserToImage(u, v, w, h, before);
+            return (x, h - y);
+        };
+    }
+
+    // Moves every annotation of the page (ours and others): /Rect, /QuadPoints, /L.
+    private static void TransformAnnotations(PdfPage page, Func<double, double, (double U, double V)> map)
+    {
+        var annots = page.Elements.GetArray("/Annots");
+        if (annots == null) return;
+        foreach (var item in annots.Elements)
+        {
+            var d = (item is PdfSharp.Pdf.Advanced.PdfReference r ? r.Value : item) as PdfDictionary;
+            if (d == null) continue;
+            if (d.Elements.GetArray("/Rect") is { Elements.Count: 4 } rect)
+            {
+                var a = map(GetPdfReal(rect.Elements[0]), GetPdfReal(rect.Elements[1]));
+                var b = map(GetPdfReal(rect.Elements[2]), GetPdfReal(rect.Elements[3]));
+                d.Elements["/Rect"] = MakePdfArray(Math.Min(a.U, b.U), Math.Min(a.V, b.V),
+                                                   Math.Max(a.U, b.U), Math.Max(a.V, b.V));
+            }
+            foreach (var key in new[] { "/QuadPoints", "/L" })
+            {
+                if (d.Elements.GetArray(key) is not { } arr || arr.Elements.Count % 2 != 0) continue;
+                var moved = new List<double>();
+                for (int k = 0; k < arr.Elements.Count; k += 2)
+                {
+                    var q = map(GetPdfReal(arr.Elements[k]), GetPdfReal(arr.Elements[k + 1]));
+                    moved.Add(q.U); moved.Add(q.V);
+                }
+                d.Elements[key] = MakePdfArray(moved.ToArray());
+            }
+        }
+    }
+
+    // OCR text of a baked page: same OCR image, placed through the page's new frame.
+    private static OcrPageData OcrOnBakedPage(OcrPageData data, PageGeometry before)
+    {
+        var g0  = data.Geometry ?? before;
+        var map = BakedPageMap(before);
+        var a = map(g0.Box.X, g0.Box.Y);
+        var b = map(g0.Box.X + g0.Box.Width, g0.Box.Y + g0.Box.Height);
+        var box = new PdfPageBox(Math.Min(a.U, b.U), Math.Min(a.V, b.V), Math.Abs(b.U - a.U), Math.Abs(b.V - a.V));
+        int rot = ((g0.Rotation - before.Rotation) % 360 + 360) % 360;
+        return data with { Geometry = new PageGeometry(rot, box) };
     }
 
     // ─── Undo / Redo implementation ──────────────────────────────────────────
@@ -795,10 +1176,10 @@ public partial class PDFReaderPage : Page
         BookmarkService.Instance.ForFile(_currentFilePath).ToDictionary(b => b.Id, b => b.PageNumber);
 
     private UndoState CaptureState() => new(
-        _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value),
+        _session.CaptureOrder(),
+        _session.Adjust.SnapshotById(),
         SnapshotDrawings(),
-        SnapshotBookmarkPages(),
-        new Dictionary<int, string>(_pageImagePaths));
+        SnapshotBookmarkPages());
 
     private UndoSnapshot CaptureSnapshot(byte[] pdf) => new(_snapshotStore.Capture(pdf), null, CaptureState());
 
@@ -840,68 +1221,17 @@ public partial class PDFReaderPage : Page
         PushUndoEntry(CaptureSnapshot(pdfSnap));
     }
 
+    // A snapshot step whose state was captured before the edit began (page delete).
+    private void PushSnapshotUndo(UndoState before)
+    {
+        byte[]? pdfSnap = _editPdfBytes;
+        if (pdfSnap == null) return;
+        PushUndoEntry(new UndoSnapshot(_snapshotStore.Capture(pdfSnap), null, before));
+    }
+
     // Records a page edit; <paramref name="before"/> is the state captured before the edit began.
     private void PushUndoEdit(PageEdit edit, UndoState before) =>
-        PushUndoEntry(new UndoSnapshot(null, edit, before, PageMapFor(edit)));
-
-    // Called right after the edit was applied.
-    private PageMap? PageMapFor(PageEdit edit) => edit switch
-    {
-        ReorderEdit o  => new PageMap(o.NewOrder, o.NewOrder.Length),
-        InsertEdit ins => InsertMap(ins.At, ins.Count, _editDocument?.Pages.Count ?? 0),
-        _              => null,   // rotate / crop keep every page in place
-    };
-
-    private static PageMap InsertMap(int at, int count, int newCount)
-    {
-        var map = new int[newCount];
-        for (int i = 0; i < newCount; i++)
-            map[i] = i < at ? i : i < at + count ? -1 : i - count;
-        return new PageMap(map, newCount - count);
-    }
-
-    /// <summary>
-    /// Moves per-page data along with a page edit: adjustment settings, adjusted images
-    /// (dropped for <paramref name="reshaped"/> pages, whose rendering changed) and OCR
-    /// results. With <paramref name="ocrOnly"/> (undo/redo) the adjustments are left to
-    /// the restored undo state.
-    /// </summary>
-    /// <returns>OCR results of pages the map removed (old index → data), or null.</returns>
-    private IReadOnlyDictionary<int, OcrPageData>? MovePageData(PageMap? map, ISet<int>? reshaped = null, bool ocrOnly = false)
-    {
-        if (!ocrOnly)
-        {
-            if (map != null)
-            {
-                var moved = new Dictionary<int, AdjSettings>();
-                for (int i = 0; i < map.NewToOld.Length; i++)
-                    if (map.NewToOld[i] >= 0 && _adjSettings.TryGetValue(map.NewToOld[i], out var adj))
-                        moved[i] = adj;
-                _adjSettings.Clear();
-                foreach (var (k, v) in moved) _adjSettings[k] = v;
-            }
-            AdjustedStore?.Remap(map?.NewToOld, reshaped);
-        }
-
-        // OCR results carry the page geometry they were made with, so rotate/crop
-        // need no change; only moved pages do.
-        if (map == null || _currentFilePath == null || OcrStore == null) return null;
-        var ocr = OcrStore.GetOcrData(_currentFilePath);
-        if (ocr == null && map.RestoredOcr == null) return null;
-        ocr ??= new Dictionary<int, OcrPageData>();
-        var movedOcr = new Dictionary<int, OcrPageData>();
-        for (int i = 0; i < map.NewToOld.Length; i++)
-            if (map.NewToOld[i] >= 0 && ocr.TryGetValue(map.NewToOld[i], out var d))
-                movedOcr[i] = d;
-        if (map.RestoredOcr != null)
-            foreach (var (i, d) in map.RestoredOcr)
-                if (i < map.NewToOld.Length) movedOcr[i] = d;
-        OcrStore.SetOcrData(_currentFilePath, movedOcr);
-
-        var kept    = new HashSet<int>(map.NewToOld.Where(o => o >= 0));
-        var dropped = ocr.Where(kv => !kept.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value);
-        return dropped.Count > 0 ? dropped : null;
-    }
+        PushUndoEntry(new UndoSnapshot(null, edit, before));
 
     private void PushUndoEntry(UndoSnapshot entry)
     {
@@ -918,7 +1248,6 @@ public partial class PDFReaderPage : Page
         var prev = _undoStack[^1]; _undoStack.RemoveAt(_undoStack.Count - 1);
         if (MakeCounterpart(prev, counterpartReverts: false) is { } redo) _redoStack.Add(redo);
         await ApplyUndoEntryAsync(prev, revert: true);
-        if (prev.Map != null) MovePageData(prev.Map.Inverse(), ocrOnly: true);
         ReleaseEntry(prev);
         UndoRedoChanged?.Invoke();
     }
@@ -929,7 +1258,6 @@ public partial class PDFReaderPage : Page
         var next = _redoStack[^1]; _redoStack.RemoveAt(_redoStack.Count - 1);
         if (MakeCounterpart(next, counterpartReverts: true) is { } undo) _undoStack.Add(undo);
         await ApplyUndoEntryAsync(next, revert: false);
-        if (next.Map != null) MovePageData(next.Map, ocrOnly: true);
         ReleaseEntry(next);
         UndoRedoChanged?.Invoke();
     }
@@ -939,8 +1267,8 @@ public partial class PDFReaderPage : Page
     private UndoSnapshot? MakeCounterpart(UndoSnapshot entry, bool counterpartReverts)
     {
         if (entry.Edit != null && (counterpartReverts || entry.Edit is not InsertEdit))
-            return new UndoSnapshot(null, entry.Edit, CaptureState(), entry.Map);
-        return _editPdfBytes != null ? CaptureSnapshot(_editPdfBytes) with { Map = entry.Map } : null;
+            return new UndoSnapshot(null, entry.Edit, CaptureState());
+        return _editPdfBytes != null ? CaptureSnapshot(_editPdfBytes) : null;
     }
 
     private async Task ApplyUndoEntryAsync(UndoSnapshot entry, bool revert)
@@ -1000,11 +1328,13 @@ public partial class PDFReaderPage : Page
         {
             case RotateEdit r:
                 ApplyRotation(r.Pages, revert ? -r.Angle : r.Angle);
+                _session.MarkContentChanged(r.Pages);
                 break;
 
             case CropEdit c:
                 for (int i = 0; i < c.Pages.Length; i++)
                     SetCropRect(_editDocument.Pages[c.Pages[i]], revert ? c.Before[i] : c.After[i]);
+                _session.MarkContentChanged(c.Pages);
                 break;
 
             case ReorderEdit o:
@@ -1024,14 +1354,12 @@ public partial class PDFReaderPage : Page
 
     private void RestoreState(UndoState state)
     {
-        // Restore image adjustment settings for all pages.
-        _adjSettings.Clear();
-        foreach (var (k, v) in state.Adj) _adjSettings[k] = v;
-        _adjUndoPushedForPage = -1;
-        AdjustedStore?.Clear();
+        // Page order first: OCR results, source images and annotations follow their pages.
+        _session.RestoreOrder(state.Order);
 
-        _pageImagePaths.Clear();
-        foreach (var (k, v) in state.PageImages) _pageImagePaths[k] = v;
+        // Restore image adjustment settings for all pages.
+        _session.Adjust.RestoreById(state.Adj);
+        _adjUndoPushedForPage = -1;
 
         if (_currentFilePath == null) return;
 
@@ -1090,7 +1418,10 @@ public partial class PDFReaderPage : Page
             _totalPages = _renderDocument.PageCount;
             _currentPage = Math.Min(_currentPage, _totalPages > 0 ? _totalPages - 1 : 0);
 
+            // Page order first, then the file rendered with that order.
             RestoreState(snapshot.State);
+            SetRenderFile(tmpPath);
+            _images.InvalidateAll();   // a snapshot may differ from the current pages in content
 
             UpdateNavButtons();
             await RenderCurrentPageAsync();  // also calls LoadAdjSettingsForPage → updates sliders
@@ -1127,21 +1458,23 @@ public partial class PDFReaderPage : Page
         if (_currentFilePath is null) { SetStatus("Open a PDF first."); return; }
 
         string title;
+        uint   page = _currentPage;
         if (_selectedIndices.Count > 0)
         {
             var raw = string.Join(" ",
                 _readingOrder.Where(_selectedIndices.Contains).Select(i => _pageWords[i].Text));
             title = raw.Length > 60 ? raw[..57] + "…" : raw;
+            page  = ViewPage;
         }
         else
         {
-            title = $"Page {_currentPage + 1}";
+            title = $"Page {page + 1}";
         }
 
         BookmarkService.Instance.Add(new Bookmark
         {
             FilePath   = _currentFilePath,
-            PageNumber = _currentPage,
+            PageNumber = page,
             Title      = title
         });
         SetStatus($"Bookmark added: \"{title}\"");
@@ -1819,49 +2152,79 @@ public partial class PDFReaderPage : Page
 
         UpdateGlobalScrollBar();
 
-        double prevH = PrevPagesPanel.ActualHeight;
+        // Every page on screen is fully usable, so the current page only moves (and the
+        // pages around it are rebuilt) once it has left the view; then the page in the
+        // middle of the view becomes current, in place. Not while selecting or drawing.
+        if (Mouse.LeftButton == MouseButtonState.Pressed) return;
+        double top = ContentY(PdfPageBorder), bottom = top + PdfPageBorder.ActualHeight;
+        double viewTop = PdfScrollViewer.VerticalOffset, viewBottom = viewTop + PdfScrollViewer.ViewportHeight;
+        if (bottom > viewTop && top < viewBottom) return;
+        if (PageAtContentY((viewTop + viewBottom) / 2) is int page && page != (int)_currentPage)
+            await ActivatePageAsync(page);
+    }
 
-        // Forward page transition: user scrolled completely past current page into the next.
-        if (e.VerticalChange > 0 &&
-            _currentPage < _totalPages - 1 &&
-            NextPagesPanel.Children.Count > 0)
+    // ── Neighbouring pages ───────────────────────────────────────────────────
+
+    // Rendered previews above/below the current page: (page index, element).
+    private IEnumerable<(int Page, FrameworkElement Element)> SidePages()
+    {
+        int n = PrevPagesPanel.Children.Count;
+        for (int k = 0; k < n; k++)
+            if (PrevPagesPanel.Children[k] is FrameworkElement fe)
+                yield return ((int)_currentPage - (n - k), fe);
+        for (int k = 0; k < NextPagesPanel.Children.Count; k++)
+            if (NextPagesPanel.Children[k] is FrameworkElement fe)
+                yield return ((int)_currentPage + 1 + k, fe);
+    }
+
+    private double ContentY(FrameworkElement element) =>
+        element.TranslatePoint(new Point(0, 0), (UIElement)PdfScrollViewer.Content).Y;
+
+    // The page whose area (gap above it included) holds content position y.
+    private int? PageAtContentY(double y)
+    {
+        if (PdfPageBorder.Visibility != Visibility.Visible) return null;
+        double top = ContentY(PdfPageBorder);
+        if (y >= top - PageGap && y <= top + PdfPageBorder.ActualHeight) return (int)_currentPage;
+        foreach (var (page, el) in SidePages())
         {
-            double boundary = prevH + PdfPageBorder.ActualHeight + PageGap;
-            if (PdfScrollViewer.VerticalOffset >= boundary)
-            {
-                double newOffset = PdfScrollViewer.VerticalOffset - boundary;
-                _pageTransitioning = true;
-                _currentPage++;
-                UpdateNavButtons();
-                await RenderCurrentPageAsync();
-                await Dispatcher.InvokeAsync(() => { },
-                    System.Windows.Threading.DispatcherPriority.Render);
-                double prevHNew = PrevPagesPanel.ActualHeight;
-                PdfScrollViewer.ScrollToVerticalOffset(prevHNew + Math.Max(0, newOffset));
-                _pageTransitioning = false;
-            }
+            double t = ContentY(el);
+            if (y >= t - PageGap && y <= t + el.ActualHeight) return page;
         }
+        return null;
+    }
 
-        // Backward page transition: user scrolled past the top of the prev-page previews.
-        if (e.VerticalChange < 0 &&
-            _currentPage > 0 &&
-            PrevPagesPanel.Children.Count > 0 &&
-            PdfScrollViewer.VerticalOffset <= 0)
+    /// <summary>
+    /// Makes a neighbouring page the current page, keeping it where it is on screen.
+    /// </summary>
+    private async Task ActivatePageAsync(int page)
+    {
+        if (_pageTransitioning || page == (int)_currentPage || page < 0 || page >= (int)_totalPages) return;
+        var target = SidePages().FirstOrDefault(sp => sp.Page == page).Element;
+        if (target == null) return;
+        double screenY = ContentY(target) - PdfScrollViewer.VerticalOffset;
+
+        _pageTransitioning = true;
+        try
         {
-            _pageTransitioning = true;
-            _currentPage--;
+            _currentPage = (uint)page;
             UpdateNavButtons();
-            await RenderCurrentPageAsync();
-            await Dispatcher.InvokeAsync(() => { },
-                System.Windows.Threading.DispatcherPriority.Render);
-            double prevHNew = PrevPagesPanel.ActualHeight;
-            double bottomTarget = prevHNew + PdfPageBorder.ActualHeight - PdfScrollViewer.ViewportHeight;
-            PdfScrollViewer.ScrollToVerticalOffset(Math.Max(prevHNew, bottomTarget));
-            _pageTransitioning = false;
+            await RenderCurrentPageAsync();   // rebuilds the previews around the new page
+            // The pages below are added a moment later; without them the content may be too
+            // short for the offset we need and the view would jump.
+            for (int i = 0; i < 20 && _currentPage + 1 < _totalPages && NextPagesPanel.Children.Count == 0; i++)
+                await Task.Delay(15);
+            await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Render);
+            PdfScrollViewer.ScrollToVerticalOffset(Math.Max(0, ContentY(PdfPageBorder) - screenY));
+            await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Render);
+            UpdateGlobalScrollBar();
         }
+        finally { _pageTransitioning = false; }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  Rendering + Text Overlay    // ═══════════════════════════════════════════════════════════════════════════
+    //  Rendering + Text Overlay    // ═══════════════════════════════════════════════════════════════════════════
     //  Rendering + Text Overlay
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1881,39 +2244,10 @@ public partial class PDFReaderPage : Page
         {
             BitmapSource displaySrc;
 
-            // PDF mode (includes images-as-temp-PDF)
-            using var pdfPage = _renderDocument!.GetPage(_currentPage);
-            using var stream  = new InMemoryRandomAccessStream();
-            var opts = new WinPdf.PdfPageRenderOptions
-            {
-                DestinationWidth = (uint)(RenderBaseWidth * _zoomLevel)
-            };
-            await pdfPage.RenderToStreamAsync(stream, opts);
-            stream.Seek(0);
-            var ms = new MemoryStream();
-            await stream.AsStream().CopyToAsync(ms);
-            ms.Position = 0;
-            var pdfBmp = new BitmapImage();
-            pdfBmp.BeginInit();
-            pdfBmp.StreamSource = ms;
-            pdfBmp.CacheOption  = BitmapCacheOption.OnLoad;
-            pdfBmp.EndInit();
-            pdfBmp.Freeze();
-            displaySrc = pdfBmp;
-
+            // PDF mode (includes images-as-temp-PDF); the page's adjustment is applied by the provider.
+            displaySrc = await _images.GetAsync((int)_currentPage, (int)(RenderBaseWidth * _zoomLevel))
+                         ?? throw new InvalidOperationException("Page could not be rendered.");
             BitmapSource finalSrc = displaySrc;
-            if (_adjSettings.TryGetValue((int)_currentPage, out var adjS))
-            {
-                using var drawBmp = BitmapSourceToDrawingBitmap(displaySrc);
-                var adjusted = AdjApplySettingsFrom(drawBmp, adjS);
-                finalSrc = BitmapToBitmapImage(adjusted);
-                adjusted.Dispose();
-                AdjustedStore?.Set((int)_currentPage, (BitmapImage)finalSrc);
-            }
-            else
-            {
-                AdjustedStore?.Remove((int)_currentPage);
-            }
 
             PdfPageImage.Source  = finalSrc;
             PdfPageImage.Width   = RenderBaseWidth * _zoomLevel;
@@ -1924,7 +2258,7 @@ public partial class PDFReaderPage : Page
             int dispH = displaySrc.PixelHeight;
 
             if (_currentFilePath is not null && _renderDocument is not null)
-                await PopulateTextOverlayAsync(_currentFilePath, (int)_currentPage, dispW, dispH);
+                await PopulateTextOverlayAsync(_currentFilePath, (int)_currentPage, dispW, dispH, _mainView);
 
             // Apply search highlights over the freshly built word borders.
             ComputeSearchHighlights();
@@ -1937,6 +2271,8 @@ public partial class PDFReaderPage : Page
             if (!preserveScroll)
             {
                 // Clear stale previews while new page renders.
+                DropSideViews(PrevPagesPanel);
+                DropSideViews(NextPagesPanel);
                 PrevPagesPanel.Children.Clear();
                 NextPagesPanel.Children.Clear();
 
@@ -1986,43 +2322,55 @@ public partial class PDFReaderPage : Page
         return Math.Max(1, (int)Math.Ceiling(viewH / pageH));
     }
 
-    // Render a single page from the document into an Image element.
-    private async Task<System.Windows.Controls.Image> RenderPageImageAsync(uint pageIndex)
+    // A neighbouring page: image, annotation/memo/drawing canvases and a text layer, with
+    // the same input handling as the current page.
+    private async Task<FrameworkElement> RenderPageImageAsync(uint pageIndex)
     {
-        BitmapSource pageSrc;
-        using var pdfPage = _renderDocument!.GetPage(pageIndex);
-        using var stream  = new InMemoryRandomAccessStream();
-        var opts = new WinPdf.PdfPageRenderOptions { DestinationWidth = (uint)(RenderBaseWidth * _zoomLevel) };
-        await pdfPage.RenderToStreamAsync(stream, opts);
-        stream.Seek(0);
-        var ms = new MemoryStream();
-        await stream.AsStream().CopyToAsync(ms);
-        ms.Position = 0;
-        var bmp = new BitmapImage();
-        bmp.BeginInit();
-        bmp.StreamSource = ms;
-        bmp.CacheOption  = BitmapCacheOption.OnLoad;
-        bmp.EndInit();
-        bmp.Freeze();
-        pageSrc = bmp;
-
-        var overrideImg2 = AdjustedStore?.Get((int)pageIndex);
-        var finalSrc2    = overrideImg2 ?? pageSrc;
-
+        var src = await _images.GetAsync((int)pageIndex, (int)(RenderBaseWidth * _zoomLevel));
+        double w = RenderBaseWidth * _zoomLevel;
         var img = new System.Windows.Controls.Image
         {
-            Source  = finalSrc2,
-            Width   = RenderBaseWidth * _zoomLevel,
+            Source  = src,
+            Width   = w,
             Height  = double.NaN,
             Stretch = System.Windows.Media.Stretch.Uniform
         };
         RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
-        return img;
+        if (src == null || _editDocument == null || pageIndex >= _editDocument.Pages.Count) return img;
+
+        double h = w * src.PixelHeight / src.PixelWidth;
+        var view = new PageView
+        {
+            Page        = pageIndex,
+            Image       = img,
+            Annotation  = new Canvas { IsHitTestVisible = false, Background = Brushes.Transparent },
+            Memo        = new Canvas { IsHitTestVisible = false, Background = Brushes.Transparent },
+            Drawing     = new Canvas { Background = Brushes.Transparent },
+            TextOverlay = new Canvas { Background = Brushes.Transparent, Cursor = Cursors.Arrow, Focusable = true,
+                                       ContextMenu = new ContextMenu() },
+        };
+        var grid = new Grid { Width = w, Height = h };
+        foreach (UIElement el in new UIElement[] { img, view.Annotation, view.Memo, view.Drawing, view.TextOverlay })
+            grid.Children.Add(el);
+        HookPageInput(view);
+        _sideViews.Add(view);
+        if (_currentFilePath != null)
+            _ = PopulateTextOverlayAsync(_currentFilePath, (int)pageIndex, w, h, view);
+        return grid;
+    }
+
+    // The previews of a panel are being replaced: forget their page views.
+    private void DropSideViews(Panel panel)
+    {
+        var gone = panel.Children.OfType<Border>().Select(b => b.Child).ToHashSet();
+        _sideViews.RemoveAll(v => v.Image.Parent is UIElement holder && gone.Contains(holder));
+        if (!AllViews.Contains(_view)) _view = _mainView;
     }
 
     // Render N prev pages into PrevPagesPanel (oldest page first at top).
     private async Task RenderPrevPagesAsync(double pageH)
     {
+        DropSideViews(PrevPagesPanel);
         PrevPagesPanel.Children.Clear();
         if (_renderDocument is null) return;
         if (_currentPage == 0) return;
@@ -2048,6 +2396,7 @@ public partial class PDFReaderPage : Page
     // Render N next pages into NextPagesPanel (nearest page first at top).
     private async Task RenderNextPagesAsync(double pageH)
     {
+        DropSideViews(NextPagesPanel);
         NextPagesPanel.Children.Clear();
         if (_renderDocument is null) return;
         if (_currentPage + 1 >= _totalPages) return;
@@ -2069,20 +2418,30 @@ public partial class PDFReaderPage : Page
         catch { NextPagesPanel.Children.Clear(); }
     }
 
+    /// <summary>
+    /// Builds <paramref name="target"/>'s text layer (words of the PDF, or of this session's
+    /// OCR) and draws its annotations, memos and drawings. Each page's latest call wins
+    /// (overlapping renders used to append the words twice).
+    /// </summary>
     private async Task PopulateTextOverlayAsync(string pdfPath, int pageIndex,
-                                                double imageWidth, double imageHeight)
+                                                double imageWidth, double imageHeight, PageView target)
     {
-        _pageWords.Clear();
-        _pageLines.Clear();
-        _readingOrder.Clear();
-        _wordToOrder.Clear();
-        _selectedIndices.Clear();
-        _lastClickedOrder = -1;
-        _lastHoverIndex   = -1;
-        _isDragging       = false;
-        _dragAnchorOrder  = -1;
-        _dragAnchorLine   = null;
-        TextOverlayCanvas.Children.Clear();
+        int generation = ++target.Generation;
+        target.Page = (uint)pageIndex;
+        WithView(target, () =>
+        {
+            _pageWords.Clear();
+            _pageLines.Clear();
+            _readingOrder.Clear();
+            _wordToOrder.Clear();
+            _selectedIndices.Clear();
+            _lastClickedOrder = -1;
+            _lastHoverIndex   = -1;
+            _isDragging       = false;
+            _dragAnchorOrder  = -1;
+            _dragAnchorLine   = null;
+            TextOverlayCanvas.Children.Clear();
+        });
 
         // Use the pre-captured bytes (set after each Save in LoadPdfAsync / ReloadRenderDocumentAsync).
         // PdfPig normalises word coordinates to the visual page space for any /Rotate value,
@@ -2097,12 +2456,9 @@ public partial class PDFReaderPage : Page
             int rotDeg = 0;
             try
             {
-                PigPdf.PdfDocument doc = editBytes != null
-                    ? PigPdf.PdfDocument.Open(editBytes)
-                    : PigPdf.PdfDocument.Open(pdfPath);
-
-                using (doc)
+                using (var lease = AcquirePigDocument(editBytes, pdfPath))
                 {
+                    var doc = lease.Document;
                     var page = doc.GetPage(pageIndex + 1);
 
                     // PdfPig word coordinates are relative to the CropBox corner, Y increases upward.
@@ -2155,6 +2511,21 @@ public partial class PDFReaderPage : Page
             catch { /* non-searchable PDF */ }
             return (result, rotDeg);
         });
+        if (generation != target.Generation) return;   // a newer render of this page took over
+        WithView(target, () => ApplyTextOverlay(pageIndex, words, pageRotation, imageWidth, imageHeight,
+                                                isCurrentPage: ReferenceEquals(target, _mainView)));
+    }
+
+    private void ApplyTextOverlay(int pageIndex, List<WordBox> words, int pageRotation,
+                                  double imageWidth, double imageHeight, bool isCurrentPage)
+    {
+        // Pages OCR'd in this session: select and search their OCR text (also scanned
+        // pages, before the text layer is saved into the file).
+        if (OcrWordsForPage(pageIndex, imageWidth, imageHeight) is { } ocrWords)
+        {
+            words        = ocrWords;
+            pageRotation = 0;   // only used when the OCR text runs horizontally on screen
+        }
 
         _currentPageRotation = pageRotation;
         _pageWords.AddRange(words);
@@ -2177,23 +2548,28 @@ public partial class PDFReaderPage : Page
             TextOverlayCanvas.Children.Add(border);
         }
 
-        _selectedAnnotation = null;
-        CloseAnnotationPopup();
+        if (isCurrentPage)
+        {
+            _selectedAnnotation = null;
+            CloseAnnotationPopup();
+        }
         AnnotationCanvas.Width  = imageWidth;
         AnnotationCanvas.Height = imageHeight;
         MemoCanvas.Width  = imageWidth;
         MemoCanvas.Height = imageHeight;
 
-        if (_editDocument != null && _currentPage < (uint)_editDocument.Pages.Count)
+        if (_editDocument != null && pageIndex < _editDocument.Pages.Count)
         {
-            var p = _editDocument.Pages[(int)_currentPage];
+            var p = _editDocument.Pages[pageIndex];
             _currentPagePdfWidth  = p.Width.Point;
             _currentPagePdfHeight = p.Height.Point;
+            _currentPageGeometry  = SearchablePdfService.GeometryOf(p);
         }
         else
         {
             _currentPagePdfWidth  = imageWidth;
             _currentPagePdfHeight = imageHeight;
+            _currentPageGeometry  = new PageGeometry(0, new PdfPageBox(0, 0, imageWidth, imageHeight));
         }
 
         DrawAnnotations();
@@ -2203,8 +2579,91 @@ public partial class PDFReaderPage : Page
         DrawingCanvas.Height = imageHeight;
         RefreshDrawingCanvas();
 
-        CropCanvas.Width  = imageWidth;
-        CropCanvas.Height = imageHeight;
+        if (isCurrentPage)
+        {
+            CropCanvas.Width  = imageWidth;
+            CropCanvas.Height = imageHeight;
+        }
+        else
+        {
+            ComputeSearchHighlights();
+            RefreshHighlights();
+        }
+    }
+
+    // PdfPig document of the current bytes, opened once and shared (one user at a time).
+    private readonly SemaphoreSlim _pigLock = new(1, 1);
+    private byte[]?             _pigBytes;
+    private PigPdf.PdfDocument? _pigDoc;
+
+    private sealed class PigLease : IDisposable
+    {
+        private readonly SemaphoreSlim _lock;
+        public PigPdf.PdfDocument Document { get; }
+        public PigLease(SemaphoreSlim l, PigPdf.PdfDocument d) { _lock = l; Document = d; }
+        public void Dispose() => _lock.Release();
+    }
+
+    private PigLease AcquirePigDocument(byte[]? bytes, string path)
+    {
+        _pigLock.Wait();
+        try
+        {
+            if (_pigDoc == null || !ReferenceEquals(bytes, _pigBytes) || bytes == null)
+            {
+                _pigDoc?.Dispose();
+                _pigDoc   = bytes != null ? PigPdf.PdfDocument.Open(bytes) : PigPdf.PdfDocument.Open(path);
+                _pigBytes = bytes;
+            }
+            return new PigLease(_pigLock, _pigDoc);
+        }
+        catch { _pigLock.Release(); throw; }
+    }
+
+    /// <summary>
+    /// Word boxes of the page's OCR results in pixels of the displayed image, or null when
+    /// the page has none, or when it was rotated since OCR (its text would run vertically).
+    /// Each OCR line is split into words, spread over the line box by character count.
+    /// </summary>
+    private List<WordBox>? OcrWordsForPage(int pageIndex, double imageWidth, double imageHeight)
+    {
+        if (!_session.OcrRegions.TryGetValue(pageIndex, out var regions) || regions.Count == 0) return null;
+        if (!_session.OcrSize.TryGetValue(pageIndex, out var size) || size.w <= 0 || size.h <= 0) return null;
+        if (_editDocument is null || pageIndex >= _editDocument.Pages.Count) return null;
+
+        var page = _editDocument.Pages[pageIndex];
+        var now  = new PageGeometry(((page.Rotate % 360) + 360) % 360, SearchablePdfService.VisibleBox(page));
+        PageGeometry? then = _session.OcrGeometry.TryGetValue(pageIndex, out var g) ? g : null;
+        if (then is { } t && t.Rotation != now.Rotation) return null;
+
+        int dw = (int)Math.Round(imageWidth), dh = (int)Math.Round(imageHeight);
+        (double X, double Y) Map(double x, double y)
+        {
+            if (then is not { } from) return (x * imageWidth / size.w, y * imageHeight / size.h);
+            var (u, v) = SearchablePdfService.ImageToUser(x, y, size.w, size.h, from);
+            return SearchablePdfService.UserToImage(u, v, dw, dh, now);
+        }
+
+        var result = new List<WordBox>();
+        foreach (var r in regions)
+        {
+            if (string.IsNullOrWhiteSpace(r.Text) || r.Points.Length == 0) continue;
+            var pts  = r.Points.Select(pt => Map(pt.X, pt.Y)).ToList();
+            double left = pts.Min(q => q.X), right  = pts.Max(q => q.X);
+            double top  = pts.Min(q => q.Y), bottom = pts.Max(q => q.Y);
+            if (right - left < 1 || bottom - top < 1) continue;
+
+            string text = r.Text.Trim();
+            double perChar = (right - left) / text.Length;
+            int pos = 0;
+            foreach (var word in text.Split(' '))
+            {
+                if (word.Length > 0)
+                    result.Add(new WordBox(word, left + pos * perChar, top, word.Length * perChar, bottom - top));
+                pos += word.Length + 1;
+            }
+        }
+        return result;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2315,6 +2774,7 @@ public partial class PDFReaderPage : Page
 
     private void TextOverlayCanvas_MouseDown(object sender, MouseButtonEventArgs e)
     {
+        UseViewOf(sender, pressing: true);
         var pos = e.GetPosition(TextOverlayCanvas);
 
         // Close any open memo popup on canvas click
@@ -2392,6 +2852,7 @@ public partial class PDFReaderPage : Page
 
     private void TextOverlayCanvas_MouseMove(object sender, MouseEventArgs e)
     {
+        UseViewOf(sender);
         var pos = e.GetPosition(TextOverlayCanvas);
 
         if (e.LeftButton == MouseButtonState.Pressed)
@@ -2405,6 +2866,18 @@ public partial class PDFReaderPage : Page
 
             if (_isDragging && _dragAnchorOrder >= 0)
             {
+                AutoScrollWhileDragging(e);
+                var anchorView = _view;
+                var overView   = NearestView(anchorView, pos);
+                if (!ReferenceEquals(overView, anchorView))
+                {
+                    var posInOver = anchorView.TextOverlay.TranslatePoint(pos, overView.TextOverlay);
+                    ExtendSelectionAcrossPages(anchorView, _dragAnchorOrder, overView, posInOver);
+                    UpdateSelectionStatus();
+                    return;
+                }
+                ClearSelectionExcept(anchorView);   // came back onto the page the drag started on
+
                 // For vertical text (90°/270°), lock to anchor column when dragging primarily vertically.
                 // This prevents minor X wobble from jumping across the narrow columns.
                 bool vertDrag = _isVerticalText && _dragAnchorLine != null;
@@ -2454,6 +2927,7 @@ public partial class PDFReaderPage : Page
 
     private void TextOverlayCanvas_MouseUp(object sender, MouseButtonEventArgs e)
     {
+        UseViewOf(sender);
         TextOverlayCanvas.ReleaseMouseCapture();
         var pos   = e.GetPosition(TextOverlayCanvas);
         bool ctrl  = Keyboard.IsKeyDown(Key.LeftCtrl)  || Keyboard.IsKeyDown(Key.RightCtrl);
@@ -2505,6 +2979,7 @@ public partial class PDFReaderPage : Page
 
     private void TextOverlayCanvas_MouseLeave(object sender, MouseEventArgs e)
     {
+        UseViewOf(sender);
         if (_lastHoverIndex >= 0 && !_selectedIndices.Contains(_lastHoverIndex))
         {
             SetWordBackground(_lastHoverIndex, Brushes.Transparent);
@@ -2518,14 +2993,14 @@ public partial class PDFReaderPage : Page
 
     private void TextOverlayCanvas_KeyDown(object sender, KeyEventArgs e)
     {
+        UseViewOf(sender);
         bool ctrl = Keyboard.IsKeyDown(Key.LeftCtrl) || Keyboard.IsKeyDown(Key.RightCtrl);
 
         if (ctrl && e.Key == Key.C)      { CopySelectionToClipboard(); e.Handled = true; }
         else if (ctrl && e.Key == Key.A) { SelectAllWords();            e.Handled = true; }
         else if (e.Key == Key.Escape)
         {
-            _selectedIndices.Clear();
-            RefreshHighlights();
+            ClearSelectionExcept(null);
             UpdateSelectionStatus();
             e.Handled = true;
         }
@@ -2542,11 +3017,10 @@ public partial class PDFReaderPage : Page
 
     private void CopySelectionToClipboard()
     {
-        if (_selectedIndices.Count == 0) return;
-        var text = string.Join(" ",
-            _readingOrder.Where(_selectedIndices.Contains).Select(i => _pageWords[i].Text));
-        Clipboard.SetText(text);
-        SetStatus($"Copied {_selectedIndices.Count} word(s) to clipboard.");
+        int count = SelectedWordCount;
+        if (count == 0) return;
+        Clipboard.SetText(SelectedText());
+        SetStatus($"Copied {count} word(s) to clipboard.");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2745,26 +3219,25 @@ public partial class PDFReaderPage : Page
 
     private void UpdateSelectionStatus()
     {
-        bool hasSel = _selectedIndices.Count > 0;
-        BtnHighlight.IsEnabled = hasSel;
+        int count = SelectedWordCount;
+        BtnHighlight.IsEnabled = count > 0;
 
-        if (!hasSel)
+        if (count == 0)
         {
-            SetStatus($"Page {_currentPage + 1} / {_totalPages}  ·  Drag or click to select");
+            SetStatus($"Page {ViewPage + 1} / {_totalPages}  ·  Drag or click to select");
             return;
         }
 
-        var preview = string.Join(" ",
-            _readingOrder.Where(_selectedIndices.Contains).Select(i => _pageWords[i].Text));
+        var preview = SelectedText().Replace('\n', ' ');
         if (preview.Length > 60) preview = preview[..57] + "…";
-        SetStatus($"{_selectedIndices.Count} word(s) selected: \"{preview}\"");
+        int pages = SelectedViews().Count;
+        SetStatus($"{count} word(s) selected{(pages > 1 ? $" on {pages} pages" : "")}: \"{preview}\"");
     }
 
     private void BtnHighlight_Click(object sender, RoutedEventArgs e)
     {
         AddAnnotation(AnnotationType.Highlight, Color.FromRgb(0xFF, 0xEE, 0x00));
-        _selectedIndices.Clear();
-        RefreshHighlights();
+        ClearSelectionExcept(null);
         UpdateSelectionStatus();
     }
 
@@ -2776,6 +3249,7 @@ public partial class PDFReaderPage : Page
 
     private void TextOverlayCanvas_ContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
+        UseViewOf(sender);
         var pos    = Mouse.GetPosition(TextOverlayCanvas);
         var hitAnn = HitTestAnnotation(pos);
 
@@ -2792,15 +3266,14 @@ public partial class PDFReaderPage : Page
         // Capture PDF-space coordinates for "Add Memo"
         if (_currentPagePdfHeight > 0)
         {
-            double toX = _currentPagePdfWidth  / TextOverlayCanvas.Width;
-            double toY = _currentPagePdfHeight / TextOverlayCanvas.Height;
-            _memoInsertPdfX = pos.X * toX;
-            _memoInsertPdfY = _currentPagePdfHeight - pos.Y * toY;
+            var at = ToPdf(pos, TextOverlayCanvas.Width, TextOverlayCanvas.Height);
+            _memoInsertPdfX = at.X;
+            _memoInsertPdfY = at.Y;
         }
 
         var menu   = TextOverlayCanvas.ContextMenu;
         menu.Items.Clear();
-        bool hasSel = _selectedIndices.Count > 0;
+        bool hasSel = SelectedWordCount > 0;   // the selection may cover other pages too
 
         if (hasSel)
         {
@@ -2844,13 +3317,20 @@ public partial class PDFReaderPage : Page
         return item;
     }
 
+    // Annotates the selection: one annotation on each page it covers.
     private void AddAnnotation(AnnotationType type, Color color)
+    {
+        foreach (var v in SelectedViews())
+            WithView(v, () => AddAnnotationOnPage(type, color));
+        DrawAnnotations();
+    }
+
+    private void AddAnnotationOnPage(AnnotationType type, Color color)
     {
         if (_currentFilePath is null || _selectedIndices.Count == 0) return;
         if (_currentPagePdfWidth <= 0 || _currentPagePdfHeight <= 0) return;
 
-        double toX = _currentPagePdfWidth  / AnnotationCanvas.Width;
-        double toY = _currentPagePdfHeight / AnnotationCanvas.Height;
+        double cw = AnnotationCanvas.Width, ch = AnnotationCanvas.Height;
 
         var spans = _selectedIndices
             .GroupBy(i => _wordToLine.GetValueOrDefault(i, -1))
@@ -2858,16 +3338,14 @@ public partial class PDFReaderPage : Page
             .Select(g =>
             {
                 var ws = g.Select(i => _pageWords[i]).ToList();
-                double cl = ws.Min(w => w.Left);
-                double cr = ws.Max(w => w.Right);
-                double ct = ws.Min(w => w.Top);
-                double cb = ws.Max(w => w.Bottom);
+                var a = ToPdf(new Point(ws.Min(w => w.Left),  ws.Min(w => w.Top)),    cw, ch);
+                var b = ToPdf(new Point(ws.Max(w => w.Right), ws.Max(w => w.Bottom)), cw, ch);
                 return new AnnotationSpan
                 {
-                    Left   = cl * toX,
-                    Right  = cr * toX,
-                    Top    = _currentPagePdfHeight - ct * toY,    // canvas top-down → PDF bottom-up
-                    Bottom = _currentPagePdfHeight - cb * toY,
+                    Left   = Math.Min(a.X, b.X),
+                    Right  = Math.Max(a.X, b.X),
+                    Bottom = Math.Min(a.Y, b.Y),
+                    Top    = Math.Max(a.Y, b.Y),
                 };
             })
             .ToList();
@@ -2879,34 +3357,43 @@ public partial class PDFReaderPage : Page
             Type       = type,
             Color      = color,
             FilePath   = _currentFilePath,
-            PageNumber = _currentPage,
+            PageNumber = ViewPage,
             Spans      = spans
         });
-        DrawAnnotations();
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  Annotations – draw
     // ═══════════════════════════════════════════════════════════════════════════
 
+    // Redraws the annotations of every page on screen (popups may change an annotation
+    // after the pointer has moved on to another page).
     private void DrawAnnotations()
     {
-        AnnotationCanvas.Children.Clear();
-        if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
+        foreach (var v in AllViews)
+            WithView(v, () =>
+            {
+                AnnotationCanvas.Children.Clear();
+                if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
+                DrawAnnotationsInto(AnnotationCanvas, ViewPage, _currentPageGeometry, _selectedAnnotation?.Id);
+            });
+    }
 
-        double sx = AnnotationCanvas.Width  / _currentPagePdfWidth;
-        double sy = AnnotationCanvas.Height / _currentPagePdfHeight;
+    // Draws the page's highlights/underlines/strike-outs on a canvas of the page's size.
+    private void DrawAnnotationsInto(Canvas canvas, uint page, PageGeometry geom, int? selectedId)
+    {
+        if (_currentFilePath is null) return;
+        var AnnotationCanvas = canvas;   // the drawing code below targets this canvas
 
-        foreach (var ann in AnnotationService.Instance.ForPage(_currentFilePath, _currentPage))
+        foreach (var ann in AnnotationService.Instance.ForPage(_currentFilePath, page))
         {
-            bool sel = _selectedAnnotation?.Id == ann.Id;
+            bool sel = selectedId == ann.Id;
 
             foreach (var span in ann.Spans)
             {
-                double cl  = span.Left   * sx;
-                double cr  = span.Right  * sx;
-                double ct  = (_currentPagePdfHeight - span.Top)    * sy;
-                double cb  = (_currentPagePdfHeight - span.Bottom) * sy;
+                var    rc  = ToCanvasRect(geom, span.Left, span.Bottom, span.Right, span.Top,
+                                          AnnotationCanvas.Width, AnnotationCanvas.Height);
+                double cl  = rc.Left, cr = rc.Right, ct = rc.Top, cb = rc.Bottom;
                 double mid = (ct + cb) / 2;
 
                 switch (ann.Type)
@@ -2977,17 +3464,13 @@ public partial class PDFReaderPage : Page
     private TextAnnotation? HitTestAnnotation(Point pt)
     {
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return null;
-        double sx = AnnotationCanvas.Width  / _currentPagePdfWidth;
-        double sy = AnnotationCanvas.Height / _currentPagePdfHeight;
-
-        foreach (var ann in AnnotationService.Instance.ForPage(_currentFilePath, _currentPage))
+        foreach (var ann in AnnotationService.Instance.ForPage(_currentFilePath, ViewPage))
         {
             foreach (var span in ann.Spans)
             {
-                double cl = span.Left  * sx;
-                double cr = span.Right * sx;
-                double ct = (_currentPagePdfHeight - span.Top)    * sy;
-                double cb = (_currentPagePdfHeight - span.Bottom) * sy;
+                var    rc = ToCanvasRect(span.Left, span.Bottom, span.Right, span.Top,
+                                         AnnotationCanvas.Width, AnnotationCanvas.Height);
+                double cl = rc.Left, cr = rc.Right, ct = rc.Top, cb = rc.Bottom;
                 if (ann.Type != AnnotationType.Highlight) { ct -= 5; cb += 5; }
                 if (pt.X >= cl && pt.X <= cr && pt.Y >= ct && pt.Y <= cb)
                     return ann;
@@ -3109,15 +3592,15 @@ public partial class PDFReaderPage : Page
     //  PDF persistence – embed (save) and load
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private void EmbedAnnotationsAndMemos()
+    private void EmbedAnnotationsAndMemos(PdfDocument doc)
     {
-        if (_editDocument is null || _currentFilePath is null) return;
+        if (_currentFilePath is null) return;
 
         var allAnns = AnnotationService.Instance.ForFile(_currentFilePath).ToList();
 
-        for (int pi = 0; pi < _editDocument.Pages.Count; pi++)
+        for (int pi = 0; pi < doc.Pages.Count; pi++)
         {
-            var page = _editDocument.Pages[pi];
+            var page = doc.Pages[pi];
 
             // Collect items from the existing /Annots array that don't belong to us.
             var toKeep = new List<PdfItem>();
@@ -3133,27 +3616,27 @@ public partial class PDFReaderPage : Page
             }
 
             // Build a fresh /Annots array = kept third-party items + our new items.
-            var annots = new PdfArray(_editDocument);
+            var annots = new PdfArray(doc);
             foreach (var kept in toKeep)
                 annots.Elements.Add(kept);
 
             // Embed text annotations (highlight / underline / strikethrough).
             foreach (var ann in allAnns.Where(a => (int)a.PageNumber == pi && a.Spans.Count > 0))
-                EmbedTextAnnotation(annots, ann);
+                EmbedTextAnnotation(doc, annots, ann);
 
             // Embed memos as PDF /Text (sticky-note) annotations.
             foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, (uint)pi))
-                EmbedMemo(annots, memo);
+                EmbedMemo(doc, annots, memo);
 
             // Embed drawn shapes (Line/Box/Circle).
             foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, (uint)pi))
-                EmbedDrawingShape(annots, shape);
+                EmbedDrawingShape(doc, annots, shape);
 
             page.Elements["/Annots"] = annots;
         }
     }
 
-    private void EmbedDrawingShape(PdfArray annots, DrawingShape shape)
+    private static void EmbedDrawingShape(PdfDocument doc, PdfArray annots, DrawingShape shape)
     {
         // Store as a /Square (box), /Circle, or /Line PDF annotation.
         string subtype = shape.ShapeType switch
@@ -3168,7 +3651,7 @@ public partial class PDFReaderPage : Page
         double maxX = Math.Max(shape.X1, shape.X2);
         double maxY = Math.Max(shape.Y1, shape.Y2);
 
-        var d = new PdfDictionary(_editDocument);
+        var d = new PdfDictionary(doc);
         d.Elements["/Type"]    = new PdfName("/Annot");
         d.Elements["/Subtype"] = new PdfName(subtype);
         d.Elements["/T"]       = new PdfString("HoloPDF Drawing");
@@ -3184,7 +3667,7 @@ public partial class PDFReaderPage : Page
         if (shape.ShapeType == DrawingShapeType.Line)
             d.Elements["/L"] = MakePdfArray(shape.X1, shape.Y1, shape.X2, shape.Y2);
 
-        _editDocument!.Internals.AddObject(d);
+        doc.Internals.AddObject(d);
         annots.Elements.Add(d.Reference!);
     }
 
@@ -3197,7 +3680,7 @@ public partial class PDFReaderPage : Page
         return t is "HoloPDF Creator" or "HoloPDF Memo" or "HoloPDF Drawing";
     }
 
-    private void EmbedTextAnnotation(PdfArray annots, TextAnnotation ann)
+    private static void EmbedTextAnnotation(PdfDocument doc, PdfArray annots, TextAnnotation ann)
     {
         string subtype = ann.Type switch
         {
@@ -3207,7 +3690,7 @@ public partial class PDFReaderPage : Page
             _                            => "/Highlight"
         };
 
-        var d = new PdfDictionary(_editDocument);
+        var d = new PdfDictionary(doc);
         d.Elements["/Type"]       = new PdfName("/Annot");
         d.Elements["/Subtype"]    = new PdfName(subtype);
         d.Elements["/T"]          = new PdfString("HoloPDF Creator");
@@ -3216,7 +3699,7 @@ public partial class PDFReaderPage : Page
             ann.Spans.Min(s => s.Left),   ann.Spans.Min(s => s.Bottom),
             ann.Spans.Max(s => s.Right),  ann.Spans.Max(s => s.Top));
 
-        var qp = new PdfArray(_editDocument);
+        var qp = new PdfArray(doc);
         foreach (var span in ann.Spans)
         {
             // UL, UR, LL, LR (PDF Y-up space)
@@ -3231,14 +3714,14 @@ public partial class PDFReaderPage : Page
         if (ann.Type == AnnotationType.Highlight)
             d.Elements["/CA"] = new PdfReal(0.5);
 
-        _editDocument.Internals.AddObject(d);
+        doc.Internals.AddObject(d);
         annots.Elements.Add(d.Reference!);
     }
 
-    private void EmbedMemo(PdfArray annots, PdfMemo memo)
+    private static void EmbedMemo(PdfDocument doc, PdfArray annots, PdfMemo memo)
     {
         double x = memo.X, y = memo.Y;
-        var d = new PdfDictionary(_editDocument);
+        var d = new PdfDictionary(doc);
         d.Elements["/Type"]     = new PdfName("/Annot");
         d.Elements["/Subtype"]  = new PdfName("/Text");
         d.Elements["/T"]        = new PdfString("HoloPDF Memo");
@@ -3248,7 +3731,7 @@ public partial class PDFReaderPage : Page
         d.Elements["/F"]        = new PdfInteger(4);
         d.Elements["/Name"]     = new PdfName("/Note");
 
-        _editDocument.Internals.AddObject(d);
+        doc.Internals.AddObject(d);
         annots.Elements.Add(d.Reference!);
     }
 
@@ -3617,12 +4100,7 @@ public partial class PDFReaderPage : Page
     private async Task ApplyAdjustToCurrentAsync()
     {
         if (_renderDocument == null) return;
-        await RenderCurrentPageAsync(preserveScroll: true);
-        if ((int)_currentPage < _thumbItems.Count && AdjustedStore != null)
-        {
-            var img = AdjustedStore.Get((int)_currentPage);
-            if (img != null) _thumbItems[(int)_currentPage].Img.Source = img;
-        }
+        await RenderCurrentPageAsync(preserveScroll: true);   // thumbnail follows via PageImageChanged
 
     }
 
@@ -3630,7 +4108,6 @@ public partial class PDFReaderPage : Page
     {
         PushUndo();  // capture state before resetting adjustments
         _adjSettings.Remove((int)_currentPage);
-        AdjustedStore?.Remove((int)_currentPage);
 
         _suppressAdjSlider = true;
         SliderBrightness.Value   = 0;
@@ -3649,214 +4126,42 @@ public partial class PDFReaderPage : Page
         LblUsmThreshold.Text = "0";
 
         _ = RenderCurrentPageAsync();
-        _ = ResetThumbnailForPageAsync((int)_currentPage);
     }
 
+    // Applying to many pages only stores the settings; the provider renders adjusted
+    // images when a page is shown, thumbnailed, OCR'd or baked.
     private async void AdjApplyAll_Click(object sender, RoutedEventArgs e)
-    {
-        if (_renderDocument == null || AdjustedStore == null) return;
-        PushUndo();  // one undo entry covers the entire batch
-        var win = new ProgressWindow($"Applying to {_totalPages} pages…") { Owner = Window.GetWindow(this) };
-        win.Show();
-        bool cancelled = false;
-        try
-        {
-            for (int i = 0; i < (int)_totalPages; i++)
-            {
-                if (win.IsCancelled) { cancelled = true; break; }
-                win.Update(i + 1, (int)_totalPages, $"Page {i + 1} / {_totalPages}…");
-                var bmp = await RenderPageToBitmapAsync(i);
-                if (bmp == null) continue;
-                var adjusted = AdjApplySettings(bmp);
-                bmp.Dispose();
-                AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
-                adjusted.Dispose();
-                SaveCurrentAdjSettings(i, false);
-            }
-        }
-        finally { win.Close(); }
-        if (!cancelled)
-            await RefreshWithAdjustedImagesAsync();
-
-    }
+        => await AdjApplyToPagesAsync(Enumerable.Range(0, (int)_totalPages));
 
     private async void AdjApplyRange_Click(object sender, RoutedEventArgs e)
     {
-        if (_renderDocument == null || AdjustedStore == null) return;
+        if (_renderDocument == null) return;
         var indices = ParseAdjRange(TxtAdjRange.Text, (int)_totalPages);
         if (indices.Count == 0) { MessageBox.Show("유효한 페이지 범위를 입력하세요. 예: 1-3,5,7-9", "범위 오류"); return; }
-        PushUndo();  // one undo entry covers the entire batch
-        var win = new ProgressWindow($"Applying to {indices.Count} pages…") { Owner = Window.GetWindow(this) };
-        win.Show();
-        try
-        {
-            for (int n = 0; n < indices.Count; n++)
-            {
-                if (win.IsCancelled) break;
-                int i = indices[n];
-                win.Update(n + 1, indices.Count, $"Page {i + 1} / {_totalPages}…");
-                var bmp = await RenderPageToBitmapAsync(i);
-                if (bmp == null) continue;
-                var adjusted = AdjApplySettings(bmp);
-                bmp.Dispose();
-                AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
-                adjusted.Dispose();
-                SaveCurrentAdjSettings(i, false);
-            }
-        }
-        finally { win.Close(); }
-        await RefreshWithAdjustedImagesAsync();
-
+        await AdjApplyToPagesAsync(indices);
     }
 
     private async void AdjApplyOdd_Click(object sender, RoutedEventArgs e)
-        => await AdjApplyByParityAsync(odd: true);
+        => await AdjApplyToPagesAsync(Enumerable.Range(0, (int)_totalPages).Where(i => i % 2 == 0));   // pages 1, 3, 5…
 
     private async void AdjApplyEven_Click(object sender, RoutedEventArgs e)
-        => await AdjApplyByParityAsync(odd: false);
+        => await AdjApplyToPagesAsync(Enumerable.Range(0, (int)_totalPages).Where(i => i % 2 == 1));
 
-    private async Task AdjApplyByParityAsync(bool odd)
+    private async Task AdjApplyToPagesAsync(IEnumerable<int> pages)
     {
-        if (_renderDocument == null || AdjustedStore == null) return;
-        // Page indices are 0-based; odd pages = index 0,2,4… (page numbers 1,3,5…)
-        var indices = Enumerable.Range(0, (int)_totalPages)
-                                .Where(i => odd ? (i % 2 == 0) : (i % 2 == 1))
-                                .ToList();
+        if (_renderDocument == null) return;
         PushUndo();  // one undo entry covers the entire batch
-        string label = odd ? "홀수" : "짝수";
-        var win = new ProgressWindow($"{label} 페이지 ({indices.Count}장) 적용 중…") { Owner = Window.GetWindow(this) };
-        win.Show();
-        bool cancelled = false;
-        try
-        {
-            for (int n = 0; n < indices.Count; n++)
-            {
-                if (win.IsCancelled) { cancelled = true; break; }
-                int i = indices[n];
-                win.Update(n + 1, indices.Count, $"Page {i + 1} / {_totalPages}…");
-                var bmp = await RenderPageToBitmapAsync(i);
-                if (bmp == null) continue;
-                var adjusted = AdjApplySettings(bmp);
-                bmp.Dispose();
-                AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
-                adjusted.Dispose();
-                SaveCurrentAdjSettings(i, false);
-            }
-        }
-        finally { win.Close(); }
-        if (!cancelled)
-            await RefreshWithAdjustedImagesAsync();
-
-    }
-
-    private async Task ResetThumbnailForPageAsync(int pageIndex)
-    {
-        if (_renderDocument == null || pageIndex >= _thumbItems.Count) return;
-        try
-        {
-            using var pdfPage = _renderDocument.GetPage((uint)pageIndex);
-            using var stream  = new InMemoryRandomAccessStream();
-            await pdfPage.RenderToStreamAsync(stream,
-                new WinPdf.PdfPageRenderOptions { DestinationWidth = 160 });
-            stream.Seek(0);
-            var ms = new MemoryStream();
-            await stream.AsStream().CopyToAsync(ms);
-            ms.Position = 0;
-            var thumb = new BitmapImage();
-            thumb.BeginInit();
-            thumb.StreamSource = ms;
-            thumb.CacheOption  = BitmapCacheOption.OnLoad;
-            thumb.EndInit();
-            thumb.Freeze();
-            _thumbItems[pageIndex].Img.Source = thumb;
-        }
-        catch { }
+        foreach (int i in pages) SaveCurrentAdjSettings(i, false);
+        await RefreshWithAdjustedImagesAsync();
     }
 
     private void ResetAllAdjustments()
     {
-        _adjSettings.Clear();
-        AdjustedStore?.Clear();
+        _adjSettings.Clear();       // thumbnails follow via PageImageChanged
         LoadAdjSettingsForPage(-1); // resets sliders to 0
-
-        RefreshAdjustedThumbnails(); // will find nothing in store, so no-op; thumbnails reset by re-render
         _ = RenderCurrentPageAsync();
-        _ = RenderThumbnailsAsync(_thumbCts.Token);
     }
 
-
-    private async Task<System.Drawing.Bitmap?> RenderPageToBitmapAsync(int pageIndex)
-    {
-        if (_renderDocument == null) return null;
-        try
-        {
-            using var pdfPage = _renderDocument.GetPage((uint)pageIndex);
-            using var stream  = new InMemoryRandomAccessStream();
-            await pdfPage.RenderToStreamAsync(stream,
-                new WinPdf.PdfPageRenderOptions { DestinationWidth = 1200 });
-            stream.Seek(0);
-            var ms = new MemoryStream();
-            await stream.AsStream().CopyToAsync(ms);
-            ms.Position = 0;
-            return new System.Drawing.Bitmap(ms);
-        }
-        catch { return null; }
-    }
-
-    // Called during live-edit (reads from UI sliders).
-    private System.Drawing.Bitmap AdjApplySettings(System.Drawing.Bitmap src)
-    {
-        var s = new AdjSettings(
-            SliderBrightness.Value, SliderContrast.Value, SliderStroke.Value,
-            SliderUsmAmount.Value, SliderUsmRadius.Value, SliderUsmThreshold.Value,
-            ChkAutoLevel.IsChecked == true);
-        return AdjApplySettingsFrom(src, s);
-    }
-
-    // Called from RenderCurrentPageAsync (uses stored record, not UI sliders).
-    private static System.Drawing.Bitmap AdjApplySettingsFrom(System.Drawing.Bitmap src, AdjSettings s)
-    {
-        float brightness   = (float)s.Brightness / 100f;
-        float contrast     = (float)s.Contrast   / 100f;
-        bool  autoLevel    = s.AutoLevel;
-        float stroke       = (float)s.Stroke;
-        float usmAmount    = (float)s.UsmAmount;
-        int   usmRadius    = (int)s.UsmRadius;
-        int   usmThreshold = (int)s.UsmThreshold;
-
-        var result = src;
-        if (Math.Abs(brightness) > 0.001f)  { var t = ImageProcessingService.AdjustBrightness(result, brightness);                     if (result != src) result.Dispose(); result = t; }
-        if (Math.Abs(contrast)   > 0.001f)  { var t = ImageProcessingService.AdjustContrast(result, contrast);                         if (result != src) result.Dispose(); result = t; }
-        if (autoLevel)                       { var t = ImageProcessingService.AutoLevel(result);                                         if (result != src) result.Dispose(); result = t; }
-        if (stroke > 0.01f)                  { var t = ImageProcessingService.ThickenStrokes(result, stroke);                           if (result != src) result.Dispose(); result = t; }
-        if (usmAmount > 0.01f)               { var t = ImageProcessingService.UnsharpMask(result, usmAmount, usmRadius, usmThreshold);  if (result != src) result.Dispose(); result = t; }
-        if (result == src) return new System.Drawing.Bitmap(src);
-        return result;
-    }
-
-    private static System.Drawing.Bitmap BitmapSourceToDrawingBitmap(BitmapSource source)
-    {
-        using var ms = new MemoryStream();
-        var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
-        encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(source));
-        encoder.Save(ms);
-        ms.Position = 0;
-        return new System.Drawing.Bitmap(ms);
-    }
-
-    private static BitmapImage BitmapToBitmapImage(System.Drawing.Bitmap bmp)
-    {
-        using var ms = new MemoryStream();
-        bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
-        ms.Position = 0;
-        var bi = new BitmapImage();
-        bi.BeginInit();
-        bi.StreamSource = ms;
-        bi.CacheOption  = BitmapCacheOption.OnLoad;
-        bi.EndInit();
-        bi.Freeze();
-        return bi;
-    }
 
     private static List<int> ParseAdjRange(string text, int total)
     {
@@ -3959,16 +4264,24 @@ public partial class PDFReaderPage : Page
 
     private void DrawMemos()
     {
-        MemoCanvas.Children.Clear();
-        if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
+        foreach (var v in AllViews)
+            WithView(v, () =>
+            {
+                MemoCanvas.Children.Clear();
+                if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
+                DrawMemosInto(MemoCanvas, ViewPage, _currentPageGeometry);
+            });
+    }
 
-        double sx = MemoCanvas.Width  / _currentPagePdfWidth;
-        double sy = MemoCanvas.Height / _currentPagePdfHeight;
+    private void DrawMemosInto(Canvas canvas, uint page, PageGeometry geom)
+    {
+        if (_currentFilePath is null) return;
+        var MemoCanvas = canvas;
 
-        foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, _currentPage))
+        foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, page))
         {
-            double cx = memo.X * sx;
-            double cy = (_currentPagePdfHeight - memo.Y) * sy;
+            var    at = ToCanvas(geom, memo.X, memo.Y, MemoCanvas.Width, MemoCanvas.Height);
+            double cx = at.X, cy = at.Y;
 
             var icon = new Border
             {
@@ -4002,13 +4315,10 @@ public partial class PDFReaderPage : Page
     {
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return null;
 
-        double sx = MemoCanvas.Width  / _currentPagePdfWidth;
-        double sy = MemoCanvas.Height / _currentPagePdfHeight;
-
-        foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, _currentPage))
+        foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, ViewPage))
         {
-            double cx = memo.X * sx;
-            double cy = (_currentPagePdfHeight - memo.Y) * sy;
+            var    at = ToCanvas(memo.X, memo.Y, MemoCanvas.Width, MemoCanvas.Height);
+            double cx = at.X, cy = at.Y;
             // icon occupies (cx-11, cy-22) to (cx+11, cy)
             if (pt.X >= cx - 11 && pt.X <= cx + 11 && pt.Y >= cy - 22 && pt.Y <= cy)
                 return memo;
@@ -4159,6 +4469,10 @@ public partial class PDFReaderPage : Page
     private void WireMemoBtns(Popup popup, TextBox tb, PdfMemo? existing,
                                Button saveBtn, Button cancelBtn)
     {
+        // The page and point the memo was opened for; the pointer may visit other pages
+        // while the popup is open.
+        uint   memoPage = ViewPage;
+        double memoX    = _memoInsertPdfX, memoY = _memoInsertPdfY;
         saveBtn.Click += (_, _) =>
         {
             var text = tb.Text.Trim();
@@ -4174,9 +4488,9 @@ public partial class PDFReaderPage : Page
                 MemoService.Instance.Add(new PdfMemo
                 {
                     FilePath   = _currentFilePath,
-                    PageNumber = _currentPage,
-                    X          = _memoInsertPdfX,
-                    Y          = _memoInsertPdfY,
+                    PageNumber = memoPage,
+                    X          = memoX,
+                    Y          = memoY,
                     Content    = text,
                 });
             }
@@ -4195,9 +4509,9 @@ public partial class PDFReaderPage : Page
     private enum DrawMode { None, Line, Box, Circle }
 
     private DrawMode         _drawMode        = DrawMode.None;
-    private bool             _isDrawing;
-    private Point            _drawStart;
-    private Shape?           _rubberBand;
+    private bool             _isDrawing  { get => _view.IsDrawing;  set => _view.IsDrawing  = value; }
+    private Point            _drawStart  { get => _view.DrawStart;  set => _view.DrawStart  = value; }
+    private Shape?           _rubberBand { get => _view.RubberBand; set => _view.RubberBand = value; }
     private DrawingShape?    _selectedShape;
     private Popup?           _shapeColorPopup;
 
@@ -4240,22 +4554,16 @@ public partial class PDFReaderPage : Page
 
     private void ApplyDrawMode()
     {
-        // Always remove first to prevent duplicate registrations when switching modes.
-        DrawingCanvas.MouseLeftButtonDown -= DrawingCanvas_MouseDown;
-        DrawingCanvas.MouseMove           -= DrawingCanvas_MouseMove;
-        DrawingCanvas.MouseLeftButtonUp   -= DrawingCanvas_MouseUp;
+        foreach (var v in AllViews) ApplyDrawMode(v);
+    }
 
+    // Drawing canvas on top while a drawing tool is selected, text layer otherwise.
+    private void ApplyDrawMode(PageView v)
+    {
         bool drawing = _drawMode != DrawMode.None;
-        DrawingCanvas.IsHitTestVisible     = drawing;
-        TextOverlayCanvas.IsHitTestVisible = !drawing;
-        DrawingCanvas.Cursor               = drawing ? Cursors.Cross : Cursors.Arrow;
-
-        if (drawing)
-        {
-            DrawingCanvas.MouseLeftButtonDown += DrawingCanvas_MouseDown;
-            DrawingCanvas.MouseMove           += DrawingCanvas_MouseMove;
-            DrawingCanvas.MouseLeftButtonUp   += DrawingCanvas_MouseUp;
-        }
+        v.Drawing.IsHitTestVisible     = drawing;
+        v.TextOverlay.IsHitTestVisible = !drawing;
+        v.Drawing.Cursor               = drawing ? Cursors.Cross : Cursors.Arrow;
     }
 
     private void UpdateDrawToolButtons()
@@ -4269,6 +4577,8 @@ public partial class PDFReaderPage : Page
 
     private void DrawingCanvas_MouseDown(object sender, MouseButtonEventArgs e)
     {
+        if (_drawMode == DrawMode.None) return;
+        UseViewOf(sender, pressing: true);
         _drawStart = e.GetPosition(DrawingCanvas);
         _isDrawing = true;
         DrawingCanvas.CaptureMouse();
@@ -4304,6 +4614,7 @@ public partial class PDFReaderPage : Page
 
     private void DrawingCanvas_MouseMove(object sender, MouseEventArgs e)
     {
+        UseViewOf(sender);
         if (!_isDrawing || _rubberBand is null) return;
 
         var pos = e.GetPosition(DrawingCanvas);
@@ -4313,6 +4624,7 @@ public partial class PDFReaderPage : Page
 
     private void DrawingCanvas_MouseUp(object sender, MouseButtonEventArgs e)
     {
+        UseViewOf(sender);
         if (!_isDrawing) return;
         _isDrawing = false;
         DrawingCanvas.ReleaseMouseCapture();
@@ -4343,13 +4655,9 @@ public partial class PDFReaderPage : Page
 
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) { e.Handled = true; return; }
 
-        double toX = _currentPagePdfWidth  / DrawingCanvas.Width;
-        double toY = _currentPagePdfHeight / DrawingCanvas.Height;
-
-        double px1 = _drawStart.X * toX;
-        double py1 = _currentPagePdfHeight - _drawStart.Y * toY;
-        double px2 = pos.X * toX;
-        double py2 = _currentPagePdfHeight - pos.Y * toY;
+        var    p1  = ToPdf(_drawStart, DrawingCanvas.Width, DrawingCanvas.Height);
+        var    p2  = ToPdf(pos,        DrawingCanvas.Width, DrawingCanvas.Height);
+        double px1 = p1.X, py1 = p1.Y, px2 = p2.X, py2 = p2.Y;
 
         var shape = new DrawingShape
         {
@@ -4358,7 +4666,7 @@ public partial class PDFReaderPage : Page
             Fill       = _lastFill,
             HasFill    = _lastHasFill,
             FilePath   = _currentFilePath,
-            PageNumber = _currentPage,
+            PageNumber = ViewPage,
             X1 = px1, Y1 = py1, X2 = px2, Y2 = py2,
         };
 
@@ -4448,20 +4756,30 @@ public partial class PDFReaderPage : Page
 
     private void RefreshDrawingCanvas()
     {
-        DrawingCanvas.Children.Clear();
-        if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
+        foreach (var v in AllViews)
+            WithView(v, () =>
+            {
+                // Keep a rubber band being dragged on this page.
+                var band = _rubberBand;
+                DrawingCanvas.Children.Clear();
+                if (band != null) DrawingCanvas.Children.Add(band);
+                if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
+                DrawShapesInto(DrawingCanvas, ViewPage, _currentPageGeometry, _selectedShape?.Id);
+            });
+    }
 
-        double sx = DrawingCanvas.Width  / _currentPagePdfWidth;
-        double sy = DrawingCanvas.Height / _currentPagePdfHeight;
+    private void DrawShapesInto(Canvas canvas, uint page, PageGeometry geom, int? selectedId)
+    {
+        if (_currentFilePath is null) return;
+        var DrawingCanvas = canvas;
 
-        foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, _currentPage))
+        foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, page))
         {
-            bool sel = _selectedShape?.Id == shape.Id;
+            bool sel = selectedId == shape.Id;
 
-            double cx1 = shape.X1 * sx;
-            double cy1 = (_currentPagePdfHeight - shape.Y1) * sy;
-            double cx2 = shape.X2 * sx;
-            double cy2 = (_currentPagePdfHeight - shape.Y2) * sy;
+            var    c1  = ToCanvas(geom, shape.X1, shape.Y1, DrawingCanvas.Width, DrawingCanvas.Height);
+            var    c2  = ToCanvas(geom, shape.X2, shape.Y2, DrawingCanvas.Width, DrawingCanvas.Height);
+            double cx1 = c1.X, cy1 = c1.Y, cx2 = c2.X, cy2 = c2.Y;
 
             var mode = shape.ShapeType switch
             {
@@ -4535,15 +4853,11 @@ public partial class PDFReaderPage : Page
     {
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return null;
 
-        double sx = DrawingCanvas.Width  / _currentPagePdfWidth;
-        double sy = DrawingCanvas.Height / _currentPagePdfHeight;
-
-        foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, _currentPage))
+        foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, ViewPage))
         {
-            double cx1 = shape.X1 * sx;
-            double cy1 = (_currentPagePdfHeight - shape.Y1) * sy;
-            double cx2 = shape.X2 * sx;
-            double cy2 = (_currentPagePdfHeight - shape.Y2) * sy;
+            var    c1  = ToCanvas(shape.X1, shape.Y1, DrawingCanvas.Width, DrawingCanvas.Height);
+            var    c2  = ToCanvas(shape.X2, shape.Y2, DrawingCanvas.Width, DrawingCanvas.Height);
+            double cx1 = c1.X, cy1 = c1.Y, cx2 = c2.X, cy2 = c2.Y;
 
             double minX = Math.Min(cx1, cx2);
             double maxX = Math.Max(cx1, cx2);
@@ -4787,10 +5101,10 @@ public partial class PDFReaderPage : Page
         var pages  = pageIndices.ToArray();
         var before = CaptureState();
         ApplyRotation(pages, angle);
+        _session.MarkContentChanged(pages);
         SetStatus("회전 적용 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         PushUndoEdit(new RotateEdit(pages, angle), before);
-        MovePageData(null, pages.ToHashSet());
         StartThumbnailGeneration(i => i, pages.ToHashSet());
         SetStatus($"회전 완료 ({angle}°).");
     }
@@ -4856,6 +5170,7 @@ public partial class PDFReaderPage : Page
             // Clean up the previous temp edited file first.
             CleanupTempEditedPath();
             _tempEditedPath = tmpPath;
+            SetRenderFile(tmpPath);
 
             _totalPages = _renderDocument.PageCount;
             UpdateNavButtons();
@@ -4870,6 +5185,23 @@ public partial class PDFReaderPage : Page
         {
             _pageTransitioning = false;
         }
+    }
+
+    // The file _renderDocument was loaded from, which the page images are rendered from.
+    private string? _renderPath;
+    // The annotation-free copy made when loading; deleted when the next document is loaded.
+    private string? _loadRenderCopy;
+
+    private void SetRenderFile(string path, bool isLoadCopy = false)
+    {
+        if (isLoadCopy)
+        {
+            if (_loadRenderCopy != null && _loadRenderCopy != path)
+                try { File.Delete(_loadRenderCopy); } catch { /* temp file, non-critical */ }
+            _loadRenderCopy = path;
+        }
+        _renderPath = path;
+        _images.SetDocument(path, _renderDocument);
     }
 
     private void CleanupTempEditedPath()
@@ -4899,6 +5231,8 @@ public partial class PDFReaderPage : Page
 
         _thumbCts.Cancel();
         _thumbCts = new CancellationTokenSource();
+
+        _thumbIds = _session.CaptureOrder().ToList();
 
         if (pageFrom != null && _renderDocument != null && _thumbItems.Count == (int)_totalPages)
         {
@@ -5115,35 +5449,35 @@ public partial class PDFReaderPage : Page
         if (toRender.Count > 0) _ = RenderThumbnailsAsync(_thumbCts.Token, toRender);
     }
 
+    private const int ThumbWidth = 160;
+
+    // Page id shown in each thumbnail slot. During a page edit the session's order changes
+    // before the panel is rebuilt, so slots are matched by id, never by index alone.
+    private List<long> _thumbIds = new();
+
     private async Task RenderThumbnailsAsync(CancellationToken ct, IReadOnlyList<int>? pages = null)
     {
-        pages ??= Enumerable.Range(0, (int)_totalPages).ToList();
+        pages ??= Enumerable.Range(0, _thumbItems.Count).ToList();
+        var slotIds = _thumbIds;
         foreach (int i in pages)
         {
             if (ct.IsCancellationRequested) return;
+            if (i >= slotIds.Count) continue;
 
             try
             {
-                BitmapSource thumbSrc;
-
                 if (_renderDocument == null) return;
-                using var pdfPage = _renderDocument.GetPage((uint)i);
-                using var stream  = new InMemoryRandomAccessStream();
-                await pdfPage.RenderToStreamAsync(stream,
-                    new WinPdf.PdfPageRenderOptions { DestinationWidth = 160 });
-                stream.Seek(0);
-                var ms = new MemoryStream();
-                await stream.AsStream().CopyToAsync(ms);
-                ms.Position = 0;
-                var pdfThumb = new BitmapImage();
-                pdfThumb.BeginInit();
-                pdfThumb.StreamSource = ms;
-                pdfThumb.CacheOption  = BitmapCacheOption.OnLoad;
-                pdfThumb.EndInit();
-                pdfThumb.Freeze();
-                thumbSrc = pdfThumb;
-
-                if (!ct.IsCancellationRequested && i < _thumbItems.Count)
+                long id  = slotIds[i];
+                int  idx = _session.IndexOf(id);
+                if (idx < 0) continue;
+                var thumbSrc = await _images.GetAsync(idx, ThumbWidth);
+                if (thumbSrc == null)
+                {
+                    if (_images.IsStale) QueuePageImageRefresh(id);   // retry after the edit
+                    continue;
+                }
+                // Write only if the slot still shows that page.
+                if (!ct.IsCancellationRequested && ReferenceEquals(slotIds, _thumbIds) && i < _thumbItems.Count)
                     _thumbItems[i].Img.Source = thumbSrc;
             }
             catch { /* skip on render error */ }
@@ -5351,14 +5685,9 @@ public partial class PDFReaderPage : Page
             "페이지 삭제", MessageBoxButton.YesNo, MessageBoxImage.Warning);
         if (result != MessageBoxResult.Yes) return;
 
-        // Old → new page index for bookmarks: a bookmark on a deleted page moves to
-        // the next surviving page (or the last page when nothing follows).
         int oldCount = _editDocument.Pages.Count;
         var deleted  = new HashSet<int>(_thumbSelectedPages);
-        var pageMap  = new int[oldCount];
-        for (int i = 0, n = 0; i < oldCount; i++)
-            pageMap[i] = deleted.Contains(i) ? n : n++;
-        int newLast = oldCount - deleted.Count - 1;
+        PushSnapshotUndo(CaptureState());
 
         // Remove in reverse index order so earlier indices stay valid.
         foreach (int pi in _thumbSelectedPages.OrderByDescending(x => x))
@@ -5366,6 +5695,9 @@ public partial class PDFReaderPage : Page
             if (pi >= 0 && pi < _editDocument.Pages.Count)
                 _editDocument.Pages.RemoveAt(pi);
         }
+        // Bookmarks move to the next page, everything else stays with the deleted page
+        // (OnSessionOrderChanged) so undo brings it back.
+        _session.Delete(deleted);
 
         // Clamp current page to new range.
         _currentPage = (uint)Math.Min((int)_currentPage, _editDocument.Pages.Count - 1);
@@ -5374,23 +5706,7 @@ public partial class PDFReaderPage : Page
         _thumbLastClickedPage = -1;
 
         SetStatus("페이지 삭제 중…");
-        var topBefore = _undoStack.Count > 0 ? _undoStack[^1] : null;
-        await ReloadRenderDocumentAsync();
-        var deleteMap = new PageMap(
-            Enumerable.Range(0, oldCount).Where(i => !deleted.Contains(i)).ToArray(), oldCount);
-        var droppedOcr = MovePageData(deleteMap);
-        if (_undoStack.Count > 0 && !ReferenceEquals(_undoStack[^1], topBefore))   // the step this delete pushed
-            _undoStack[^1] = _undoStack[^1] with { Map = deleteMap with { DroppedOcr = droppedOcr } };
-        if (_currentFilePath != null)
-            BookmarkService.Instance.RemapPages(_currentFilePath,
-                p => p < oldCount ? Math.Min(pageMap[p], newLast) : newLast);
-
-        // Image-sourced pages: drop deleted ones and shift the rest to their new index.
-        var keptImages = _pageImagePaths
-            .Where(kv => kv.Key < oldCount && !deleted.Contains(kv.Key))
-            .ToDictionary(kv => pageMap[kv.Key], kv => kv.Value);
-        _pageImagePaths.Clear();
-        foreach (var kv in keptImages) _pageImagePaths[kv.Key] = kv.Value;
+        await ReloadRenderDocumentAsync(pushUndo: false);
 
         var survivors = Enumerable.Range(0, oldCount).Where(i => !deleted.Contains(i)).ToArray();
         StartThumbnailGeneration(i => i < survivors.Length ? survivors[i] : null);
@@ -5461,16 +5777,13 @@ public partial class PDFReaderPage : Page
 
         if (cancelled)
         {
+            // Take back the pages inserted before the cancel; the document is unchanged.
+            for (int i = insertedCount - 1; i >= 0; i--) _editDocument.Pages.RemoveAt(insertAt + i);
             foreach (var (ms, x) in resources) { x.Dispose(); ms.Dispose(); }
             return;
         }
 
-        // Shift existing page-image entries to make room, then record the new paths.
-        var shifted = new Dictionary<int, string>();
-        foreach (var kv in _pageImagePaths)
-            shifted[kv.Key >= insertAt ? kv.Key + insertedCount : kv.Key] = kv.Value;
-        _pageImagePaths.Clear();
-        foreach (var kv in shifted) _pageImagePaths[kv.Key] = kv.Value;
+        _session.Insert(insertAt, insertedCount);
         for (int i = 0; i < insertedCount; i++)
             _pageImagePaths[insertAt + i] = imagePaths[i];
 
@@ -5478,10 +5791,6 @@ public partial class PDFReaderPage : Page
         SetStatus("이미지 삽입 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);   // _editDocument.Save() runs here — resources alive
         PushUndoEdit(new InsertEdit(insertAt, insertedCount), before);
-        MovePageData(InsertMap(insertAt, insertedCount, _editDocument.Pages.Count));
-        if (_currentFilePath != null)
-            BookmarkService.Instance.RemapPages(_currentFilePath,
-                p => p >= insertAt ? p + insertedCount : p);
         foreach (var (ms, x) in resources) { x.Dispose(); ms.Dispose(); }
         StartThumbnailGeneration(i => i < insertAt ? i : i < insertAt + insertedCount ? null : i - insertedCount);
         SetStatus($"이미지 삽입 완료. 총 {_editDocument.Pages.Count}페이지");
@@ -5685,26 +5994,19 @@ public partial class PDFReaderPage : Page
 
         var before = CaptureState();
         if (!await RebuildInPageOrderAsync(newOrder.ToArray())) return;
+        _session.Reorder(newOrder);
 
         SetStatus("페이지 순서 변경 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         PushUndoEdit(new ReorderEdit(newOrder.ToArray()), before);
-        MovePageData(new PageMap(newOrder.ToArray(), newOrder.Count));
-        if (_currentFilePath != null)
-        {
-            var newIndex = new Dictionary<int, int>();
-            for (int i = 0; i < newOrder.Count; i++) newIndex[newOrder[i]] = i;
-            BookmarkService.Instance.RemapPages(_currentFilePath,
-                p => newIndex.TryGetValue(p, out int np) ? np : p);
-        }
         StartThumbnailGeneration(i => i < newOrder.Count ? newOrder[i] : null);
         SetStatus("페이지 순서 변경 완료.");
     }
 
     /// <summary>
     /// Rebuilds _editDocument with its pages in <paramref name="newOrder"/>
-    /// (newOrder[i] = current index of the page to put at position i) and remaps
-    /// _pageImagePaths. Returns false, leaving _editDocument untouched, on failure.
+    /// (newOrder[i] = current index of the page to put at position i). The caller updates
+    /// the session's page order. Returns false, leaving _editDocument untouched, on failure.
     /// </summary>
     private async Task<bool> RebuildInPageOrderAsync(int[] newOrder)
     {
@@ -5778,14 +6080,6 @@ public partial class PDFReaderPage : Page
             try { if (System.IO.File.Exists(srcPath)) System.IO.File.Delete(srcPath); } catch { }
             try { if (System.IO.File.Exists(outPath)) System.IO.File.Delete(outPath); } catch { }
         }
-
-        // Remap _pageImagePaths to new positions
-        var remapped = new Dictionary<int, string>();
-        for (int i = 0; i < newOrder.Length; i++)
-            if (_pageImagePaths.TryGetValue(newOrder[i], out string? path))
-                remapped[i] = path;
-        _pageImagePaths.Clear();
-        foreach (var kv in remapped) _pageImagePaths[kv.Key] = kv.Value;
 
         // Only swap _editDocument after the new doc is fully built
         _editDocument.Dispose();
@@ -5910,6 +6204,15 @@ public partial class PDFReaderPage : Page
         int total     = (int)_totalPages;
         if (total == 0 || (bytes == null && path == null)) return hits;
 
+        // Pages OCR'd in this session are searched by their OCR text.
+        var ocrText = new Dictionary<int, string>();
+        foreach (var (p, regions) in _session.OcrRegions)
+        {
+            if (!_session.OcrSize.ContainsKey(p)) continue;   // text-layer regions come from the PDF below
+            var t = string.Join(" ", regions.Select(r => r.Text.Trim()).Where(x => x.Length > 0));
+            if (t.Length > 0) ocrText[p] = t;
+        }
+
         await Task.Run(() =>
         {
             try
@@ -5926,14 +6229,19 @@ public partial class PDFReaderPage : Page
                         ct.ThrowIfCancellationRequested();
                         if (restrictToPages != null && !restrictToPages.Contains(p)) continue;
 
-                        var page  = doc.GetPage(p + 1);
-                        var words = NearestNeighbourWordExtractor.Instance
-                            .GetWords(page.Letters)
-                            .Select(w => w.Text)
-                            .ToList();
-                        if (words.Count == 0) continue;
-
-                        string text  = string.Join(" ", words);
+                        string text;
+                        if (ocrText.TryGetValue(p, out var fromOcr))
+                            text = fromOcr;
+                        else
+                        {
+                            var page  = doc.GetPage(p + 1);
+                            var words = NearestNeighbourWordExtractor.Instance
+                                .GetWords(page.Letters)
+                                .Select(w => w.Text)
+                                .ToList();
+                            if (words.Count == 0) continue;
+                            text = string.Join(" ", words);
+                        }
                         int    start = 0;
                         while (start < text.Length && hits.Count < 500)
                         {
@@ -6082,10 +6390,10 @@ public partial class PDFReaderPage : Page
         double w = CropCanvas.Width;
         double h = CropCanvas.Height;
         if (double.IsNaN(w) || double.IsNaN(h) || w <= 0 || h <= 0) return;
-        if (_currentPagePdfWidth <= 0 || _currentPagePdfHeight <= 0) return;
+        if (_mainView.PdfWidth <= 0 || _mainView.PdfHeight <= 0) return;
 
-        double scaleX = w / _currentPagePdfWidth;
-        double scaleY = h / _currentPagePdfHeight;
+        double scaleX = w / _mainView.PdfWidth;
+        double scaleY = h / _mainView.PdfHeight;
 
         double topPx    = Math.Clamp(_cropTop    * scaleY, 0, h);
         double bottomPx = Math.Clamp(h - _cropBottom * scaleY, 0, h);
@@ -6162,13 +6470,11 @@ public partial class PDFReaderPage : Page
             afters.Add(after);
             SetCropRect(page, after);
         }
+        _session.MarkContentChanged(pages);
         SetStatus("Crop 적용 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         if (pages.Count > 0)
-        {
             PushUndoEdit(new CropEdit(pages.ToArray(), befores.ToArray(), afters.ToArray()), state);
-            MovePageData(null, pages.ToHashSet());
-        }
         StartThumbnailGeneration(i => i, pages.ToHashSet());
 
         // Clear crop inputs and overlay — the page is already cropped visually.

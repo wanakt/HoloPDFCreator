@@ -475,19 +475,19 @@
                                    Stretch="None"
                                    RenderOptions.BitmapScalingMode="HighQuality"/>
 
-                            <Canvas x:Name="AnnotationCanvas"
+                            <Canvas x:Name="MainAnnotationCanvas"
                                     IsHitTestVisible="False"
                                     Background="Transparent"/>
 
-                            <Canvas x:Name="MemoCanvas"
+                            <Canvas x:Name="MainMemoCanvas"
                                     IsHitTestVisible="False"
                                     Background="Transparent"/>
 
-                            <Canvas x:Name="DrawingCanvas"
+                            <Canvas x:Name="MainDrawingCanvas"
                                     Background="Transparent"
                                     IsHitTestVisible="False"/>
 
-                            <Canvas x:Name="TextOverlayCanvas"
+                            <Canvas x:Name="MainTextOverlayCanvas"
                                     Background="Transparent"
                                     Cursor="Arrow"
                                     Focusable="True"
