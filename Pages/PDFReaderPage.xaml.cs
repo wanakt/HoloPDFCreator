@@ -110,11 +110,15 @@ public partial class PDFReaderPage : Page
     // ─── Undo / Redo ─────────────────────────────────────────────────────────
     private record DrawingShapeData(DrawingShapeType Type, Color Stroke, Color Fill, bool HasFill,
                                      string FilePath, uint Page, double X1, double Y1, double X2, double Y2);
-    private record UndoSnapshot(byte[] Pdf, Dictionary<int, AdjSettings> Adj, List<DrawingShapeData> Shapes,
-                                Dictionary<int, uint> BmPages);
+    // Pdf is a handle into _snapshotStore (a temp file), not the bytes themselves.
+    private record UndoSnapshot(PdfSnapshotStore.Handle Pdf, Dictionary<int, AdjSettings> Adj,
+                                List<DrawingShapeData> Shapes, Dictionary<int, uint> BmPages);
     private readonly List<UndoSnapshot> _undoStack = new();
     private readonly List<UndoSnapshot> _redoStack = new();
-    private const int UndoMaxLevels = 15;
+    private readonly PdfSnapshotStore   _snapshotStore = new();
+    private const int  UndoMaxLevels   = 15;
+    // Disk space the undo/redo snapshot files may take before the oldest steps are dropped.
+    private long _undoDiskBudget = 2L * 1024 * 1024 * 1024;
     // Tracks which page already had its adj-change undo pushed in the current session.
     // -1 = none yet; set to page idx on first adj change, reset by PushUndo().
     private int _adjUndoPushedForPage = -1;
@@ -465,8 +469,8 @@ public partial class PDFReaderPage : Page
         _searchHighlightQuery = null;
         _searchHighlightIndices.Clear();
         // New file load clears undo/redo history.
-        _undoStack.Clear();
-        _redoStack.Clear();
+        ClearUndoStack(_undoStack);
+        ClearUndoStack(_redoStack);
         _adjUndoPushedForPage = -1;
         UndoRedoChanged?.Invoke();
         // A new PDF load invalidates any prior edit-temp (rotation etc.).
@@ -756,6 +760,32 @@ public partial class PDFReaderPage : Page
         _currentFilePath is null ? new() :
         BookmarkService.Instance.ForFile(_currentFilePath).ToDictionary(b => b.Id, b => b.PageNumber);
 
+    private UndoSnapshot CaptureSnapshot(byte[] pdf) => new(
+        _snapshotStore.Capture(pdf),
+        _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value),
+        SnapshotDrawings(),
+        SnapshotBookmarkPages());
+
+    private void ClearUndoStack(List<UndoSnapshot> stack)
+    {
+        foreach (var e in stack) _snapshotStore.Release(e.Pdf);
+        stack.Clear();
+    }
+
+    // Drops the oldest undo steps beyond the level limit or the disk budget. Runs only
+    // when a new edit is pushed (the redo stack is empty then), so undoing never eats into
+    // the remaining history. The newest step is always kept, so a large document still
+    // gets one level of undo; the disk may exceed the budget by one snapshot.
+    private void TrimUndoHistory()
+    {
+        while (_undoStack.Count > UndoMaxLevels ||
+               (_snapshotStore.DiskBytes > _undoDiskBudget && _undoStack.Count > 1))
+        {
+            _snapshotStore.Release(_undoStack[0].Pdf);
+            _undoStack.RemoveAt(0);
+        }
+    }
+
     // Captures PDF bytes, image adjustment settings, drawing shapes and bookmark pages.
     public void PushUndo()
     {
@@ -766,11 +796,9 @@ public partial class PDFReaderPage : Page
             if (path == null || !System.IO.File.Exists(path)) return;
             try { pdfSnap = System.IO.File.ReadAllBytes(path); } catch { return; }
         }
-        var adjSnap   = _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value);
-        var shapeSnap = SnapshotDrawings();
-        _undoStack.Add(new UndoSnapshot(pdfSnap, adjSnap, shapeSnap, SnapshotBookmarkPages()));
-        if (_undoStack.Count > UndoMaxLevels) _undoStack.RemoveAt(0);
-        _redoStack.Clear();
+        _undoStack.Add(CaptureSnapshot(pdfSnap));
+        ClearUndoStack(_redoStack);
+        TrimUndoHistory();
         _adjUndoPushedForPage = -1;  // reset: next adj change on any page triggers a new push
         UndoRedoChanged?.Invoke();
     }
@@ -779,13 +807,10 @@ public partial class PDFReaderPage : Page
     {
         if (_undoStack.Count == 0) return;
         if (_editPdfBytes != null)
-        {
-            var curAdj    = _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value);
-            var curShapes = SnapshotDrawings();
-            _redoStack.Add(new UndoSnapshot(_editPdfBytes, curAdj, curShapes, SnapshotBookmarkPages()));
-        }
+            _redoStack.Add(CaptureSnapshot(_editPdfBytes));
         var prev = _undoStack[^1]; _undoStack.RemoveAt(_undoStack.Count - 1);
         await RestoreSnapshotAsync(prev);
+        _snapshotStore.Release(prev.Pdf);
         UndoRedoChanged?.Invoke();
     }
 
@@ -793,14 +818,10 @@ public partial class PDFReaderPage : Page
     {
         if (_redoStack.Count == 0) return;
         if (_editPdfBytes != null)
-        {
-            var curAdj    = _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value);
-            var curShapes = SnapshotDrawings();
-            _undoStack.Add(new UndoSnapshot(_editPdfBytes, curAdj, curShapes, SnapshotBookmarkPages()));
-            if (_undoStack.Count > UndoMaxLevels) _undoStack.RemoveAt(0);
-        }
+            _undoStack.Add(CaptureSnapshot(_editPdfBytes));
         var next = _redoStack[^1]; _redoStack.RemoveAt(_redoStack.Count - 1);
         await RestoreSnapshotAsync(next);
+        _snapshotStore.Release(next.Pdf);
         UndoRedoChanged?.Invoke();
     }
 
@@ -812,11 +833,12 @@ public partial class PDFReaderPage : Page
             System.IO.Path.GetRandomFileName() + ".pdf");
         try
         {
-            System.IO.File.WriteAllBytes(tmpPath, snapshot.Pdf);
+            byte[] pdf = _snapshotStore.Load(snapshot.Pdf);
+            System.IO.File.WriteAllBytes(tmpPath, pdf);
 
             _editDocument?.Dispose();
-            _editPdfBytes = snapshot.Pdf;
-            _editDocument = PdfReader.Open(new MemoryStream(snapshot.Pdf), PdfDocumentOpenMode.Modify);
+            _editPdfBytes = pdf;
+            _editDocument = PdfReader.Open(new MemoryStream(pdf), PdfDocumentOpenMode.Modify);
 
             var tmpFile = await StorageFile.GetFileFromPathAsync(tmpPath);
             _renderDocument = await WinPdf.PdfDocument.LoadFromFileAsync(tmpFile);
