@@ -67,6 +67,25 @@ public partial class PDFReaderPage : Page
     private readonly Dictionary<int,int> _wordToLine = new();
     private double                       _currentPagePdfWidth;
     private double                       _currentPagePdfHeight;
+    // Rotation and visible box of the current page: annotations, memos and drawings are
+    // kept in PDF user space and mapped to the canvas through it.
+    private PageGeometry                 _currentPageGeometry;
+
+    private Point ToPdf(Point canvas, double canvasW, double canvasH)
+    {
+        var (u, v) = SearchablePdfService.ImageToUser(canvas.X, canvas.Y, canvasW, canvasH, _currentPageGeometry);
+        return new Point(u, v);
+    }
+
+    private Point ToCanvas(double u, double v, double canvasW, double canvasH)
+    {
+        var (x, y) = SearchablePdfService.UserToImage(u, v, canvasW, canvasH, _currentPageGeometry);
+        return new Point(x, y);
+    }
+
+    // A rectangle in PDF user space → canvas (axis-aligned for any /Rotate).
+    private Rect ToCanvasRect(double left, double bottom, double right, double top, double canvasW, double canvasH) =>
+        new(ToCanvas(left, bottom, canvasW, canvasH), ToCanvas(right, top, canvasW, canvasH));
 
     // ─── Adjust panel state ───────────────────────────────────────────────────
     private bool _suppressAdjSlider;
@@ -693,9 +712,16 @@ public partial class PDFReaderPage : Page
     /// <returns>False when nothing was saved (no document, or the save failed and was reported).</returns>
     public Task<bool> SaveAsAsync(string outputPath, bool includeOcr = true) => SaveToPathAsync(outputPath, includeOcr);
 
-    private async Task<bool> SaveToPathAsync(string outputPath, bool includeOcr = true)
+    /// <summary>
+    /// Writes the document as <see cref="SaveAsAsync"/> would, into a separate file, and
+    /// keeps working on the current one (the OCR view's "searchable PDF" export).
+    /// </summary>
+    public Task<bool> SaveCopyAsync(string outputPath, bool includeOcr = true) => SaveToPathAsync(outputPath, includeOcr, asCopy: true);
+
+    private async Task<bool> SaveToPathAsync(string outputPath, bool includeOcr = true, bool asCopy = false)
     {
         if (_editDocument is null || _currentFilePath is null) return false;
+        if (asCopy && _editPdfBytes is null) return false;
 
         bool hasAdj   = _adjSettings.Count > 0 && _renderDocument != null;
         int  adjCount = hasAdj ? _adjSettings.Count : 0;
@@ -713,39 +739,49 @@ public partial class PDFReaderPage : Page
 
         string? tmpPath = null;
         var bakedResources = new List<(MemoryStream Ms, XImage Xi)>();
+        // A copy is written from the current state's bytes; the document itself stays untouched.
+        PdfDocument doc = asCopy
+            ? PdfReader.Open(new MemoryStream(_editPdfBytes!), PdfDocumentOpenMode.Modify)
+            : _editDocument;
         try
         {
             progress.Update(++step, total, "어노테이션 처리 중…");
-            EmbedAnnotationsAndMemos();
+            EmbedAnnotationsAndMemos(doc);
 
             if (hasAdj)
             {
-                await BakeAdjustmentsIntoDocAsync(_editDocument, bakedResources,
+                var baked = await BakeAdjustmentsIntoDocAsync(doc, bakedResources,
                     onPageDone: (done, pageTotal) =>
                     {
                         progress.Update(step + done, total,
                             $"이미지 조정 적용 중… ({done} / {pageTotal} 페이지)");
                     });
                 step += adjCount;
+                // Baked pages got a new frame; their OCR text goes through it too.
+                foreach (var (pi, before) in baked)
+                    if (ocrData.TryGetValue(pi, out var d)) ocrData[pi] = OcrOnBakedPage(d, before);
             }
 
             if (BookmarkService.Instance.IsDirty(_currentFilePath))
-                WriteBookmarksToOutlines(_editDocument, _currentFilePath);
+                WriteBookmarksToOutlines(doc, _currentFilePath);
 
             progress.Update(++step, total, "PDF 파일 저장 중…");
             tmpPath = System.IO.Path.Combine(
                 System.IO.Path.GetDirectoryName(outputPath)!,
                 System.IO.Path.GetRandomFileName() + ".pdf");
 
-            await Task.Run(() => _editDocument.Save(tmpPath));
+            await Task.Run(() => doc.Save(tmpPath));
 
             foreach (var (ms, xi) in bakedResources) { xi.Dispose(); ms.Dispose(); }
             bakedResources.Clear();
 
-            _editDocument.Dispose();
-            _editDocument   = null;
-            _renderDocument = null;
-            _images.SetDocument(null);
+            doc.Dispose();
+            if (!asCopy)
+            {
+                _editDocument   = null;
+                _renderDocument = null;
+                _images.SetDocument(null);
+            }
 
             if (hasOcr)
             {
@@ -771,9 +807,17 @@ public partial class PDFReaderPage : Page
             File.Move(tmpPath, outputPath, overwrite: true);
             tmpPath = null;
 
+            if (asCopy)
+            {
+                progress.Close();
+                SetStatus($"Saved a copy: {System.IO.Path.GetFileName(outputPath)}");
+                return true;
+            }
+
             if (!outputPath.Equals(_currentFilePath, StringComparison.OrdinalIgnoreCase))
             {
                 AnnotationService.Instance.RenameFile(_currentFilePath, outputPath);
+                MemoService.Instance.RenameFile(_currentFilePath, outputPath);
                 DrawingService.Instance.RenameFile(_currentFilePath, outputPath);
             }
 
@@ -793,6 +837,7 @@ public partial class PDFReaderPage : Page
         catch (Exception ex)
         {
             progress.Close();
+            if (asCopy) doc.Dispose();
             foreach (var (ms, xi) in bakedResources) { xi?.Dispose(); ms?.Dispose(); }
             if (tmpPath != null && File.Exists(tmpPath)) File.Delete(tmpPath);
             MessageBox.Show($"Save failed:\n{ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
@@ -806,10 +851,15 @@ public partial class PDFReaderPage : Page
     /// The streams and XImages added to <paramref name="resources"/> must be kept
     /// alive until after <see cref="PdfDocument.Save"/> is called.
     /// </summary>
-    private async Task BakeAdjustmentsIntoDocAsync(
+    /// <returns>
+    /// For each baked page, its geometry before baking: a baked page becomes its displayed
+    /// area (origin 0, no rotation, no crop), and coordinates move by <see cref="BakedPageMap"/>.
+    /// </returns>
+    private async Task<Dictionary<int, PageGeometry>> BakeAdjustmentsIntoDocAsync(
         PdfDocument doc, List<(MemoryStream Ms, XImage Xi)> resources,
         Action<int, int>? onPageDone = null)
     {
+        var baked = new Dictionary<int, PageGeometry>();
         var entries = _adjSettings.ToList();
         int done = 0;
         foreach (var (pageIdx, adjS) in entries)
@@ -854,23 +904,19 @@ public partial class PDFReaderPage : Page
             var xImg  = XImage.FromStream(imgMs);
             resources.Add((imgMs, xImg));
 
-            // Determine draw dimensions, accounting for PDF page rotation.
-            // WinRT renders in display orientation; we bake that orientation directly.
-            var page = doc.Pages[pageIdx];
-            double ptW, ptH;
-            if (page.Rotate is 90 or 270)
-            {
-                ptW = page.Height.Point;
-                ptH = page.Width.Point;
-                page.Width  = XUnit.FromPoint(ptW);
-                page.Height = XUnit.FromPoint(ptH);
-                page.Rotate = 0;
-            }
-            else
-            {
-                ptW = page.Width.Point;
-                ptH = page.Height.Point;
-            }
+            // WinRT rendered the displayed area (CropBox, rotation applied); that area
+            // becomes the whole page: MediaBox at the origin, no CropBox, no rotation.
+            var page    = doc.Pages[pageIdx];
+            var oldGeom = SearchablePdfService.GeometryOf(page);
+            var (ptW, ptH) = SearchablePdfService.DisplaySize(oldGeom);
+            TransformAnnotations(page, BakedPageMap(oldGeom));
+            page.Elements.Remove("/CropBox");
+            page.Rotate      = 0;
+            // PDFsharp keeps "landscape" from the old /Rotate and would then swap width and
+            // height for XGraphics, drawing the image shifted and scaled.
+            page.Orientation = PdfSharp.PageOrientation.Portrait;
+            page.MediaBox    = new PdfSharp.Pdf.PdfRectangle(new XPoint(0, 0), new XPoint(ptW, ptH));
+            baked[pageIdx] = oldGeom;
 
             // Discard original content streams and draw the adjusted image.
             page.Elements.Remove("/Contents");
@@ -879,6 +925,63 @@ public partial class PDFReaderPage : Page
 
             onPageDone?.Invoke(++done, entries.Count);
         }
+        return baked;
+    }
+
+    /// <summary>
+    /// User space of a page before baking → user space of the baked page, whose origin is
+    /// the bottom-left of what was displayed (rotation and crop applied).
+    /// </summary>
+    private static Func<double, double, (double U, double V)> BakedPageMap(PageGeometry before)
+    {
+        var (w, h) = SearchablePdfService.DisplaySize(before);
+        return (u, v) =>
+        {
+            var (x, y) = SearchablePdfService.UserToImage(u, v, w, h, before);
+            return (x, h - y);
+        };
+    }
+
+    // Moves every annotation of the page (ours and others): /Rect, /QuadPoints, /L.
+    private static void TransformAnnotations(PdfPage page, Func<double, double, (double U, double V)> map)
+    {
+        var annots = page.Elements.GetArray("/Annots");
+        if (annots == null) return;
+        foreach (var item in annots.Elements)
+        {
+            var d = (item is PdfSharp.Pdf.Advanced.PdfReference r ? r.Value : item) as PdfDictionary;
+            if (d == null) continue;
+            if (d.Elements.GetArray("/Rect") is { Elements.Count: 4 } rect)
+            {
+                var a = map(GetPdfReal(rect.Elements[0]), GetPdfReal(rect.Elements[1]));
+                var b = map(GetPdfReal(rect.Elements[2]), GetPdfReal(rect.Elements[3]));
+                d.Elements["/Rect"] = MakePdfArray(Math.Min(a.U, b.U), Math.Min(a.V, b.V),
+                                                   Math.Max(a.U, b.U), Math.Max(a.V, b.V));
+            }
+            foreach (var key in new[] { "/QuadPoints", "/L" })
+            {
+                if (d.Elements.GetArray(key) is not { } arr || arr.Elements.Count % 2 != 0) continue;
+                var moved = new List<double>();
+                for (int k = 0; k < arr.Elements.Count; k += 2)
+                {
+                    var q = map(GetPdfReal(arr.Elements[k]), GetPdfReal(arr.Elements[k + 1]));
+                    moved.Add(q.U); moved.Add(q.V);
+                }
+                d.Elements[key] = MakePdfArray(moved.ToArray());
+            }
+        }
+    }
+
+    // OCR text of a baked page: same OCR image, placed through the page's new frame.
+    private static OcrPageData OcrOnBakedPage(OcrPageData data, PageGeometry before)
+    {
+        var g0  = data.Geometry ?? before;
+        var map = BakedPageMap(before);
+        var a = map(g0.Box.X, g0.Box.Y);
+        var b = map(g0.Box.X + g0.Box.Width, g0.Box.Y + g0.Box.Height);
+        var box = new PdfPageBox(Math.Min(a.U, b.U), Math.Min(a.V, b.V), Math.Abs(b.U - a.U), Math.Abs(b.V - a.V));
+        int rot = ((g0.Rotation - before.Rotation) % 360 + 360) % 360;
+        return data with { Geometry = new PageGeometry(rot, box) };
     }
 
     // ─── Undo / Redo implementation ──────────────────────────────────────────
@@ -2207,11 +2310,13 @@ public partial class PDFReaderPage : Page
             var p = _editDocument.Pages[(int)_currentPage];
             _currentPagePdfWidth  = p.Width.Point;
             _currentPagePdfHeight = p.Height.Point;
+            _currentPageGeometry  = SearchablePdfService.GeometryOf(p);
         }
         else
         {
             _currentPagePdfWidth  = imageWidth;
             _currentPagePdfHeight = imageHeight;
+            _currentPageGeometry  = new PageGeometry(0, new PdfPageBox(0, 0, imageWidth, imageHeight));
         }
 
         DrawAnnotations();
@@ -2856,10 +2961,9 @@ public partial class PDFReaderPage : Page
         // Capture PDF-space coordinates for "Add Memo"
         if (_currentPagePdfHeight > 0)
         {
-            double toX = _currentPagePdfWidth  / TextOverlayCanvas.Width;
-            double toY = _currentPagePdfHeight / TextOverlayCanvas.Height;
-            _memoInsertPdfX = pos.X * toX;
-            _memoInsertPdfY = _currentPagePdfHeight - pos.Y * toY;
+            var at = ToPdf(pos, TextOverlayCanvas.Width, TextOverlayCanvas.Height);
+            _memoInsertPdfX = at.X;
+            _memoInsertPdfY = at.Y;
         }
 
         var menu   = TextOverlayCanvas.ContextMenu;
@@ -2913,8 +3017,7 @@ public partial class PDFReaderPage : Page
         if (_currentFilePath is null || _selectedIndices.Count == 0) return;
         if (_currentPagePdfWidth <= 0 || _currentPagePdfHeight <= 0) return;
 
-        double toX = _currentPagePdfWidth  / AnnotationCanvas.Width;
-        double toY = _currentPagePdfHeight / AnnotationCanvas.Height;
+        double cw = AnnotationCanvas.Width, ch = AnnotationCanvas.Height;
 
         var spans = _selectedIndices
             .GroupBy(i => _wordToLine.GetValueOrDefault(i, -1))
@@ -2922,16 +3025,14 @@ public partial class PDFReaderPage : Page
             .Select(g =>
             {
                 var ws = g.Select(i => _pageWords[i]).ToList();
-                double cl = ws.Min(w => w.Left);
-                double cr = ws.Max(w => w.Right);
-                double ct = ws.Min(w => w.Top);
-                double cb = ws.Max(w => w.Bottom);
+                var a = ToPdf(new Point(ws.Min(w => w.Left),  ws.Min(w => w.Top)),    cw, ch);
+                var b = ToPdf(new Point(ws.Max(w => w.Right), ws.Max(w => w.Bottom)), cw, ch);
                 return new AnnotationSpan
                 {
-                    Left   = cl * toX,
-                    Right  = cr * toX,
-                    Top    = _currentPagePdfHeight - ct * toY,    // canvas top-down → PDF bottom-up
-                    Bottom = _currentPagePdfHeight - cb * toY,
+                    Left   = Math.Min(a.X, b.X),
+                    Right  = Math.Max(a.X, b.X),
+                    Bottom = Math.Min(a.Y, b.Y),
+                    Top    = Math.Max(a.Y, b.Y),
                 };
             })
             .ToList();
@@ -2958,19 +3059,15 @@ public partial class PDFReaderPage : Page
         AnnotationCanvas.Children.Clear();
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
 
-        double sx = AnnotationCanvas.Width  / _currentPagePdfWidth;
-        double sy = AnnotationCanvas.Height / _currentPagePdfHeight;
-
         foreach (var ann in AnnotationService.Instance.ForPage(_currentFilePath, _currentPage))
         {
             bool sel = _selectedAnnotation?.Id == ann.Id;
 
             foreach (var span in ann.Spans)
             {
-                double cl  = span.Left   * sx;
-                double cr  = span.Right  * sx;
-                double ct  = (_currentPagePdfHeight - span.Top)    * sy;
-                double cb  = (_currentPagePdfHeight - span.Bottom) * sy;
+                var    rc  = ToCanvasRect(span.Left, span.Bottom, span.Right, span.Top,
+                                          AnnotationCanvas.Width, AnnotationCanvas.Height);
+                double cl  = rc.Left, cr = rc.Right, ct = rc.Top, cb = rc.Bottom;
                 double mid = (ct + cb) / 2;
 
                 switch (ann.Type)
@@ -3041,17 +3138,13 @@ public partial class PDFReaderPage : Page
     private TextAnnotation? HitTestAnnotation(Point pt)
     {
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return null;
-        double sx = AnnotationCanvas.Width  / _currentPagePdfWidth;
-        double sy = AnnotationCanvas.Height / _currentPagePdfHeight;
-
         foreach (var ann in AnnotationService.Instance.ForPage(_currentFilePath, _currentPage))
         {
             foreach (var span in ann.Spans)
             {
-                double cl = span.Left  * sx;
-                double cr = span.Right * sx;
-                double ct = (_currentPagePdfHeight - span.Top)    * sy;
-                double cb = (_currentPagePdfHeight - span.Bottom) * sy;
+                var    rc = ToCanvasRect(span.Left, span.Bottom, span.Right, span.Top,
+                                         AnnotationCanvas.Width, AnnotationCanvas.Height);
+                double cl = rc.Left, cr = rc.Right, ct = rc.Top, cb = rc.Bottom;
                 if (ann.Type != AnnotationType.Highlight) { ct -= 5; cb += 5; }
                 if (pt.X >= cl && pt.X <= cr && pt.Y >= ct && pt.Y <= cb)
                     return ann;
@@ -3173,15 +3266,15 @@ public partial class PDFReaderPage : Page
     //  PDF persistence – embed (save) and load
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private void EmbedAnnotationsAndMemos()
+    private void EmbedAnnotationsAndMemos(PdfDocument doc)
     {
-        if (_editDocument is null || _currentFilePath is null) return;
+        if (_currentFilePath is null) return;
 
         var allAnns = AnnotationService.Instance.ForFile(_currentFilePath).ToList();
 
-        for (int pi = 0; pi < _editDocument.Pages.Count; pi++)
+        for (int pi = 0; pi < doc.Pages.Count; pi++)
         {
-            var page = _editDocument.Pages[pi];
+            var page = doc.Pages[pi];
 
             // Collect items from the existing /Annots array that don't belong to us.
             var toKeep = new List<PdfItem>();
@@ -3197,27 +3290,27 @@ public partial class PDFReaderPage : Page
             }
 
             // Build a fresh /Annots array = kept third-party items + our new items.
-            var annots = new PdfArray(_editDocument);
+            var annots = new PdfArray(doc);
             foreach (var kept in toKeep)
                 annots.Elements.Add(kept);
 
             // Embed text annotations (highlight / underline / strikethrough).
             foreach (var ann in allAnns.Where(a => (int)a.PageNumber == pi && a.Spans.Count > 0))
-                EmbedTextAnnotation(annots, ann);
+                EmbedTextAnnotation(doc, annots, ann);
 
             // Embed memos as PDF /Text (sticky-note) annotations.
             foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, (uint)pi))
-                EmbedMemo(annots, memo);
+                EmbedMemo(doc, annots, memo);
 
             // Embed drawn shapes (Line/Box/Circle).
             foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, (uint)pi))
-                EmbedDrawingShape(annots, shape);
+                EmbedDrawingShape(doc, annots, shape);
 
             page.Elements["/Annots"] = annots;
         }
     }
 
-    private void EmbedDrawingShape(PdfArray annots, DrawingShape shape)
+    private static void EmbedDrawingShape(PdfDocument doc, PdfArray annots, DrawingShape shape)
     {
         // Store as a /Square (box), /Circle, or /Line PDF annotation.
         string subtype = shape.ShapeType switch
@@ -3232,7 +3325,7 @@ public partial class PDFReaderPage : Page
         double maxX = Math.Max(shape.X1, shape.X2);
         double maxY = Math.Max(shape.Y1, shape.Y2);
 
-        var d = new PdfDictionary(_editDocument);
+        var d = new PdfDictionary(doc);
         d.Elements["/Type"]    = new PdfName("/Annot");
         d.Elements["/Subtype"] = new PdfName(subtype);
         d.Elements["/T"]       = new PdfString("HoloPDF Drawing");
@@ -3248,7 +3341,7 @@ public partial class PDFReaderPage : Page
         if (shape.ShapeType == DrawingShapeType.Line)
             d.Elements["/L"] = MakePdfArray(shape.X1, shape.Y1, shape.X2, shape.Y2);
 
-        _editDocument!.Internals.AddObject(d);
+        doc.Internals.AddObject(d);
         annots.Elements.Add(d.Reference!);
     }
 
@@ -3261,7 +3354,7 @@ public partial class PDFReaderPage : Page
         return t is "HoloPDF Creator" or "HoloPDF Memo" or "HoloPDF Drawing";
     }
 
-    private void EmbedTextAnnotation(PdfArray annots, TextAnnotation ann)
+    private static void EmbedTextAnnotation(PdfDocument doc, PdfArray annots, TextAnnotation ann)
     {
         string subtype = ann.Type switch
         {
@@ -3271,7 +3364,7 @@ public partial class PDFReaderPage : Page
             _                            => "/Highlight"
         };
 
-        var d = new PdfDictionary(_editDocument);
+        var d = new PdfDictionary(doc);
         d.Elements["/Type"]       = new PdfName("/Annot");
         d.Elements["/Subtype"]    = new PdfName(subtype);
         d.Elements["/T"]          = new PdfString("HoloPDF Creator");
@@ -3280,7 +3373,7 @@ public partial class PDFReaderPage : Page
             ann.Spans.Min(s => s.Left),   ann.Spans.Min(s => s.Bottom),
             ann.Spans.Max(s => s.Right),  ann.Spans.Max(s => s.Top));
 
-        var qp = new PdfArray(_editDocument);
+        var qp = new PdfArray(doc);
         foreach (var span in ann.Spans)
         {
             // UL, UR, LL, LR (PDF Y-up space)
@@ -3295,14 +3388,14 @@ public partial class PDFReaderPage : Page
         if (ann.Type == AnnotationType.Highlight)
             d.Elements["/CA"] = new PdfReal(0.5);
 
-        _editDocument.Internals.AddObject(d);
+        doc.Internals.AddObject(d);
         annots.Elements.Add(d.Reference!);
     }
 
-    private void EmbedMemo(PdfArray annots, PdfMemo memo)
+    private static void EmbedMemo(PdfDocument doc, PdfArray annots, PdfMemo memo)
     {
         double x = memo.X, y = memo.Y;
-        var d = new PdfDictionary(_editDocument);
+        var d = new PdfDictionary(doc);
         d.Elements["/Type"]     = new PdfName("/Annot");
         d.Elements["/Subtype"]  = new PdfName("/Text");
         d.Elements["/T"]        = new PdfString("HoloPDF Memo");
@@ -3312,7 +3405,7 @@ public partial class PDFReaderPage : Page
         d.Elements["/F"]        = new PdfInteger(4);
         d.Elements["/Name"]     = new PdfName("/Note");
 
-        _editDocument.Internals.AddObject(d);
+        doc.Internals.AddObject(d);
         annots.Elements.Add(d.Reference!);
     }
 
@@ -3848,13 +3941,10 @@ public partial class PDFReaderPage : Page
         MemoCanvas.Children.Clear();
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
 
-        double sx = MemoCanvas.Width  / _currentPagePdfWidth;
-        double sy = MemoCanvas.Height / _currentPagePdfHeight;
-
         foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, _currentPage))
         {
-            double cx = memo.X * sx;
-            double cy = (_currentPagePdfHeight - memo.Y) * sy;
+            var    at = ToCanvas(memo.X, memo.Y, MemoCanvas.Width, MemoCanvas.Height);
+            double cx = at.X, cy = at.Y;
 
             var icon = new Border
             {
@@ -3888,13 +3978,10 @@ public partial class PDFReaderPage : Page
     {
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return null;
 
-        double sx = MemoCanvas.Width  / _currentPagePdfWidth;
-        double sy = MemoCanvas.Height / _currentPagePdfHeight;
-
         foreach (var memo in MemoService.Instance.ForPage(_currentFilePath, _currentPage))
         {
-            double cx = memo.X * sx;
-            double cy = (_currentPagePdfHeight - memo.Y) * sy;
+            var    at = ToCanvas(memo.X, memo.Y, MemoCanvas.Width, MemoCanvas.Height);
+            double cx = at.X, cy = at.Y;
             // icon occupies (cx-11, cy-22) to (cx+11, cy)
             if (pt.X >= cx - 11 && pt.X <= cx + 11 && pt.Y >= cy - 22 && pt.Y <= cy)
                 return memo;
@@ -4229,13 +4316,9 @@ public partial class PDFReaderPage : Page
 
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) { e.Handled = true; return; }
 
-        double toX = _currentPagePdfWidth  / DrawingCanvas.Width;
-        double toY = _currentPagePdfHeight / DrawingCanvas.Height;
-
-        double px1 = _drawStart.X * toX;
-        double py1 = _currentPagePdfHeight - _drawStart.Y * toY;
-        double px2 = pos.X * toX;
-        double py2 = _currentPagePdfHeight - pos.Y * toY;
+        var    p1  = ToPdf(_drawStart, DrawingCanvas.Width, DrawingCanvas.Height);
+        var    p2  = ToPdf(pos,        DrawingCanvas.Width, DrawingCanvas.Height);
+        double px1 = p1.X, py1 = p1.Y, px2 = p2.X, py2 = p2.Y;
 
         var shape = new DrawingShape
         {
@@ -4337,17 +4420,13 @@ public partial class PDFReaderPage : Page
         DrawingCanvas.Children.Clear();
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return;
 
-        double sx = DrawingCanvas.Width  / _currentPagePdfWidth;
-        double sy = DrawingCanvas.Height / _currentPagePdfHeight;
-
         foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, _currentPage))
         {
             bool sel = _selectedShape?.Id == shape.Id;
 
-            double cx1 = shape.X1 * sx;
-            double cy1 = (_currentPagePdfHeight - shape.Y1) * sy;
-            double cx2 = shape.X2 * sx;
-            double cy2 = (_currentPagePdfHeight - shape.Y2) * sy;
+            var    c1  = ToCanvas(shape.X1, shape.Y1, DrawingCanvas.Width, DrawingCanvas.Height);
+            var    c2  = ToCanvas(shape.X2, shape.Y2, DrawingCanvas.Width, DrawingCanvas.Height);
+            double cx1 = c1.X, cy1 = c1.Y, cx2 = c2.X, cy2 = c2.Y;
 
             var mode = shape.ShapeType switch
             {
@@ -4421,15 +4500,11 @@ public partial class PDFReaderPage : Page
     {
         if (_currentFilePath is null || _currentPagePdfHeight <= 0) return null;
 
-        double sx = DrawingCanvas.Width  / _currentPagePdfWidth;
-        double sy = DrawingCanvas.Height / _currentPagePdfHeight;
-
         foreach (var shape in DrawingService.Instance.ForPage(_currentFilePath, _currentPage))
         {
-            double cx1 = shape.X1 * sx;
-            double cy1 = (_currentPagePdfHeight - shape.Y1) * sy;
-            double cx2 = shape.X2 * sx;
-            double cy2 = (_currentPagePdfHeight - shape.Y2) * sy;
+            var    c1  = ToCanvas(shape.X1, shape.Y1, DrawingCanvas.Width, DrawingCanvas.Height);
+            var    c2  = ToCanvas(shape.X2, shape.Y2, DrawingCanvas.Width, DrawingCanvas.Height);
+            double cx1 = c1.X, cy1 = c1.Y, cx2 = c2.X, cy2 = c2.Y;
 
             double minX = Math.Min(cx1, cx2);
             double maxX = Math.Max(cx1, cx2);

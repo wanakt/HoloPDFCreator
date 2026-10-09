@@ -100,6 +100,8 @@ public partial class OcrPage : Page
 
     // Page images of PDF pages: the reader's provider for its document, or one of our own.
     private const int OcrImageWidth = 1200;
+    // Render the next page while the current one is looked at (browsing is mostly forward).
+    private bool _prefetchNext = true;
     private PageImageProvider? _images;
     private bool _ownsImages;
 
@@ -416,6 +418,7 @@ public partial class OcrPage : Page
     private async Task LoadAndDisplayPageAsync(int index)
     {
         if (_images == null || index < 0 || index >= _items.Count || !_items[index].FromPdf) return;
+        if (_prefetchNext) _images.Prefetch(index + 1, OcrImageWidth);
         if (_items[index].OcrSource != null) { SelectItem(index); return; }
 
         try

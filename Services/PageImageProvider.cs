@@ -44,6 +44,10 @@ public sealed class PageImageProvider : IDisposable
     private long _bytes;
     private readonly Dictionary<long, int> _pageVersion = new();
 
+    // Renders in flight, so a page asked for twice (prefetch, then display) is rendered once.
+    // Keyed with the file and page version they were started for.
+    private readonly Dictionary<((long, int, bool) Key, int Doc, int Ver), Task<BitmapSource?>> _pending = new();
+
     /// <summary>Memory the cached images may take.</summary>
     public long CacheBudget { get; set; } = 256L * 1024 * 1024;
 
@@ -155,6 +159,9 @@ public sealed class PageImageProvider : IDisposable
         var key = (id, width, adj != null);
 
         string? path; int docVersion; bool stale; int pageVersion;
+        Task<BitmapSource?>? shared = null;
+        TaskCompletionSource<BitmapSource?>? mine = null;
+        ((long, int, bool), int, int) pendingKey = default;
         lock (_lock)
         {
             if (_cache.TryGetValue(key, out var node))
@@ -165,11 +172,38 @@ public sealed class PageImageProvider : IDisposable
             }
             path = _path; docVersion = _docVersion; stale = _stale;
             pageVersion = _pageVersion.GetValueOrDefault(id);
+            if (path != null && !stale && cache)
+            {
+                pendingKey = (key, docVersion, pageVersion);
+                if (!_pending.TryGetValue(pendingKey, out shared))
+                {
+                    mine = new TaskCompletionSource<BitmapSource?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _pending[pendingKey] = mine.Task;
+                }
+            }
         }
         // Mid page edit the index may name another page in the file: render nothing.
         if (path == null || stale) return null;
+        if (shared != null) return await shared.WaitAsync(ct).ConfigureAwait(false);
 
-        var image = await RenderAsync(path, docVersion, index, width, adj, ct).ConfigureAwait(false);
+        BitmapSource? image;
+        try
+        {
+            // A shared render is not cancelled by one of its callers.
+            image = await RenderAsync(path, docVersion, index, width, adj,
+                                      mine != null ? CancellationToken.None : ct).ConfigureAwait(false);
+            mine?.TrySetResult(image);
+        }
+        catch (Exception ex)
+        {
+            mine?.TrySetException(ex);
+            throw;
+        }
+        finally
+        {
+            if (mine != null) lock (_lock) _pending.Remove(pendingKey);
+        }
+        ct.ThrowIfCancellationRequested();
         if (image == null) return null;
 
         lock (_lock)
@@ -186,6 +220,13 @@ public sealed class PageImageProvider : IDisposable
             }
         }
         return image;
+    }
+
+    /// <summary>Starts rendering a page that is likely to be shown next (result is cached).</summary>
+    public void Prefetch(int index, int width, bool adjusted = true)
+    {
+        if (index < 0 || index >= _session.PageCount) return;
+        _ = GetAsync(index, width, adjusted).ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
     }
 
     private void RemoveEntry((long, int, bool) key)

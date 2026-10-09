@@ -21,12 +21,8 @@ public partial class MainWindow : Window
             await _pdfReaderPage.LoadPdfAsync(path);
             await ShowReaderDocumentInOcrAsync();
         };
-        _ocrPage.SaveReaderDocument = async (path, includeOcr) =>
-        {
-            bool saved = await _pdfReaderPage.SaveAsAsync(path, includeOcr);
-            await ShowReaderDocumentInOcrAsync();   // the reader continues on the saved file
-            return saved;
-        };
+        // A copy: the reader keeps working on its document.
+        _ocrPage.SaveReaderDocument = (path, includeOcr) => _pdfReaderPage.SaveCopyAsync(path, includeOcr);
 
         Loaded += async (_, _) =>
         {
