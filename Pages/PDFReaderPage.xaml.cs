@@ -206,8 +206,18 @@ public partial class PDFReaderPage : Page
         else if (p.Y > PdfScrollViewer.ActualHeight - edge) PdfScrollViewer.ScrollToVerticalOffset(PdfScrollViewer.VerticalOffset + step);
     }
 
+    // Clicking a page focuses its text layer (for Ctrl+C / Ctrl+A); WPF would then scroll
+    // the whole page into view, pulling a page that only peeks in at the top or bottom
+    // into the middle. The page is already where the user clicked, so never scroll for it.
+    private static void KeepInPlaceOnFocus(PageView v)
+    {
+        v.TextOverlay.RequestBringIntoView += (_, e) => e.Handled = true;
+        v.Drawing.RequestBringIntoView     += (_, e) => e.Handled = true;
+    }
+
     private void HookPageInput(PageView v)
     {
+        KeepInPlaceOnFocus(v);
         v.TextOverlay.MouseLeftButtonDown += TextOverlayCanvas_MouseDown;
         v.TextOverlay.MouseMove           += TextOverlayCanvas_MouseMove;
         v.TextOverlay.MouseLeftButtonUp   += TextOverlayCanvas_MouseUp;
@@ -385,6 +395,7 @@ public partial class PDFReaderPage : Page
             Drawing = MainDrawingCanvas, TextOverlay = MainTextOverlayCanvas,
         };
         _view = _mainView;
+        KeepInPlaceOnFocus(_mainView);
         MainDrawingCanvas.MouseLeftButtonDown += DrawingCanvas_MouseDown;
         MainDrawingCanvas.MouseMove           += DrawingCanvas_MouseMove;
         MainDrawingCanvas.MouseLeftButtonUp   += DrawingCanvas_MouseUp;
