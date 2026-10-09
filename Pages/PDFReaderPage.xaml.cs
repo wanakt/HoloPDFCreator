@@ -120,15 +120,90 @@ public partial class PDFReaderPage : Page
         finally { _view = saved; }
     }
 
-    // Input from a page's canvas: work on that page. Pressing on another page clears the
-    // selection left on the previous one (one selection in the document at a time).
+    // Input from a page's canvas: work on that page. A press that starts a new selection
+    // clears what was selected on the other pages (one selection in the document).
     private void UseViewOf(object sender, bool pressing = false)
     {
         var v = AllViews.FirstOrDefault(pv => ReferenceEquals(pv.TextOverlay, sender) || ReferenceEquals(pv.Drawing, sender));
-        if (v == null || ReferenceEquals(v, _view)) return;
-        if (pressing && _view.Selected.Count > 0)
-            WithView(_view, () => { _selectedIndices.Clear(); RefreshHighlights(); });
+        if (v == null) return;
+        if (pressing) ClearSelectionExcept(v);
         _view = v;
+    }
+
+    // Pages with selected words, top to bottom.
+    private List<PageView> SelectedViews() => AllViews.Where(v => v.Selected.Count > 0).OrderBy(v => v.Page).ToList();
+
+    private int SelectedWordCount => AllViews.Sum(v => v.Selected.Count);
+
+    private void ClearSelectionExcept(PageView? keep)
+    {
+        foreach (var v in AllViews)
+            if (!ReferenceEquals(v, keep) && v.Selected.Count > 0)
+                WithView(v, () => { _selectedIndices.Clear(); RefreshHighlights(); });
+    }
+
+    // Selected text of every page, in reading order, pages separated by a line break.
+    private string SelectedText() => string.Join("\n", SelectedViews().Select(v =>
+        string.Join(" ", v.ReadingOrder.Where(v.Selected.Contains).Select(i => v.Words[i].Text))));
+
+    // ── selection dragged across pages ───────────────────────────────────────
+
+    // The page whose text layer is under (or nearest to) a point given relative to `from`.
+    private PageView NearestView(PageView from, Point posInFrom)
+    {
+        PageView best = from; double bestDist = double.MaxValue;
+        foreach (var v in AllViews)
+        {
+            if (v.TextOverlay.ActualHeight <= 0) continue;
+            var pt = from.TextOverlay.TranslatePoint(posInFrom, v.TextOverlay);
+            double dist = pt.Y < 0 ? -pt.Y : pt.Y > v.TextOverlay.ActualHeight ? pt.Y - v.TextOverlay.ActualHeight : 0;
+            if (dist < bestDist) { bestDist = dist; best = v; }
+        }
+        return best;
+    }
+
+    /// <summary>
+    /// Extends the drag that started on <paramref name="anchor"/> (at reading-order index
+    /// <paramref name="anchorOrder"/>) to <paramref name="target"/> at <paramref name="posInTarget"/>:
+    /// the anchor page from the anchor to its end (or start), pages in between entirely,
+    /// the target page from its start (or end) to the pointer.
+    /// </summary>
+    private void ExtendSelectionAcrossPages(PageView anchor, int anchorOrder, PageView target, Point posInTarget)
+    {
+        int targetOrder = -1;
+        WithView(target, () => targetOrder = _readingOrder.Count > 0 ? GetNearestReadingOrder(posInTarget) : -1);
+        bool down = target.Page > anchor.Page;
+        uint lo = Math.Min(anchor.Page, target.Page), hi = Math.Max(anchor.Page, target.Page);
+
+        foreach (var v in AllViews)
+        {
+            var next = new HashSet<int>();
+            int n = v.ReadingOrder.Count;
+            if (n > 0)
+            {
+                (int from, int to) range =
+                    ReferenceEquals(v, anchor) ? (down ? (anchorOrder, n - 1) : (0, anchorOrder)) :
+                    ReferenceEquals(v, target) ? (targetOrder < 0 ? (1, 0) : down ? (0, targetOrder) : (targetOrder, n - 1)) :
+                    v.Page > lo && v.Page < hi ? (0, n - 1) : (1, 0);
+                for (int k = Math.Max(0, range.from); k <= range.to && k < n; k++) next.Add(v.ReadingOrder[k]);
+            }
+            if (!next.SetEquals(v.Selected))
+                WithView(v, () =>
+                {
+                    _selectedIndices.Clear();
+                    foreach (var i in next) _selectedIndices.Add(i);
+                    RefreshHighlights();
+                });
+        }
+    }
+
+    // Dragging near the top/bottom edge scrolls, so the selection can reach pages off screen.
+    private void AutoScrollWhileDragging(MouseEventArgs e)
+    {
+        var p = e.GetPosition(PdfScrollViewer);
+        const double edge = 24, step = 24;
+        if (p.Y < edge)                                 PdfScrollViewer.ScrollToVerticalOffset(PdfScrollViewer.VerticalOffset - step);
+        else if (p.Y > PdfScrollViewer.ActualHeight - edge) PdfScrollViewer.ScrollToVerticalOffset(PdfScrollViewer.VerticalOffset + step);
     }
 
     private void HookPageInput(PageView v)
@@ -2780,6 +2855,18 @@ public partial class PDFReaderPage : Page
 
             if (_isDragging && _dragAnchorOrder >= 0)
             {
+                AutoScrollWhileDragging(e);
+                var anchorView = _view;
+                var overView   = NearestView(anchorView, pos);
+                if (!ReferenceEquals(overView, anchorView))
+                {
+                    var posInOver = anchorView.TextOverlay.TranslatePoint(pos, overView.TextOverlay);
+                    ExtendSelectionAcrossPages(anchorView, _dragAnchorOrder, overView, posInOver);
+                    UpdateSelectionStatus();
+                    return;
+                }
+                ClearSelectionExcept(anchorView);   // came back onto the page the drag started on
+
                 // For vertical text (90°/270°), lock to anchor column when dragging primarily vertically.
                 // This prevents minor X wobble from jumping across the narrow columns.
                 bool vertDrag = _isVerticalText && _dragAnchorLine != null;
@@ -2902,8 +2989,7 @@ public partial class PDFReaderPage : Page
         else if (ctrl && e.Key == Key.A) { SelectAllWords();            e.Handled = true; }
         else if (e.Key == Key.Escape)
         {
-            _selectedIndices.Clear();
-            RefreshHighlights();
+            ClearSelectionExcept(null);
             UpdateSelectionStatus();
             e.Handled = true;
         }
@@ -2920,11 +3006,10 @@ public partial class PDFReaderPage : Page
 
     private void CopySelectionToClipboard()
     {
-        if (_selectedIndices.Count == 0) return;
-        var text = string.Join(" ",
-            _readingOrder.Where(_selectedIndices.Contains).Select(i => _pageWords[i].Text));
-        Clipboard.SetText(text);
-        SetStatus($"Copied {_selectedIndices.Count} word(s) to clipboard.");
+        int count = SelectedWordCount;
+        if (count == 0) return;
+        Clipboard.SetText(SelectedText());
+        SetStatus($"Copied {count} word(s) to clipboard.");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3123,26 +3208,25 @@ public partial class PDFReaderPage : Page
 
     private void UpdateSelectionStatus()
     {
-        bool hasSel = _selectedIndices.Count > 0;
-        BtnHighlight.IsEnabled = hasSel;
+        int count = SelectedWordCount;
+        BtnHighlight.IsEnabled = count > 0;
 
-        if (!hasSel)
+        if (count == 0)
         {
             SetStatus($"Page {ViewPage + 1} / {_totalPages}  ·  Drag or click to select");
             return;
         }
 
-        var preview = string.Join(" ",
-            _readingOrder.Where(_selectedIndices.Contains).Select(i => _pageWords[i].Text));
+        var preview = SelectedText().Replace('\n', ' ');
         if (preview.Length > 60) preview = preview[..57] + "…";
-        SetStatus($"{_selectedIndices.Count} word(s) selected: \"{preview}\"");
+        int pages = SelectedViews().Count;
+        SetStatus($"{count} word(s) selected{(pages > 1 ? $" on {pages} pages" : "")}: \"{preview}\"");
     }
 
     private void BtnHighlight_Click(object sender, RoutedEventArgs e)
     {
         AddAnnotation(AnnotationType.Highlight, Color.FromRgb(0xFF, 0xEE, 0x00));
-        _selectedIndices.Clear();
-        RefreshHighlights();
+        ClearSelectionExcept(null);
         UpdateSelectionStatus();
     }
 
@@ -3154,7 +3238,7 @@ public partial class PDFReaderPage : Page
 
     private void TextOverlayCanvas_ContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
-        UseViewOf(sender, pressing: true);
+        UseViewOf(sender);
         var pos    = Mouse.GetPosition(TextOverlayCanvas);
         var hitAnn = HitTestAnnotation(pos);
 
@@ -3178,7 +3262,7 @@ public partial class PDFReaderPage : Page
 
         var menu   = TextOverlayCanvas.ContextMenu;
         menu.Items.Clear();
-        bool hasSel = _selectedIndices.Count > 0;
+        bool hasSel = SelectedWordCount > 0;   // the selection may cover other pages too
 
         if (hasSel)
         {
@@ -3222,7 +3306,15 @@ public partial class PDFReaderPage : Page
         return item;
     }
 
+    // Annotates the selection: one annotation on each page it covers.
     private void AddAnnotation(AnnotationType type, Color color)
+    {
+        foreach (var v in SelectedViews())
+            WithView(v, () => AddAnnotationOnPage(type, color));
+        DrawAnnotations();
+    }
+
+    private void AddAnnotationOnPage(AnnotationType type, Color color)
     {
         if (_currentFilePath is null || _selectedIndices.Count == 0) return;
         if (_currentPagePdfWidth <= 0 || _currentPagePdfHeight <= 0) return;
@@ -3257,7 +3349,6 @@ public partial class PDFReaderPage : Page
             PageNumber = ViewPage,
             Spans      = spans
         });
-        DrawAnnotations();
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
