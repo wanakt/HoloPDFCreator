@@ -21,5 +21,7 @@ public class TextAnnotation
     public Color                Color      { get; set; }
     public string               FilePath   { get; set; } = "";
     public uint                 PageNumber { get; set; }
+    // DocumentSession page id; PageNumber follows it through page edits (0 = not yet assigned).
+    public long                 PageId     { get; set; }
     public List<AnnotationSpan> Spans      { get; set; } = new();
 }

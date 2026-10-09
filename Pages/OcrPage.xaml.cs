@@ -19,7 +19,7 @@ using WinPdf = Windows.Data.Pdf;
 
 namespace HoloPDFCreator.Pages;
 
-public partial class OcrPage : Page, IPageOcrStore
+public partial class OcrPage : Page
 {
     // ─── Data model ───────────────────────────────────────────────────────────
 
@@ -83,15 +83,16 @@ public partial class OcrPage : Page, IPageOcrStore
 
     // ─── OCR ─────────────────────────────────────────────────────────────────
     private readonly OcrService _ocrService = new();
-    private readonly Dictionary<int, List<OcrRegion>> _pageRegions  = new();
-    private readonly Dictionary<int, (int w, int h)>  _regionDims   = new();
+    // OCR results are kept in the document's session by page id, so they follow pages
+    // through the reader's edits: the reader's shared session for its document, or a
+    // session of this view's own for PDFs and images opened here.
+    private DocumentSession _session = new(canGrow: true);
+    private PageIndexed<List<OcrRegion>> _pageRegions => _session.OcrRegions;
+    private PageIndexed<(int w, int h)>  _regionDims  => _session.OcrSize;
     // Page rotation / visible box when each page was OCR'd (PDF sources only).
-    private readonly Dictionary<int, PageGeometry>    _regionGeom   = new();
+    private PageIndexed<PageGeometry>    _regionGeom  => _session.OcrGeometry;
     // Current rotation / visible box of every page of _sourcePdfPath.
     private PageGeometry[]? _pageGeom;
-    // The document the results belong to: the reader's own file path, which stays
-    // the same while _sourcePdfPath (the temp file it renders from) changes per edit.
-    private string? _docKey;
     private List<OcrRegion>    _currentRegions = new();
 
     private CancellationTokenSource? _batchCts;
@@ -115,58 +116,6 @@ public partial class OcrPage : Page, IPageOcrStore
     }
 
     // ─── Public API ───────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Returns OCR results for <paramref name="forFilePath"/> as page-indexed
-    /// <see cref="OcrPageData"/> ready for <see cref="SearchablePdfService"/>.
-    /// Returns null when no results exist for that file or none have image dims
-    /// (e.g. results loaded from an existing text layer rather than freshly run).
-    /// </summary>
-
-    public IReadOnlyDictionary<int, OcrPageData>? GetOcrData(string docKey)
-    {
-        if (_docKey == null || !string.Equals(_docKey, docKey, StringComparison.OrdinalIgnoreCase)) return null;
-        var result = new Dictionary<int, OcrPageData>();
-        lock (_pageRegions)
-        {
-            foreach (var (idx, regions) in _pageRegions)
-            {
-                if (regions.Count == 0) continue;
-                if (!_regionDims.TryGetValue(idx, out var d) || d.w <= 0 || d.h <= 0) continue;
-                result[idx] = new OcrPageData(regions, d.w, d.h,
-                    _regionGeom.TryGetValue(idx, out var g) ? g : null);
-            }
-        }
-        return result.Count > 0 ? result : null;
-    }
-
-    public void SetOcrData(string docKey, IReadOnlyDictionary<int, OcrPageData>? data)
-    {
-        if (_docKey == null || !string.Equals(_docKey, docKey, StringComparison.OrdinalIgnoreCase)) return;
-        lock (_pageRegions)
-        {
-            // Regions without image size come from the PDF's own text layer; they are
-            // read again from the edited file the next time the pages are loaded.
-            _pageRegions.Clear();
-            _regionDims.Clear();
-            _regionGeom.Clear();
-            if (data != null)
-            {
-                foreach (var (idx, d) in data)
-                {
-                    _pageRegions[idx] = d.Regions;
-                    _regionDims[idx]  = (d.ImgWidth, d.ImgHeight);
-                    if (d.Geometry is { } g) _regionGeom[idx] = g;
-                }
-            }
-        }
-        if (_selectedIndex >= 0)
-        {
-            _currentRegions = _pageRegions.TryGetValue(_selectedIndex, out var cur) ? cur : new();
-            DrawOverlays();
-            ShowResults();
-        }
-    }
 
     /// <summary>
     /// The regions of page <paramref name="idx"/> in pixels of a <paramref name="w"/> × <paramref name="h"/>
@@ -226,10 +175,7 @@ public partial class OcrPage : Page, IPageOcrStore
 
     public void PrepareForImages(int expectedCount)
     {
-        _pageRegions.Clear();
-        _regionDims.Clear();
-        _regionGeom.Clear();
-        _docKey   = null;
+        _session  = new DocumentSession(canGrow: true);
         _pageGeom = null;
         _previewCts.Cancel();
         _pdfThumbCts.Cancel();
@@ -304,8 +250,7 @@ public partial class OcrPage : Page, IPageOcrStore
         _lastImageSource = paths;
         _lastPdfPath     = null;
         ClearItems();
-        lock (_pageRegions) { _pageRegions.Clear(); _regionDims.Clear(); _regionGeom.Clear(); }
-        _docKey        = null;
+        _session       = new DocumentSession(canGrow: true);
         _pageGeom      = null;
         _sourcePdfPath = null;
         _pdfPageCount  = 0;
@@ -328,35 +273,30 @@ public partial class OcrPage : Page, IPageOcrStore
     }
 
     /// <summary>
-    /// Loads the pages of <paramref name="filePath"/>. <paramref name="docKey"/> names the
-    /// document (the reader passes its own file path while <paramref name="filePath"/> is the
-    /// temp file it renders from); OCR results are kept when it is the same document.
+    /// Loads the pages of <paramref name="filePath"/>. The reader passes its
+    /// <paramref name="session"/> (and the temp file it renders from): OCR results then
+    /// live in that session and stay with their pages. Without one the PDF is opened as
+    /// a document of this view's own.
     /// </summary>
-    public async Task LoadFromPdfAsync(string filePath, uint initialPage = 0, string? docKey = null)
+    public async Task LoadFromPdfAsync(string filePath, uint initialPage = 0, DocumentSession? session = null)
     {
-        if (filePath == _lastPdfPath && _items.Count > 0) return;
+        if (filePath == _lastPdfPath && _items.Count > 0 && (session == null || ReferenceEquals(session, _session))) return;
         _lastPdfPath = filePath;
-        docKey ??= filePath;
 
         _pdfThumbCts.Cancel();
         _pdfThumbCts = new CancellationTokenSource();
-        lock (_pageRegions)
+        if (session != null)
         {
-            if (string.Equals(docKey, _docKey, StringComparison.OrdinalIgnoreCase))
-            {
-                // Same document, new rendering: keep OCR results (the reader moved them
-                // along with its page edits), drop text-layer regions (re-read below).
+            _session = session;
+            // Text-layer regions (no image size) are read again from this rendering below.
+            lock (_pageRegions)
                 foreach (int idx in _pageRegions.Keys.Where(k => !_regionDims.ContainsKey(k)).ToList())
                     _pageRegions.Remove(idx);
-            }
-            else
-            {
-                _pageRegions.Clear();
-                _regionDims.Clear();
-                _regionGeom.Clear();
-            }
         }
-        _docKey   = docKey;
+        else
+        {
+            _session = new DocumentSession();
+        }
         _pageGeom = null;
         ClearItems();
         _sourcePdfPath  = null;
@@ -370,6 +310,7 @@ public partial class OcrPage : Page, IPageOcrStore
             var pdfDoc      = await WinPdf.PdfDocument.LoadFromFileAsync(storageFile);
             uint count      = pdfDoc.PageCount;
             string baseName = Path.GetFileNameWithoutExtension(filePath);
+            if (session == null) _session.Open(filePath, (int)count);
 
             initialPage = Math.Min(initialPage, count - 1);
 
@@ -410,7 +351,6 @@ public partial class OcrPage : Page, IPageOcrStore
         catch (Exception ex)
         {
             _lastPdfPath = null;
-            _docKey      = null;
             SetStatus($"PDF load failed: {ex.Message}");
             MessageBox.Show($"Could not load PDF:\n{ex.Message}", "Error",
                             MessageBoxButton.OK, MessageBoxImage.Error);
@@ -951,13 +891,14 @@ public partial class OcrPage : Page, IPageOcrStore
         _pdfThumbCts.Cancel();
         _pdfThumbCts = new CancellationTokenSource();
         _previewCts.Cancel();
+        // Clears the document's OCR results (also the reader's, when attached to it).
         _pageRegions.Clear();
         _regionDims.Clear();
         _regionGeom.Clear();
+        _session       = new DocumentSession(canGrow: true);
         ClearItems();
         _lastPdfPath   = null;
         _sourcePdfPath = null;
-        _docKey        = null;
         _pageGeom      = null;
         _pdfPageCount  = 0;
         _pdfInitialPage = 0;
@@ -1738,7 +1679,7 @@ public partial class OcrPage : Page, IPageOcrStore
         // Same regions (and order) as _currentRegions, mapped onto the displayed image.
         var shown = _currentRegions;
         if (_selectedIndex >= 0 && _selectedIndex < _items.Count &&
-            ReferenceEquals(_pageRegions.GetValueOrDefault(_selectedIndex), _currentRegions) &&
+            _pageRegions.TryGetValue(_selectedIndex, out var selRegions) && ReferenceEquals(selRegions, _currentRegions) &&
             ImgMain.Source is BitmapSource disp)
             shown = RegionsInImage(_selectedIndex, disp.PixelWidth, disp.PixelHeight);
         for (int i = 0; i < shown.Count; i++)

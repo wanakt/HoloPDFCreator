@@ -19,6 +19,7 @@ using Windows.Storage;
 using Windows.Storage.Streams;
 using PigPdf = UglyToad.PdfPig;
 using WinPdf = Windows.Data.Pdf;
+using AdjSettings = HoloPDFCreator.Models.AdjustSettings;
 
 namespace HoloPDFCreator.Pages;
 
@@ -71,8 +72,8 @@ public partial class PDFReaderPage : Page
     private bool _suppressAdjSlider;
     private bool _adjPanelReady;
     private System.Windows.Threading.DispatcherTimer? _adjDebounceTimer;
-    private record AdjSettings(double Brightness, double Contrast, double Stroke, double UsmAmount, double UsmRadius, double UsmThreshold, bool AutoLevel);
-    private readonly Dictionary<int, AdjSettings> _adjSettings = new();
+    // Per-page data lives in the session by page id; these views address it by page index.
+    private PageIndexed<AdjSettings> _adjSettings => _session.Adjust;
 
     // ─── Memo state ───────────────────────────────────────────────────────────
     private double _memoInsertPdfX;
@@ -110,34 +111,14 @@ public partial class PDFReaderPage : Page
     // ─── Undo / Redo ─────────────────────────────────────────────────────────
     private record DrawingShapeData(DrawingShapeType Type, Color Stroke, Color Fill, bool HasFill,
                                      string FilePath, uint Page, double X1, double Y1, double X2, double Y2);
-    // Cheap per-step state that every undo step restores.
-    private record UndoState(Dictionary<int, AdjSettings> Adj, List<DrawingShapeData> Shapes,
-                             Dictionary<int, uint> BmPages, Dictionary<int, string> PageImages);
+    // Cheap per-step state that every undo step restores: the page order (per-page data
+    // that is not undoable, like OCR results, follows its page id through it), the
+    // adjustments by page id, drawings and bookmark pages.
+    private record UndoState(long[] Order, Dictionary<long, AdjSettings> Adj,
+                             List<DrawingShapeData> Shapes, Dictionary<int, uint> BmPages);
     // A step holds either a full PDF snapshot (Pdf: a handle into _snapshotStore, i.e. a
     // temp file) or a small page edit that is reverted / re-applied in place (Edit).
-    // Map: how the step moved pages, for data that is not part of the undo state but has
-    // to follow its page (OCR results). Null when no page moved.
-    private record UndoSnapshot(PdfSnapshotStore.Handle? Pdf, PageEdit? Edit, UndoState State,
-                                PageMap? Map = null);
-
-    // NewToOld[i] = index before the step of the page now at i (-1 = page added by the step).
-    // DroppedOcr: OCR results of pages the step removed, by their old index, so undoing
-    // the step can put them back.
-    private sealed record PageMap(int[] NewToOld, int OldCount,
-                                  IReadOnlyDictionary<int, OcrPageData>? DroppedOcr = null)
-    {
-        public PageMap Inverse()
-        {
-            var inv = new int[OldCount];
-            Array.Fill(inv, -1);
-            for (int i = 0; i < NewToOld.Length; i++)
-                if (NewToOld[i] >= 0 && NewToOld[i] < OldCount) inv[NewToOld[i]] = i;
-            return new PageMap(inv, NewToOld.Length) { RestoredOcr = DroppedOcr };
-        }
-
-        // Set on an inverse map: results to add back at their (new) index.
-        public IReadOnlyDictionary<int, OcrPageData>? RestoredOcr { get; init; }
-    }
+    private record UndoSnapshot(PdfSnapshotStore.Handle? Pdf, PageEdit? Edit, UndoState State);
 
     private abstract record PageEdit;
     private sealed record RotateEdit(int[] Pages, int Angle) : PageEdit;
@@ -174,7 +155,7 @@ public partial class PDFReaderPage : Page
     // Maps page index in _editDocument → original image file path (image-only pages).
     // Used so ReorderThumbPagesAsync can re-draw image pages from source files instead
     // of copying PDF pages (PDFsharp-WPF AddPage silently drops image XObjects).
-    private readonly Dictionary<int, string> _pageImagePaths = new();
+    private PageIndexed<string> _pageImagePaths => _session.SourceImages;
     private static readonly SolidColorBrush ThumbBrushNormal     = Frozen(0x1E, 0x1E, 0x2E);
     private static readonly SolidColorBrush ThumbBrushSelected   = Frozen(0x31, 0x32, 0x44);
     private static readonly SolidColorBrush ThumbBrushHover      = Frozen(0x28, 0x28, 0x3C);
@@ -217,6 +198,7 @@ public partial class PDFReaderPage : Page
 
     public PDFReaderPage()
     {
+        SubscribeSession(_session);
         InitializeComponent();
         _adjPanelReady = true;
         PdfPageBorder.Effect = new System.Windows.Media.Effects.DropShadowEffect
@@ -263,11 +245,93 @@ public partial class PDFReaderPage : Page
     public AdjustedImageStore? AdjustedStore   { get; set; }
     public BitmapSource?       CurrentPageImage => PdfPageImage.Source as BitmapSource;
 
+    private DocumentSession _session = new();
+
     /// <summary>
-    /// OCR results of the open document. Save embeds them as an invisible text layer;
-    /// page edits and undo/redo move them along with their pages.
+    /// The open document's pages and per-page data (adjustments, source images, OCR
+    /// results), shared with the OCR view. Page edits change its page order.
     /// </summary>
-    public IPageOcrStore? OcrStore { get; set; }
+    public DocumentSession Session
+    {
+        get => _session;
+        set
+        {
+            if (ReferenceEquals(value, _session)) return;
+            UnsubscribeSession(_session);
+            _session = value;
+            SubscribeSession(_session);
+        }
+    }
+
+    private void SubscribeSession(DocumentSession s)
+    {
+        s.OrderChanged   += OnSessionOrderChanged;
+        s.ContentChanged += OnSessionContentChanged;
+        s.Reset          += OnSessionReset;
+    }
+
+    private void UnsubscribeSession(DocumentSession s)
+    {
+        s.OrderChanged   -= OnSessionOrderChanged;
+        s.ContentChanged -= OnSessionContentChanged;
+        s.Reset          -= OnSessionReset;
+    }
+
+    // Page order changed (page edit or undo/redo): move what is still kept by page number.
+    private void OnSessionOrderChanged(long[] oldOrder, long[] newOrder)
+    {
+        var newIndex = new Dictionary<long, int>();
+        for (int i = 0; i < newOrder.Length; i++) newIndex[newOrder[i]] = i;
+
+        var newToOld = newOrder.Select(id => Array.IndexOf(oldOrder, id)).ToArray();
+        AdjustedStore?.Remap(newToOld);
+
+        string? file = _session.FilePath;
+        if (file == null || newOrder.Length == 0) return;
+
+        // Bookmarks on a removed page move to the next page that is still there.
+        var oldToNew = new int[oldOrder.Length];
+        for (int j = oldOrder.Length - 1, next = newOrder.Length - 1; j >= 0; j--)
+        {
+            if (newIndex.TryGetValue(oldOrder[j], out int ni)) next = ni;
+            oldToNew[j] = next;
+        }
+        BookmarkService.Instance.RemapPages(file, p => p < oldToNew.Length ? oldToNew[p] : p);
+
+        // Annotations, memos and drawings belong to their page id: hidden while the page
+        // is deleted, back when it is restored.
+        uint PageOf(long id) => newIndex.TryGetValue(id, out int ni) ? (uint)ni : uint.MaxValue;
+        long IdOf(uint page) => page < oldOrder.Length ? oldOrder[page] : 0;
+        foreach (var a in AnnotationService.Instance.ForFile(file))
+        {
+            if (a.PageId == 0) a.PageId = IdOf(a.PageNumber);
+            if (a.PageId != 0) a.PageNumber = PageOf(a.PageId);
+        }
+        foreach (var m in MemoService.Instance.ForFile(file))
+        {
+            if (m.PageId == 0) m.PageId = IdOf(m.PageNumber);
+            if (m.PageId != 0) m.PageNumber = PageOf(m.PageId);
+        }
+        foreach (var d in DrawingService.Instance.ForFile(file))
+        {
+            if (d.PageId == 0) d.PageId = IdOf(d.PageNumber);
+            if (d.PageId != 0) d.PageNumber = PageOf(d.PageId);
+        }
+    }
+
+    // Pages rotated or cropped: their adjusted images no longer match.
+    private void OnSessionContentChanged(IReadOnlyCollection<long> ids) =>
+        AdjustedStore?.Remap(null, ids.Select(_session.IndexOf).Where(i => i >= 0).ToHashSet());
+
+    // New page ids: page ids recorded on annotations no longer mean anything.
+    private void OnSessionReset()
+    {
+        string? file = _session.FilePath;
+        if (file == null) return;
+        foreach (var a in AnnotationService.Instance.ForFile(file)) a.PageId = 0;
+        foreach (var m in MemoService.Instance.ForFile(file))       m.PageId = 0;
+        foreach (var d in DrawingService.Instance.ForFile(file))    d.PageId = 0;
+    }
 
     // Renders the current page at high resolution for OCR (≈300 DPI for letter paper).
     public async Task<BitmapSource?> RenderPageForOcrAsync(uint page, uint width = 1600)
@@ -543,6 +607,8 @@ public partial class PDFReaderPage : Page
             try { File.Delete(renderTmp); } catch { /* temp file, non-critical */ }
 
             _totalPages = _renderDocument.PageCount;
+            // Same file with the same pages (e.g. reloaded after saving) keeps its page data.
+            _session.Open(filePath, (int)_totalPages);
 
             DropZone.Visibility      = Visibility.Collapsed;
             PdfPageBorder.Visibility = Visibility.Visible;
@@ -602,8 +668,8 @@ public partial class PDFReaderPage : Page
 
         bool hasAdj   = _adjSettings.Count > 0 && _renderDocument != null;
         int  adjCount = hasAdj ? _adjSettings.Count : 0;
-        var  ocrData  = OcrStore?.GetOcrData(_currentFilePath);
-        bool hasOcr   = ocrData is { Count: > 0 };
+        var  ocrData  = _session.OcrForSave();
+        bool hasOcr   = ocrData.Count > 0;
         // total = 어노테이션(1) + 페이지별 이미지 조정(adjCount) + PDF저장(1) + OCR(0~1)
         int  total    = 1 + adjCount + 1 + (hasOcr ? 1 : 0);
         int  step     = 0;
@@ -658,7 +724,7 @@ public partial class PDFReaderPage : Page
                 try
                 {
                     await Task.Run(() =>
-                        SearchablePdfService.Save(tmpPath, tmpOcr, ocrData!,
+                        SearchablePdfService.Save(tmpPath, tmpOcr, ocrData,
                                                   replaceExistingText: true));
                 }
                 catch
@@ -685,6 +751,8 @@ public partial class PDFReaderPage : Page
             // The saved file's outline now holds every bookmark; drop the in-memory
             // copies so LoadPdfAsync re-imports them once instead of duplicating.
             BookmarkService.Instance.RemoveForFile(outputPath);
+            // Same pages under the new name: OCR results and page ids stay.
+            _session.Rename(outputPath);
 
             progress.Close();
             await LoadPdfAsync(outputPath);
@@ -795,10 +863,10 @@ public partial class PDFReaderPage : Page
         BookmarkService.Instance.ForFile(_currentFilePath).ToDictionary(b => b.Id, b => b.PageNumber);
 
     private UndoState CaptureState() => new(
-        _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value),
+        _session.CaptureOrder(),
+        _session.Adjust.SnapshotById(),
         SnapshotDrawings(),
-        SnapshotBookmarkPages(),
-        new Dictionary<int, string>(_pageImagePaths));
+        SnapshotBookmarkPages());
 
     private UndoSnapshot CaptureSnapshot(byte[] pdf) => new(_snapshotStore.Capture(pdf), null, CaptureState());
 
@@ -840,68 +908,17 @@ public partial class PDFReaderPage : Page
         PushUndoEntry(CaptureSnapshot(pdfSnap));
     }
 
+    // A snapshot step whose state was captured before the edit began (page delete).
+    private void PushSnapshotUndo(UndoState before)
+    {
+        byte[]? pdfSnap = _editPdfBytes;
+        if (pdfSnap == null) return;
+        PushUndoEntry(new UndoSnapshot(_snapshotStore.Capture(pdfSnap), null, before));
+    }
+
     // Records a page edit; <paramref name="before"/> is the state captured before the edit began.
     private void PushUndoEdit(PageEdit edit, UndoState before) =>
-        PushUndoEntry(new UndoSnapshot(null, edit, before, PageMapFor(edit)));
-
-    // Called right after the edit was applied.
-    private PageMap? PageMapFor(PageEdit edit) => edit switch
-    {
-        ReorderEdit o  => new PageMap(o.NewOrder, o.NewOrder.Length),
-        InsertEdit ins => InsertMap(ins.At, ins.Count, _editDocument?.Pages.Count ?? 0),
-        _              => null,   // rotate / crop keep every page in place
-    };
-
-    private static PageMap InsertMap(int at, int count, int newCount)
-    {
-        var map = new int[newCount];
-        for (int i = 0; i < newCount; i++)
-            map[i] = i < at ? i : i < at + count ? -1 : i - count;
-        return new PageMap(map, newCount - count);
-    }
-
-    /// <summary>
-    /// Moves per-page data along with a page edit: adjustment settings, adjusted images
-    /// (dropped for <paramref name="reshaped"/> pages, whose rendering changed) and OCR
-    /// results. With <paramref name="ocrOnly"/> (undo/redo) the adjustments are left to
-    /// the restored undo state.
-    /// </summary>
-    /// <returns>OCR results of pages the map removed (old index → data), or null.</returns>
-    private IReadOnlyDictionary<int, OcrPageData>? MovePageData(PageMap? map, ISet<int>? reshaped = null, bool ocrOnly = false)
-    {
-        if (!ocrOnly)
-        {
-            if (map != null)
-            {
-                var moved = new Dictionary<int, AdjSettings>();
-                for (int i = 0; i < map.NewToOld.Length; i++)
-                    if (map.NewToOld[i] >= 0 && _adjSettings.TryGetValue(map.NewToOld[i], out var adj))
-                        moved[i] = adj;
-                _adjSettings.Clear();
-                foreach (var (k, v) in moved) _adjSettings[k] = v;
-            }
-            AdjustedStore?.Remap(map?.NewToOld, reshaped);
-        }
-
-        // OCR results carry the page geometry they were made with, so rotate/crop
-        // need no change; only moved pages do.
-        if (map == null || _currentFilePath == null || OcrStore == null) return null;
-        var ocr = OcrStore.GetOcrData(_currentFilePath);
-        if (ocr == null && map.RestoredOcr == null) return null;
-        ocr ??= new Dictionary<int, OcrPageData>();
-        var movedOcr = new Dictionary<int, OcrPageData>();
-        for (int i = 0; i < map.NewToOld.Length; i++)
-            if (map.NewToOld[i] >= 0 && ocr.TryGetValue(map.NewToOld[i], out var d))
-                movedOcr[i] = d;
-        if (map.RestoredOcr != null)
-            foreach (var (i, d) in map.RestoredOcr)
-                if (i < map.NewToOld.Length) movedOcr[i] = d;
-        OcrStore.SetOcrData(_currentFilePath, movedOcr);
-
-        var kept    = new HashSet<int>(map.NewToOld.Where(o => o >= 0));
-        var dropped = ocr.Where(kv => !kept.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value);
-        return dropped.Count > 0 ? dropped : null;
-    }
+        PushUndoEntry(new UndoSnapshot(null, edit, before));
 
     private void PushUndoEntry(UndoSnapshot entry)
     {
@@ -918,7 +935,6 @@ public partial class PDFReaderPage : Page
         var prev = _undoStack[^1]; _undoStack.RemoveAt(_undoStack.Count - 1);
         if (MakeCounterpart(prev, counterpartReverts: false) is { } redo) _redoStack.Add(redo);
         await ApplyUndoEntryAsync(prev, revert: true);
-        if (prev.Map != null) MovePageData(prev.Map.Inverse(), ocrOnly: true);
         ReleaseEntry(prev);
         UndoRedoChanged?.Invoke();
     }
@@ -929,7 +945,6 @@ public partial class PDFReaderPage : Page
         var next = _redoStack[^1]; _redoStack.RemoveAt(_redoStack.Count - 1);
         if (MakeCounterpart(next, counterpartReverts: true) is { } undo) _undoStack.Add(undo);
         await ApplyUndoEntryAsync(next, revert: false);
-        if (next.Map != null) MovePageData(next.Map, ocrOnly: true);
         ReleaseEntry(next);
         UndoRedoChanged?.Invoke();
     }
@@ -939,8 +954,8 @@ public partial class PDFReaderPage : Page
     private UndoSnapshot? MakeCounterpart(UndoSnapshot entry, bool counterpartReverts)
     {
         if (entry.Edit != null && (counterpartReverts || entry.Edit is not InsertEdit))
-            return new UndoSnapshot(null, entry.Edit, CaptureState(), entry.Map);
-        return _editPdfBytes != null ? CaptureSnapshot(_editPdfBytes) with { Map = entry.Map } : null;
+            return new UndoSnapshot(null, entry.Edit, CaptureState());
+        return _editPdfBytes != null ? CaptureSnapshot(_editPdfBytes) : null;
     }
 
     private async Task ApplyUndoEntryAsync(UndoSnapshot entry, bool revert)
@@ -1024,14 +1039,13 @@ public partial class PDFReaderPage : Page
 
     private void RestoreState(UndoState state)
     {
+        // Page order first: OCR results, source images and annotations follow their pages.
+        _session.RestoreOrder(state.Order);
+
         // Restore image adjustment settings for all pages.
-        _adjSettings.Clear();
-        foreach (var (k, v) in state.Adj) _adjSettings[k] = v;
+        _session.Adjust.RestoreById(state.Adj);
         _adjUndoPushedForPage = -1;
         AdjustedStore?.Clear();
-
-        _pageImagePaths.Clear();
-        foreach (var (k, v) in state.PageImages) _pageImagePaths[k] = v;
 
         if (_currentFilePath == null) return;
 
@@ -4787,10 +4801,10 @@ public partial class PDFReaderPage : Page
         var pages  = pageIndices.ToArray();
         var before = CaptureState();
         ApplyRotation(pages, angle);
+        _session.MarkContentChanged(pages);
         SetStatus("회전 적용 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         PushUndoEdit(new RotateEdit(pages, angle), before);
-        MovePageData(null, pages.ToHashSet());
         StartThumbnailGeneration(i => i, pages.ToHashSet());
         SetStatus($"회전 완료 ({angle}°).");
     }
@@ -5351,14 +5365,9 @@ public partial class PDFReaderPage : Page
             "페이지 삭제", MessageBoxButton.YesNo, MessageBoxImage.Warning);
         if (result != MessageBoxResult.Yes) return;
 
-        // Old → new page index for bookmarks: a bookmark on a deleted page moves to
-        // the next surviving page (or the last page when nothing follows).
         int oldCount = _editDocument.Pages.Count;
         var deleted  = new HashSet<int>(_thumbSelectedPages);
-        var pageMap  = new int[oldCount];
-        for (int i = 0, n = 0; i < oldCount; i++)
-            pageMap[i] = deleted.Contains(i) ? n : n++;
-        int newLast = oldCount - deleted.Count - 1;
+        PushSnapshotUndo(CaptureState());
 
         // Remove in reverse index order so earlier indices stay valid.
         foreach (int pi in _thumbSelectedPages.OrderByDescending(x => x))
@@ -5366,6 +5375,9 @@ public partial class PDFReaderPage : Page
             if (pi >= 0 && pi < _editDocument.Pages.Count)
                 _editDocument.Pages.RemoveAt(pi);
         }
+        // Bookmarks move to the next page, everything else stays with the deleted page
+        // (OnSessionOrderChanged) so undo brings it back.
+        _session.Delete(deleted);
 
         // Clamp current page to new range.
         _currentPage = (uint)Math.Min((int)_currentPage, _editDocument.Pages.Count - 1);
@@ -5374,23 +5386,7 @@ public partial class PDFReaderPage : Page
         _thumbLastClickedPage = -1;
 
         SetStatus("페이지 삭제 중…");
-        var topBefore = _undoStack.Count > 0 ? _undoStack[^1] : null;
-        await ReloadRenderDocumentAsync();
-        var deleteMap = new PageMap(
-            Enumerable.Range(0, oldCount).Where(i => !deleted.Contains(i)).ToArray(), oldCount);
-        var droppedOcr = MovePageData(deleteMap);
-        if (_undoStack.Count > 0 && !ReferenceEquals(_undoStack[^1], topBefore))   // the step this delete pushed
-            _undoStack[^1] = _undoStack[^1] with { Map = deleteMap with { DroppedOcr = droppedOcr } };
-        if (_currentFilePath != null)
-            BookmarkService.Instance.RemapPages(_currentFilePath,
-                p => p < oldCount ? Math.Min(pageMap[p], newLast) : newLast);
-
-        // Image-sourced pages: drop deleted ones and shift the rest to their new index.
-        var keptImages = _pageImagePaths
-            .Where(kv => kv.Key < oldCount && !deleted.Contains(kv.Key))
-            .ToDictionary(kv => pageMap[kv.Key], kv => kv.Value);
-        _pageImagePaths.Clear();
-        foreach (var kv in keptImages) _pageImagePaths[kv.Key] = kv.Value;
+        await ReloadRenderDocumentAsync(pushUndo: false);
 
         var survivors = Enumerable.Range(0, oldCount).Where(i => !deleted.Contains(i)).ToArray();
         StartThumbnailGeneration(i => i < survivors.Length ? survivors[i] : null);
@@ -5461,16 +5457,13 @@ public partial class PDFReaderPage : Page
 
         if (cancelled)
         {
+            // Take back the pages inserted before the cancel; the document is unchanged.
+            for (int i = insertedCount - 1; i >= 0; i--) _editDocument.Pages.RemoveAt(insertAt + i);
             foreach (var (ms, x) in resources) { x.Dispose(); ms.Dispose(); }
             return;
         }
 
-        // Shift existing page-image entries to make room, then record the new paths.
-        var shifted = new Dictionary<int, string>();
-        foreach (var kv in _pageImagePaths)
-            shifted[kv.Key >= insertAt ? kv.Key + insertedCount : kv.Key] = kv.Value;
-        _pageImagePaths.Clear();
-        foreach (var kv in shifted) _pageImagePaths[kv.Key] = kv.Value;
+        _session.Insert(insertAt, insertedCount);
         for (int i = 0; i < insertedCount; i++)
             _pageImagePaths[insertAt + i] = imagePaths[i];
 
@@ -5478,10 +5471,6 @@ public partial class PDFReaderPage : Page
         SetStatus("이미지 삽입 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);   // _editDocument.Save() runs here — resources alive
         PushUndoEdit(new InsertEdit(insertAt, insertedCount), before);
-        MovePageData(InsertMap(insertAt, insertedCount, _editDocument.Pages.Count));
-        if (_currentFilePath != null)
-            BookmarkService.Instance.RemapPages(_currentFilePath,
-                p => p >= insertAt ? p + insertedCount : p);
         foreach (var (ms, x) in resources) { x.Dispose(); ms.Dispose(); }
         StartThumbnailGeneration(i => i < insertAt ? i : i < insertAt + insertedCount ? null : i - insertedCount);
         SetStatus($"이미지 삽입 완료. 총 {_editDocument.Pages.Count}페이지");
@@ -5685,26 +5674,19 @@ public partial class PDFReaderPage : Page
 
         var before = CaptureState();
         if (!await RebuildInPageOrderAsync(newOrder.ToArray())) return;
+        _session.Reorder(newOrder);
 
         SetStatus("페이지 순서 변경 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         PushUndoEdit(new ReorderEdit(newOrder.ToArray()), before);
-        MovePageData(new PageMap(newOrder.ToArray(), newOrder.Count));
-        if (_currentFilePath != null)
-        {
-            var newIndex = new Dictionary<int, int>();
-            for (int i = 0; i < newOrder.Count; i++) newIndex[newOrder[i]] = i;
-            BookmarkService.Instance.RemapPages(_currentFilePath,
-                p => newIndex.TryGetValue(p, out int np) ? np : p);
-        }
         StartThumbnailGeneration(i => i < newOrder.Count ? newOrder[i] : null);
         SetStatus("페이지 순서 변경 완료.");
     }
 
     /// <summary>
     /// Rebuilds _editDocument with its pages in <paramref name="newOrder"/>
-    /// (newOrder[i] = current index of the page to put at position i) and remaps
-    /// _pageImagePaths. Returns false, leaving _editDocument untouched, on failure.
+    /// (newOrder[i] = current index of the page to put at position i). The caller updates
+    /// the session's page order. Returns false, leaving _editDocument untouched, on failure.
     /// </summary>
     private async Task<bool> RebuildInPageOrderAsync(int[] newOrder)
     {
@@ -5778,14 +5760,6 @@ public partial class PDFReaderPage : Page
             try { if (System.IO.File.Exists(srcPath)) System.IO.File.Delete(srcPath); } catch { }
             try { if (System.IO.File.Exists(outPath)) System.IO.File.Delete(outPath); } catch { }
         }
-
-        // Remap _pageImagePaths to new positions
-        var remapped = new Dictionary<int, string>();
-        for (int i = 0; i < newOrder.Length; i++)
-            if (_pageImagePaths.TryGetValue(newOrder[i], out string? path))
-                remapped[i] = path;
-        _pageImagePaths.Clear();
-        foreach (var kv in remapped) _pageImagePaths[kv.Key] = kv.Value;
 
         // Only swap _editDocument after the new doc is fully built
         _editDocument.Dispose();
@@ -6162,13 +6136,11 @@ public partial class PDFReaderPage : Page
             afters.Add(after);
             SetCropRect(page, after);
         }
+        _session.MarkContentChanged(pages);
         SetStatus("Crop 적용 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         if (pages.Count > 0)
-        {
             PushUndoEdit(new CropEdit(pages.ToArray(), befores.ToArray(), afters.ToArray()), state);
-            MovePageData(null, pages.ToHashSet());
-        }
         StartThumbnailGeneration(i => i, pages.ToHashSet());
 
         // Clear crop inputs and overlay — the page is already cropped visually.

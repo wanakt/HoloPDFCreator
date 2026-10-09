@@ -15,7 +15,6 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _pdfReaderPage.AdjustedStore      = _adjustedStore;
-        _pdfReaderPage.OcrStore           = _ocrPage;
         ContentFrame.Navigate(_pdfReaderPage);
 
         Loaded += async (_, _) =>
@@ -53,7 +52,7 @@ public partial class MainWindow : Window
         {
             // pdfPath may be the reader's temp file; the results belong to the document itself.
             await _ocrPage.LoadFromPdfAsync(pdfPath, _pdfReaderPage.CurrentPage,
-                                            _pdfReaderPage.CurrentFilePath);
+                                            _pdfReaderPage.Session);
             _ocrPage.ApplyAdjustedImages(_adjustedStore);
         }
     }

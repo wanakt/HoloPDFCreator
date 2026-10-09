@@ -6,6 +6,7 @@ public class PdfMemo
     public int      Id         { get; } = System.Threading.Interlocked.Increment(ref _counter);
     public string   FilePath   { get; set; } = "";
     public uint     PageNumber { get; set; }
+    public long     PageId     { get; set; }   // DocumentSession page id (0 = not yet assigned)
     public double   X          { get; set; }   // PDF user-space (pts, origin BL)
     public double   Y          { get; set; }
     public string   Content    { get; set; } = "";
