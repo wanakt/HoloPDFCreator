@@ -107,7 +107,11 @@ public class OcrService : IDisposable
             detPath        = Path.Combine(baseDir, "models", "v5", "ch_PP-OCRv5_mobile_det.onnx");
             recPath        = Path.Combine(baseDir, "models", cfg.ModelVer, cfg.RecFile);
             keysPath       = Path.Combine(baseDir, "models", cfg.ModelVer, cfg.KeysFile);
-            useCustomPaths = language != OcrLanguage.Latin;
+            // Latin uses the package's bundled models, which are these same files. Passing
+            // them by absolute path matters: InitModels() resolves "models/v5/..." against
+            // the current directory, which is not the app folder when a PDF is opened via
+            // a file association or a shortcut with another start-in folder.
+            useCustomPaths = true;
         }
 
         if (useCustomPaths && !File.Exists(recPath))

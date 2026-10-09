@@ -20,6 +20,29 @@ public class AdjustedImageStore
 
     public void Clear() => _images.Clear();
 
+    /// <summary>
+    /// Follows a page edit: newToOld[i] is the old index of the page now at i (-1 = new
+    /// page; null = pages did not move). Images of <paramref name="drop"/> pages (new
+    /// indices, e.g. rotated or cropped) are discarded and get rendered again.
+    /// </summary>
+    public void Remap(int[]? newToOld, ISet<int>? drop = null)
+    {
+        var moved = new Dictionary<int, BitmapImage>();
+        if (newToOld == null)
+        {
+            foreach (var (k, v) in _images) moved[k] = v;
+        }
+        else
+        {
+            for (int i = 0; i < newToOld.Length; i++)
+                if (newToOld[i] >= 0 && _images.TryGetValue(newToOld[i], out var img))
+                    moved[i] = img;
+        }
+        if (drop != null) foreach (int i in drop) moved.Remove(i);
+        _images.Clear();
+        foreach (var (k, v) in moved) _images[k] = v;
+    }
+
     public bool HasAny => _images.Count > 0;
 
     public IReadOnlyList<(int PageIndex, BitmapImage Image)> GetAll()

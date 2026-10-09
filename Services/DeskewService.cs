@@ -9,23 +9,63 @@ public static class DeskewService
     private const double AngleStepDeg = 0.5;
     private const int    SampleStep   = 4;
 
+    /// <summary>One rotation applied about the image centre onto an enlarged canvas.</summary>
+    public readonly record struct RotationStep(double Degrees, int SrcW, int SrcH, int DstW, int DstH);
+
     /// <summary>
     /// Pass 1 – projection-profile rough deskew.
     /// Returns the same instance if correction is negligible (&lt;0.1°).
+    /// The applied rotation is appended to <paramref name="steps"/> so OCR coordinates
+    /// can be mapped back to the original image with <see cref="MapBack(OcrRegion, IReadOnlyList{RotationStep})"/>.
     /// </summary>
-    public static SKBitmap Deskew(SKBitmap src)
+    public static SKBitmap Deskew(SKBitmap src, List<RotationStep>? steps = null)
     {
         double angle = DetectSkewAngle(src);
         if (Math.Abs(angle) < 0.1) return src;
-        return RotateBitmap(src, -angle);
+        return RotateBitmap(src, -angle, steps);
     }
 
     /// <summary>
     /// Pass 2 – fine correction using the median angle of OCR text-box edges.
     /// Returns the same instance if residual is below 0.05°.
     /// </summary>
-    public static SKBitmap RotateByAngle(SKBitmap src, double degrees)
-        => Math.Abs(degrees) < 0.05 ? src : RotateBitmap(src, degrees);
+    public static SKBitmap RotateByAngle(SKBitmap src, double degrees, List<RotationStep>? steps = null)
+        => Math.Abs(degrees) < 0.05 ? src : RotateBitmap(src, degrees, steps);
+
+    /// <summary>
+    /// Maps a region found on the rotated image back onto the original image: the page
+    /// itself is not deskewed, so its text layer and overlays need original coordinates.
+    /// </summary>
+    public static OcrRegion MapBack(OcrRegion r, IReadOnlyList<RotationStep> steps)
+    {
+        if (steps.Count == 0) return r;
+        double cy = r.Points.Length > 0 ? r.Points.Average(p => p.Y) : 0;
+        return new OcrRegion
+        {
+            Text   = r.Text,
+            Score  = r.Score,
+            Points = r.Points.Select(p =>
+            {
+                var (x, y) = MapBack(p.X, p.Y, steps);
+                return new OcrPoint((int)Math.Round(x), (int)Math.Round(y));
+            }).ToArray(),
+            Words  = r.Words.Select(w =>
+                new WordFragment(w.Text, (int)Math.Round(MapBack(w.CenterX, cy, steps).X), w.Score)).ToArray(),
+        };
+    }
+
+    public static (double X, double Y) MapBack(double x, double y, IReadOnlyList<RotationStep> steps)
+    {
+        for (int i = steps.Count - 1; i >= 0; i--)
+        {
+            var st = steps[i];
+            double rad = -st.Degrees * Math.PI / 180.0;   // inverse rotation
+            double dx  = x - st.DstW / 2.0, dy = y - st.DstH / 2.0;
+            x = dx * Math.Cos(rad) - dy * Math.Sin(rad) + st.SrcW / 2.0;
+            y = dx * Math.Sin(rad) + dy * Math.Cos(rad) + st.SrcH / 2.0;
+        }
+        return (x, y);
+    }
 
     /// <summary>
     /// Computes the median skew angle (degrees) from the top edges of OCR text boxes.
@@ -91,7 +131,10 @@ public static class DeskewService
         int totalSampled = (w / SampleStep) * (h / SampleStep);
         if (dark.Count < 50 || dark.Count > totalSampled * 6 / 10) return 0;
 
-        int histLen = w + h + 4;
+        // Bins are SampleStep wide: with 1 px bins the samples (every SampleStep px) fill
+        // only every SampleStep-th bin at exactly 0°, which inflates its score and made
+        // 0° win over the real skew angle.
+        int histLen = (w + h) / SampleStep + 4;
         int histOff = histLen / 2;
         var hist    = new int[histLen];
 
@@ -106,7 +149,7 @@ public static class DeskewService
             Array.Clear(hist, 0, histLen);
             foreach (var (dx, dy) in dark)
             {
-                int row = (int)(dy * cosA - dx * sinA) + histOff;
+                int row = (int)Math.Floor((dy * cosA - dx * sinA) / SampleStep) + histOff;
                 if ((uint)row < (uint)histLen) hist[row]++;
             }
 
@@ -120,7 +163,7 @@ public static class DeskewService
         return bestAngle;
     }
 
-    private static SKBitmap RotateBitmap(SKBitmap src, double degrees)
+    private static SKBitmap RotateBitmap(SKBitmap src, double degrees, List<RotationStep>? steps = null)
     {
         float rad  = (float)(degrees * Math.PI / 180.0);
         float cosA = Math.Abs(MathF.Cos(rad));
@@ -135,6 +178,7 @@ public static class DeskewService
         canvas.RotateDegrees((float)degrees);
         canvas.Translate(-src.Width / 2f, -src.Height / 2f);
         canvas.DrawBitmap(src, 0, 0);
+        steps?.Add(new RotationStep(degrees, src.Width, src.Height, newW, newH));
         return dst;
     }
 }
