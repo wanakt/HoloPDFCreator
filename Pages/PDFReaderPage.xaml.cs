@@ -874,12 +874,39 @@ public partial class PDFReaderPage : Page
             if (_editDocument != null)
                 _currentPage = (uint)Math.Min((int)_currentPage, Math.Max(0, _editDocument.Pages.Count - 1));
             await ReloadRenderDocumentAsync(pushUndo: false);   // also re-renders the current page
-            StartThumbnailGeneration();
+            var (pageFrom, stale) = ThumbnailMapFor(entry.Edit!, revert);
+            StartThumbnailGeneration(pageFrom, stale);
         }
         catch (Exception ex)
         {
             SetStatus($"실행 취소 오류: {ex.Message}");
         }
+    }
+
+    // How thumbnails move when an edit is applied (see StartThumbnailGeneration).
+    private static (Func<int, int?> PageFrom, ISet<int>? Stale) ThumbnailMapFor(PageEdit edit, bool revert)
+    {
+        switch (edit)
+        {
+            case RotateEdit r: return (i => i, r.Pages.ToHashSet());
+            case CropEdit c:   return (i => i, c.Pages.ToHashSet());
+            case ReorderEdit o:
+                var order = ReorderFor(o, revert);
+                return (i => i < order.Length ? order[i] : null, null);
+            case InsertEdit ins when revert:
+                return (i => i < ins.At ? i : i + ins.Count, null);
+            default:
+                return (_ => null, null);
+        }
+    }
+
+    // Page order to rebuild with: newOrder[i] = current index of the page to put at i.
+    private static int[] ReorderFor(ReorderEdit o, bool revert)
+    {
+        if (!revert) return o.NewOrder;
+        var order = new int[o.NewOrder.Length];
+        for (int i = 0; i < o.NewOrder.Length; i++) order[o.NewOrder[i]] = i;
+        return order;
     }
 
     // Mutates _editDocument; the caller reloads the render document afterwards.
@@ -898,13 +925,7 @@ public partial class PDFReaderPage : Page
                 break;
 
             case ReorderEdit o:
-                var order = o.NewOrder;
-                if (revert)
-                {
-                    order = new int[o.NewOrder.Length];
-                    for (int i = 0; i < o.NewOrder.Length; i++) order[o.NewOrder[i]] = i;
-                }
-                if (!await RebuildInPageOrderAsync(order))
+                if (!await RebuildInPageOrderAsync(ReorderFor(o, revert)))
                     throw new InvalidOperationException("페이지 순서를 되돌리지 못했습니다.");
                 break;
 
@@ -4686,7 +4707,7 @@ public partial class PDFReaderPage : Page
         SetStatus("회전 적용 중…");
         await ReloadRenderDocumentAsync(pushUndo: false);
         PushUndoEdit(new RotateEdit(pages, angle), before);
-        StartThumbnailGeneration();
+        StartThumbnailGeneration(i => i, pages.ToHashSet());
         SetStatus($"회전 완료 ({angle}°).");
     }
 
@@ -4780,10 +4801,28 @@ public partial class PDFReaderPage : Page
     //  Thumbnail panel
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private void StartThumbnailGeneration()
+    /// <summary>
+    /// (Re)builds the thumbnail panel. After a page edit pass <paramref name="pageFrom"/>
+    /// (new index → index before the edit, null for a new page) and the changed pages in
+    /// <paramref name="stale"/>: existing thumbnails and the selection then follow their
+    /// pages and only new or changed pages are rendered again. When the page count is
+    /// unchanged the panel elements themselves are kept. Without it everything is rebuilt.
+    /// </summary>
+    private void StartThumbnailGeneration(Func<int, int?>? pageFrom = null, ISet<int>? stale = null)
     {
+        var oldSources  = _thumbItems.Select(t => (ImageSource?)t.Img.Source).ToList();
+        var oldSelected = _thumbSelectedPages.ToList();
+
         _thumbCts.Cancel();
         _thumbCts = new CancellationTokenSource();
+
+        if (pageFrom != null && _renderDocument != null && _thumbItems.Count == (int)_totalPages)
+        {
+            ReuseThumbnails(pageFrom, stale, oldSources, oldSelected);
+            UpdateThumbnailHighlight();
+            return;
+        }
+
         _thumbItems.Clear();
         _thumbSelectedPages.Clear();
         _thumbLastClickedPage = -1;
@@ -4963,13 +5002,39 @@ public partial class PDFReaderPage : Page
             ThumbPanel.Children.Add(container);
         }
 
+        if (pageFrom != null)
+        {
+            ReuseThumbnails(pageFrom, stale, oldSources, oldSelected);
+            UpdateThumbnailHighlight();
+            return;
+        }
         UpdateThumbnailHighlight();
         _ = RenderThumbnailsAsync(_thumbCts.Token);
     }
 
-    private async Task RenderThumbnailsAsync(CancellationToken ct)
+    private void ReuseThumbnails(Func<int, int?> pageFrom, ISet<int>? stale,
+                                 List<ImageSource?> oldSources, List<int> oldSelected)
     {
-        for (int i = 0; i < (int)_totalPages; i++)
+        var oldSel   = new HashSet<int>(oldSelected);
+        var toRender = new List<int>();
+        _thumbSelectedPages.Clear();
+        for (int i = 0; i < _thumbItems.Count; i++)
+        {
+            int? from = pageFrom(i);
+            ImageSource? src = from is int o && o >= 0 && o < oldSources.Count && stale?.Contains(i) != true
+                ? oldSources[o] : null;
+            _thumbItems[i].Img.Source = src;
+            if (src == null) toRender.Add(i);
+            if (from is int f && oldSel.Contains(f)) _thumbSelectedPages.Add(i);
+        }
+        if (_thumbSelectedPages.Count == 0) _thumbLastClickedPage = -1;
+        if (toRender.Count > 0) _ = RenderThumbnailsAsync(_thumbCts.Token, toRender);
+    }
+
+    private async Task RenderThumbnailsAsync(CancellationToken ct, IReadOnlyList<int>? pages = null)
+    {
+        pages ??= Enumerable.Range(0, (int)_totalPages).ToList();
+        foreach (int i in pages)
         {
             if (ct.IsCancellationRequested) return;
 
@@ -5237,7 +5302,8 @@ public partial class PDFReaderPage : Page
         _pageImagePaths.Clear();
         foreach (var kv in keptImages) _pageImagePaths[kv.Key] = kv.Value;
 
-        StartThumbnailGeneration();
+        var survivors = Enumerable.Range(0, oldCount).Where(i => !deleted.Contains(i)).ToArray();
+        StartThumbnailGeneration(i => i < survivors.Length ? survivors[i] : null);
         SetStatus($"삭제 완료. 남은 페이지: {_editDocument.Pages.Count}");
     }
 
@@ -5326,7 +5392,7 @@ public partial class PDFReaderPage : Page
             BookmarkService.Instance.RemapPages(_currentFilePath,
                 p => p >= insertAt ? p + insertedCount : p);
         foreach (var (ms, x) in resources) { x.Dispose(); ms.Dispose(); }
-        StartThumbnailGeneration();
+        StartThumbnailGeneration(i => i < insertAt ? i : i < insertAt + insertedCount ? null : i - insertedCount);
         SetStatus($"이미지 삽입 완료. 총 {_editDocument.Pages.Count}페이지");
     }
 
@@ -5539,7 +5605,7 @@ public partial class PDFReaderPage : Page
             BookmarkService.Instance.RemapPages(_currentFilePath,
                 p => newIndex.TryGetValue(p, out int np) ? np : p);
         }
-        StartThumbnailGeneration();
+        StartThumbnailGeneration(i => i < newOrder.Count ? newOrder[i] : null);
         SetStatus("페이지 순서 변경 완료.");
     }
 
@@ -6008,7 +6074,7 @@ public partial class PDFReaderPage : Page
         await ReloadRenderDocumentAsync(pushUndo: false);
         if (pages.Count > 0)
             PushUndoEdit(new CropEdit(pages.ToArray(), befores.ToArray(), afters.ToArray()), state);
-        StartThumbnailGeneration();
+        StartThumbnailGeneration(i => i, pages.ToHashSet());
 
         // Clear crop inputs and overlay — the page is already cropped visually.
         _suppressCropInput = true;
