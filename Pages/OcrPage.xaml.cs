@@ -26,10 +26,14 @@ public partial class OcrPage : Page
     private class ImageItem : IDisposable
     {
         public required string DisplayName  { get; init; }
+        // Image files only: the loaded bitmap. PDF pages keep no bitmap of their own;
+        // their images come from the page image provider (shared with the reader).
         public Bitmap?         Original     { get; set; }
-        public BitmapImage?    ThumbSource  { get; set; }
-        public BitmapSource?   OcrSource    { get; set; }  // BitmapSource received from PDF Reader
-        public bool            IsLoaded     => Original  != null;
+        public BitmapSource?   ThumbSource  { get; set; }
+        // The image shown for the selected PDF page (released when another page is selected).
+        public BitmapSource?   OcrSource    { get; set; }
+        public bool            FromPdf      { get; init; }
+        public bool            IsLoaded     => Original != null || FromPdf;
 
         public void Dispose()
         {
@@ -93,6 +97,58 @@ public partial class OcrPage : Page
     private PageIndexed<PageGeometry>    _regionGeom  => _session.OcrGeometry;
     // Current rotation / visible box of every page of _sourcePdfPath.
     private PageGeometry[]? _pageGeom;
+
+    // Page images of PDF pages: the reader's provider for its document, or one of our own.
+    private const int OcrImageWidth = 1200;
+    private PageImageProvider? _images;
+    private bool _ownsImages;
+
+    private void UseImages(PageImageProvider? images, bool owned)
+    {
+        if (ReferenceEquals(images, _images)) return;
+        if (_images != null)
+        {
+            _images.PageImageChanged -= OnPageImageChanged;
+            if (_ownsImages) _images.Dispose();
+        }
+        _images     = images;
+        _ownsImages = owned;
+        if (_images != null) _images.PageImageChanged += OnPageImageChanged;
+    }
+
+    // A page's image changed (adjusted or rotated in the reader): refresh what shows it.
+    private readonly HashSet<long> _changedImages = new();
+    private bool _allImagesChanged;
+    private System.Windows.Threading.DispatcherTimer? _imageTimer;
+
+    private void OnPageImageChanged(long id) => Dispatcher.BeginInvoke(() =>
+    {
+        if (id < 0) _allImagesChanged = true; else _changedImages.Add(id);
+        _imageTimer ??= new System.Windows.Threading.DispatcherTimer(
+            TimeSpan.FromMilliseconds(250), System.Windows.Threading.DispatcherPriority.Background,
+            (_, _) => FlushImageChanges(), Dispatcher);
+        _imageTimer.Stop();
+        _imageTimer.Start();
+    });
+
+    private void FlushImageChanges()
+    {
+        _imageTimer?.Stop();
+        var pages = _allImagesChanged
+            ? Enumerable.Range(0, _items.Count).ToList()
+            : _changedImages.Select(_session.IndexOf).Where(i => i >= 0 && i < _items.Count).ToList();
+        _changedImages.Clear();
+        _allImagesChanged = false;
+        foreach (int i in pages)
+        {
+            if (!_items[i].FromPdf) continue;
+            _items[i].ThumbSource = null;
+            _items[i].OcrSource   = null;
+        }
+        if (pages.Count == 0) return;
+        _ = RenderPdfThumbnailsAsync(_pdfThumbCts.Token, pages);
+        if (pages.Contains(_selectedIndex)) _ = LoadAndDisplayPageAsync(_selectedIndex);
+    }
     private List<OcrRegion>    _currentRegions = new();
 
     private CancellationTokenSource? _batchCts;
@@ -151,24 +207,6 @@ public partial class OcrPage : Page
             }).ToArray(),
             Words  = r.Words,
         }).ToList();
-    }
-
-    public void ApplyAdjustedImages(AdjustedImageStore store)
-    {
-        if (!store.HasAny || _items.Count == 0) return;
-        bool changed = false;
-        for (int i = 0; i < _items.Count; i++)
-        {
-            var img = store.Get(i);
-            if (img == null) continue;
-            _items[i].OcrSource = img;
-            changed = true;
-        }
-        if (!changed) return;
-        RefreshImageList();
-        if (_selectedIndex >= 0 && _selectedIndex < _items.Count)
-            UpdateMainImageDisplay(_items[_selectedIndex]);
-        UpdateButtonStates();
     }
 
     // ── Streaming public API (used by MainWindow when sending pages from PDF Reader) ──
@@ -278,7 +316,8 @@ public partial class OcrPage : Page
     /// live in that session and stay with their pages. Without one the PDF is opened as
     /// a document of this view's own.
     /// </summary>
-    public async Task LoadFromPdfAsync(string filePath, uint initialPage = 0, DocumentSession? session = null)
+    public async Task LoadFromPdfAsync(string filePath, uint initialPage = 0, DocumentSession? session = null,
+                                       PageImageProvider? images = null)
     {
         if (filePath == _lastPdfPath && _items.Count > 0 && (session == null || ReferenceEquals(session, _session))) return;
         _lastPdfPath = filePath;
@@ -314,22 +353,20 @@ public partial class OcrPage : Page
 
             initialPage = Math.Min(initialPage, count - 1);
 
+            if (session != null && images != null)
+                UseImages(images, owned: false);
+            else
+            {
+                var own = new PageImageProvider(_session);
+                own.SetDocument(filePath, pdfDoc);
+                UseImages(own, owned: true);
+            }
+
             for (uint i = 0; i < count; i++)
                 AddPlaceholderInternal($"{baseName} — Page {i + 1}");
 
             SetStatus($"Loading page {initialPage + 1} / {count}…");
-
-            using var pdfPage = pdfDoc.GetPage(initialPage);
-            using var stream  = new InMemoryRandomAccessStream();
-            await pdfPage.RenderToStreamAsync(stream,
-                new WinPdf.PdfPageRenderOptions { DestinationWidth = 1200 });
-            stream.Seek(0);
-
-            var ms = new MemoryStream();
-            await stream.AsStream().CopyToAsync(ms);
-            ms.Position = 0;
-
-            _items[(int)initialPage].Original = new Bitmap(ms);
+            _items[(int)initialPage].OcrSource = await _images!.GetAsync((int)initialPage, OcrImageWidth);
 
             _sourcePdfPath  = filePath;
             _pdfPageCount   = (int)count;
@@ -341,7 +378,7 @@ public partial class OcrPage : Page
             SelectItem((int)initialPage);
             UpdateButtonStates();
 
-            _ = RenderPdfThumbnailsAsync(filePath, _pdfThumbCts.Token);
+            _ = RenderPdfThumbnailsAsync(_pdfThumbCts.Token);
             _ = TryLoadExistingTextLayerAsync(filePath);
 
             SetStatus(count > 1
@@ -357,79 +394,17 @@ public partial class OcrPage : Page
         }
     }
 
-    private async Task<bool> EnsureAllPdfPagesLoadedAsync(ProgressWindow? win = null)
-    {
-        if (_sourcePdfPath == null) return true;
-        var unloaded = Enumerable.Range(0, _items.Count)
-            .Where(i => _items[i].Original == null && _items[i].OcrSource == null).ToList();
-        if (unloaded.Count == 0) return true;
-
-        string filePath = _sourcePdfPath;
-
-        try
-        {
-            if (win != null) win.SetTitle("Loading PDF pages…");
-            else SetStatus($"Loading {unloaded.Count} remaining page(s)…");
-
-            var storageFile = await StorageFile.GetFileFromPathAsync(filePath);
-            var pdfDoc      = await WinPdf.PdfDocument.LoadFromFileAsync(storageFile);
-
-            for (int n = 0; n < unloaded.Count; n++)
-            {
-                int idx = unloaded[n];
-                string stepText = $"Loading page {idx + 1} / {_items.Count}…";
-                if (win != null) win.Update(n + 1, unloaded.Count, stepText);
-                else             SetStatus(stepText);
-
-                using var pdfPage = pdfDoc.GetPage((uint)idx);
-                using var stream  = new InMemoryRandomAccessStream();
-                await pdfPage.RenderToStreamAsync(stream,
-                    new WinPdf.PdfPageRenderOptions { DestinationWidth = 1200 });
-                stream.Seek(0);
-
-                var ms = new MemoryStream();
-                await stream.AsStream().CopyToAsync(ms);
-                ms.Position = 0;
-
-                _items[idx].Original = new Bitmap(ms);
-            }
-
-            RefreshImageList();
-            SelectItem(_selectedIndex);
-            UpdateButtonStates();
-            return true;
-        }
-        catch (Exception ex)
-        {
-            SetStatus($"Failed to load all pages: {ex.Message}");
-            MessageBox.Show($"Could not load PDF pages:\n{ex.Message}", "Error",
-                            MessageBoxButton.OK, MessageBoxImage.Error);
-            return false;
-        }
-    }
-
     private async Task LoadAndDisplayPageAsync(int index)
     {
-        if (_sourcePdfPath == null || index < 0 || index >= _items.Count) return;
-        if (_items[index].Original != null) { SelectItem(index); return; }
+        if (_images == null || index < 0 || index >= _items.Count || !_items[index].FromPdf) return;
+        if (_items[index].OcrSource != null) { SelectItem(index); return; }
 
         try
         {
             SetStatus($"Loading page {index + 1} / {_items.Count}…");
-            var storageFile = await StorageFile.GetFileFromPathAsync(_sourcePdfPath);
-            var pdfDoc      = await WinPdf.PdfDocument.LoadFromFileAsync(storageFile);
-
-            using var pdfPage = pdfDoc.GetPage((uint)index);
-            using var stream  = new InMemoryRandomAccessStream();
-            await pdfPage.RenderToStreamAsync(stream,
-                new WinPdf.PdfPageRenderOptions { DestinationWidth = 1200 });
-            stream.Seek(0);
-
-            var ms = new MemoryStream();
-            await stream.AsStream().CopyToAsync(ms);
-            ms.Position = 0;
-
-            _items[index].Original = new Bitmap(ms);
+            var img = await _images.GetAsync(index, OcrImageWidth);
+            if (img == null) { SetStatus($"Failed to load page {index + 1}."); return; }
+            if (index < _items.Count) _items[index].OcrSource = img;
         }
         catch (Exception ex)
         {
@@ -448,12 +423,6 @@ public partial class OcrPage : Page
                 var child = ImageListPanel.Children[index];
                 if (child is Border b)
                 {
-                    var item = _items[index];
-                    if (item.ThumbSource == null && item.Original != null)
-                    {
-                        using var thumb = CreateThumbnail(item.Original, 150, 92);
-                        item.ThumbSource = BitmapToWpf(thumb);
-                    }
                     int pos = ImageListPanel.Children.IndexOf(b);
                     if (pos >= 0)
                     {
@@ -463,41 +432,6 @@ public partial class OcrPage : Page
                 }
             }
             UpdateButtonStates();
-        }
-    }
-
-    private async Task<bool> LoadSpecificPagesAsync(IList<int> indices)
-    {
-        if (_sourcePdfPath == null) return true;
-        try
-        {
-            var storageFile = await StorageFile.GetFileFromPathAsync(_sourcePdfPath);
-            var pdfDoc      = await WinPdf.PdfDocument.LoadFromFileAsync(storageFile);
-
-            foreach (int idx in indices)
-            {
-                if (idx < 0 || idx >= _items.Count || _items[idx].Original != null) continue;
-                SetStatus($"Loading page {idx + 1} / {_items.Count}…");
-
-                using var pdfPage = pdfDoc.GetPage((uint)idx);
-                using var stream  = new InMemoryRandomAccessStream();
-                await pdfPage.RenderToStreamAsync(stream,
-                    new WinPdf.PdfPageRenderOptions { DestinationWidth = 1200 });
-                stream.Seek(0);
-
-                var ms = new MemoryStream();
-                await stream.AsStream().CopyToAsync(ms);
-                ms.Position = 0;
-                _items[idx].Original = new Bitmap(ms);
-            }
-            return true;
-        }
-        catch (Exception ex)
-        {
-            SetStatus($"Failed to load pages: {ex.Message}");
-            MessageBox.Show($"Could not load PDF pages:\n{ex.Message}", "Error",
-                            MessageBoxButton.OK, MessageBoxImage.Error);
-            return false;
         }
     }
 
@@ -560,7 +494,7 @@ public partial class OcrPage : Page
         _items.Add(new ImageItem { DisplayName = name, Original = bmp });
 
     private void AddPlaceholderInternal(string name) =>
-        _items.Add(new ImageItem { DisplayName = name });
+        _items.Add(new ImageItem { DisplayName = name, FromPdf = true });
 
     private void ClearItems()
     {
@@ -569,7 +503,6 @@ public partial class OcrPage : Page
         _selectedIndex   = -1;
         _markedIndices.Clear();
         _lastMarkedIndex = -1;
-        // Do not clear AdjustedStore here — it is filled by PDFReaderPage and read via OverrideWithAdjustedStore()
     }
 
     private void RefreshImageList()
@@ -742,6 +675,9 @@ public partial class OcrPage : Page
         }
 
         var item = _items[index];
+        // Keep one PDF page image here; the provider caches the rest within its budget.
+        for (int i = 0; i < _items.Count; i++)
+            if (i != index && _items[i].FromPdf) _items[i].OcrSource = null;
 
         if (item.Original == null && item.OcrSource == null)
         {
@@ -869,12 +805,10 @@ public partial class OcrPage : Page
     private void BtnZoomFit_Click(object sender, RoutedEventArgs e)
     {
         if (_selectedIndex < 0 || _selectedIndex >= _items.Count) { ApplyZoom(1.0); return; }
-        var item = _items[_selectedIndex];
-        var bmp  = item.Original;
-        if (bmp == null) { ApplyZoom(1.0); return; }
+        if (ImgMain.Source is not BitmapSource shown) { ApplyZoom(1.0); return; }
         double avW = Math.Max(1, ScrollMain.ActualWidth  - 28);
         double avH = Math.Max(1, ScrollMain.ActualHeight - 28);
-        ApplyZoom(Math.Min(avW / bmp.Width, avH / bmp.Height));
+        ApplyZoom(Math.Min(avW / shown.PixelWidth, avH / shown.PixelHeight));
     }
 
     private void ApplyZoom(double scale)
@@ -966,14 +900,6 @@ public partial class OcrPage : Page
         _ => OcrLanguage.Latin,
     };
 
-    private BitmapSource? GetOcrSourceForPage(int index)
-    {
-        var item = _items[index];
-        if (item.OcrSource != null) return item.OcrSource;
-        if (item.Original != null) return BitmapToWpf(item.Original);
-        return null;
-    }
-
     private async Task RunOcrOnPagesAsync(
         IEnumerable<int> indices,
         OcrModelSize modelSize,
@@ -1035,49 +961,6 @@ public partial class OcrPage : Page
             }
             _ocrService.KoreanUpscaleTarget = _lastKoreanUpscale;
 
-            // Build a pool of PDF document instances — one per worker — for fully parallel lazy rendering.
-            // A single serialized document (pdfSem=1) becomes the throughput bottleneck once pre-loaded
-            // pages are exhausted: serial render time >> inference time → OCR workers starve.
-            string? pdfPath = _sourcePdfPath;
-            var pdfDocPool = new System.Collections.Concurrent.ConcurrentQueue<WinPdf.PdfDocument>();
-            if (pdfPath != null)
-            {
-                for (int d = 0; d < effWorkers; d++)
-                {
-                    var sf = await StorageFile.GetFileFromPathAsync(pdfPath);
-                    pdfDocPool.Enqueue(await WinPdf.PdfDocument.LoadFromFileAsync(sf));
-                }
-            }
-            // Semaphore counts available documents so WaitAsync blocks callers when the pool is empty.
-            var pdfPoolSem = new SemaphoreSlim(pdfDocPool.Count, Math.Max(pdfDocPool.Count, 1));
-
-            // Renders page idx from the pool; no-op if already loaded.
-            // ConfigureAwait(false) keeps continuations on thread pool threads, not the UI thread.
-            async Task LazyLoadPageAsync(int idx, CancellationToken localCt)
-            {
-                if (_items[idx].Original != null || _items[idx].OcrSource != null || pdfDocPool.IsEmpty)
-                    return;
-                await pdfPoolSem.WaitAsync(localCt).ConfigureAwait(false);
-                pdfDocPool.TryDequeue(out var doc);
-                try
-                {
-                    if (_items[idx].Original == null && _items[idx].OcrSource == null)
-                    {
-                        using var pdfPage = doc!.GetPage((uint)idx);
-                        using var stream  = new InMemoryRandomAccessStream();
-                        await pdfPage.RenderToStreamAsync(stream,
-                            new WinPdf.PdfPageRenderOptions { DestinationWidth = 1200 })
-                            .AsTask().ConfigureAwait(false);
-                        stream.Seek(0);
-                        var ms = new MemoryStream();
-                        await stream.AsStream().CopyToAsync(ms).ConfigureAwait(false);
-                        ms.Position = 0;
-                        _items[idx].Original = new Bitmap(ms);
-                    }
-                }
-                finally { pdfDocPool.Enqueue(doc!); pdfPoolSem.Release(); }
-            }
-
             int done   = 0;
             bool deskew = ChkDeskew.IsChecked == true;
             SetOcrStatus($"OCR 실행 중… (0/{idxList.Count})");
@@ -1087,12 +970,11 @@ public partial class OcrPage : Page
                 new ParallelOptions { MaxDegreeOfParallelism = effWorkers, CancellationToken = ct },
                 async (idx, localCt) =>
                 {
-                    await LazyLoadPageAsync(idx, localCt).ConfigureAwait(false);
-
-                    // OcrSource carries the adjusted image when the user applied Image Adjust;
-                    // prefer it so OCR reflects the adjustments. Fall back to Original only
-                    // when OcrSource is absent (direct-load path where only Original is set).
-                    BitmapSource? wpfSrc = _items[idx].OcrSource;
+                    // PDF pages: the provider's image, with the page's adjustment applied (the
+                    // same image the reader shows). Image files: the loaded bitmap.
+                    BitmapSource? wpfSrc = _items[idx].FromPdf && _images != null
+                        ? await _images.GetAsync(idx, OcrImageWidth, ct: localCt).ConfigureAwait(false)
+                        : null;
                     Bitmap?       bmp    = wpfSrc == null ? _items[idx].Original : null;
 
                     SkiaSharp.SKBitmap skBmp;
@@ -1645,7 +1527,7 @@ public partial class OcrPage : Page
     {
         var item = _items[index];
 
-        if (item.OcrSource != null) return item.OcrSource;
+        if (item.FromPdf && _images != null) return await _images.GetAsync(index, OcrImageWidth);
         if (item.Original  != null) return BitmapToWpf(item.Original);
 
         if (srcPdf == null) return null;
@@ -1957,50 +1839,27 @@ public partial class OcrPage : Page
 
     // ─── PDF thumbnail rendering ──────────────────────────────────────────────
 
-    private async Task RenderPdfThumbnailsAsync(string filePath, CancellationToken ct)
+    // Thumbnails of PDF pages (all, or the given ones) from the page image provider.
+    private async Task RenderPdfThumbnailsAsync(CancellationToken ct, IReadOnlyList<int>? pages = null)
     {
-        try
+        if (_images == null) return;
+        foreach (int i in pages ?? Enumerable.Range(0, _items.Count).ToList())
         {
-            var storageFile = await StorageFile.GetFileFromPathAsync(filePath);
-            var pdfDoc      = await WinPdf.PdfDocument.LoadFromFileAsync(storageFile);
-
-            for (int i = 0; i < _items.Count; i++)
+            if (ct.IsCancellationRequested) return;
+            if (i >= _items.Count || !_items[i].FromPdf || _items[i].ThumbSource != null) continue;
+            try
             {
+                var thumb = await _images.GetAsync(i, 160);
                 if (ct.IsCancellationRequested) return;
-                if (_items[i].ThumbSource != null) continue;
-
-                try
+                if (thumb != null && i < _items.Count)
                 {
-                    using var pdfPage = pdfDoc.GetPage((uint)i);
-                    using var stream  = new InMemoryRandomAccessStream();
-                    await pdfPage.RenderToStreamAsync(stream,
-                        new WinPdf.PdfPageRenderOptions { DestinationWidth = 160 });
-                    stream.Seek(0);
-
-                    var ms = new MemoryStream();
-                    await stream.AsStream().CopyToAsync(ms);
-                    ms.Position = 0;
-
-                    var bmpImage = new BitmapImage();
-                    bmpImage.BeginInit();
-                    bmpImage.StreamSource = ms;
-                    bmpImage.CacheOption  = BitmapCacheOption.OnLoad;
-                    bmpImage.EndInit();
-                    bmpImage.Freeze();
-
-                    if (ct.IsCancellationRequested) return;
-                    if (i < _items.Count)
-                    {
-                        _items[i].ThumbSource = bmpImage;
-                        UpdateListItemAt(i);
-                    }
+                    _items[i].ThumbSource = thumb;
+                    UpdateListItemAt(i);
                 }
-                catch { }
-
-                await Task.Yield();
             }
+            catch { }
+            await Task.Yield();
         }
-        catch { }
     }
 
     private void UpdateListItemAt(int index)

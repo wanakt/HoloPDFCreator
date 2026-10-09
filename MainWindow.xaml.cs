@@ -7,14 +7,12 @@ namespace HoloPDFCreator;
 
 public partial class MainWindow : Window
 {
-    private readonly AdjustedImageStore _adjustedStore = new();
     private readonly PDFReaderPage     _pdfReaderPage = new();
     private readonly OcrPage           _ocrPage       = new();
 
     public MainWindow()
     {
         InitializeComponent();
-        _pdfReaderPage.AdjustedStore      = _adjustedStore;
         ContentFrame.Navigate(_pdfReaderPage);
 
         Loaded += async (_, _) =>
@@ -52,8 +50,7 @@ public partial class MainWindow : Window
         {
             // pdfPath may be the reader's temp file; the results belong to the document itself.
             await _ocrPage.LoadFromPdfAsync(pdfPath, _pdfReaderPage.CurrentPage,
-                                            _pdfReaderPage.Session);
-            _ocrPage.ApplyAdjustedImages(_adjustedStore);
+                                            _pdfReaderPage.Session, _pdfReaderPage.Images);
         }
     }
 }

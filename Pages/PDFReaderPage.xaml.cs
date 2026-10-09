@@ -198,6 +198,8 @@ public partial class PDFReaderPage : Page
 
     public PDFReaderPage()
     {
+        _images = new PageImageProvider(_session);
+        _images.PageImageChanged += OnPageImageChanged;
         SubscribeSession(_session);
         InitializeComponent();
         _adjPanelReady = true;
@@ -242,10 +244,12 @@ public partial class PDFReaderPage : Page
     public string?             EffectiveFilePath => _tempEditedPath ?? _currentFilePath;
     public uint               CurrentPage      => _currentPage;
     public uint               TotalPages       => _totalPages;
-    public AdjustedImageStore? AdjustedStore   { get; set; }
+    /// <summary>Renders (and caches) this document's page images; shared with the OCR view.</summary>
+    public PageImageProvider   Images          => _images;
     public BitmapSource?       CurrentPageImage => PdfPageImage.Source as BitmapSource;
 
-    private DocumentSession _session = new();
+    private DocumentSession   _session = new();
+    private PageImageProvider _images;
 
     /// <summary>
     /// The open document's pages and per-page data (adjustments, source images, OCR
@@ -258,7 +262,12 @@ public partial class PDFReaderPage : Page
         {
             if (ReferenceEquals(value, _session)) return;
             UnsubscribeSession(_session);
+            _images.PageImageChanged -= OnPageImageChanged;
+            _images.Dispose();
             _session = value;
+            _images  = new PageImageProvider(_session);
+            _images.PageImageChanged += OnPageImageChanged;
+            _images.SetDocument(_renderPath, _renderDocument);
             SubscribeSession(_session);
         }
     }
@@ -266,15 +275,45 @@ public partial class PDFReaderPage : Page
     private void SubscribeSession(DocumentSession s)
     {
         s.OrderChanged   += OnSessionOrderChanged;
-        s.ContentChanged += OnSessionContentChanged;
         s.Reset          += OnSessionReset;
     }
 
     private void UnsubscribeSession(DocumentSession s)
     {
         s.OrderChanged   -= OnSessionOrderChanged;
-        s.ContentChanged -= OnSessionContentChanged;
         s.Reset          -= OnSessionReset;
+    }
+
+    // ── Page images changed (adjustment, rotate, crop): refresh their thumbnails ──
+    private readonly HashSet<long> _changedPageImages = new();
+    private bool _allPageImagesChanged;
+    private System.Windows.Threading.DispatcherTimer? _pageImageTimer;
+
+    private void OnPageImageChanged(long id) => Dispatcher.BeginInvoke(() => QueuePageImageRefresh(id));
+
+    private void QueuePageImageRefresh(long id)
+    {
+        if (id < 0) _allPageImagesChanged = true; else _changedPageImages.Add(id);
+        // Coalesce: slider drags change the same page many times a second.
+        _pageImageTimer ??= new System.Windows.Threading.DispatcherTimer(
+            TimeSpan.FromMilliseconds(250), System.Windows.Threading.DispatcherPriority.Background,
+            (_, _) => FlushPageImageChanges(), Dispatcher);
+        _pageImageTimer.Stop();
+        _pageImageTimer.Start();
+    }
+
+    private void FlushPageImageChanges()
+    {
+        _pageImageTimer?.Stop();
+        if (_renderDocument == null) { _changedPageImages.Clear(); _allPageImagesChanged = false; return; }
+        if (_images.IsStale) { _pageImageTimer?.Start(); return; }   // a page edit is in progress
+        IReadOnlyList<int>? pages = _allPageImagesChanged
+            ? null
+            : _changedPageImages.Select(id => _thumbIds.IndexOf(id)).Where(i => i >= 0).OrderBy(i => i).ToList();
+        _changedPageImages.Clear();
+        _allPageImagesChanged = false;
+        if (pages is { Count: 0 }) return;
+        _ = RenderThumbnailsAsync(_thumbCts.Token, pages);
     }
 
     // Page order changed (page edit or undo/redo): move what is still kept by page number.
@@ -282,9 +321,6 @@ public partial class PDFReaderPage : Page
     {
         var newIndex = new Dictionary<long, int>();
         for (int i = 0; i < newOrder.Length; i++) newIndex[newOrder[i]] = i;
-
-        var newToOld = newOrder.Select(id => Array.IndexOf(oldOrder, id)).ToArray();
-        AdjustedStore?.Remap(newToOld);
 
         string? file = _session.FilePath;
         if (file == null || newOrder.Length == 0) return;
@@ -318,10 +354,6 @@ public partial class PDFReaderPage : Page
             if (d.PageId != 0) d.PageNumber = PageOf(d.PageId);
         }
     }
-
-    // Pages rotated or cropped: their adjusted images no longer match.
-    private void OnSessionContentChanged(IReadOnlyCollection<long> ids) =>
-        AdjustedStore?.Remap(null, ids.Select(_session.IndexOf).Where(i => i >= 0).ToHashSet());
 
     // New page ids: page ids recorded on annotations no longer mean anything.
     private void OnSessionReset()
@@ -358,24 +390,12 @@ public partial class PDFReaderPage : Page
         catch { return null; }
     }
 
-    // Re-render the current page and update thumbnails with any adjusted-image overrides.
+    // Re-render the current page (and its side pages) after adjustments changed;
+    // thumbnails follow through PageImageChanged.
     public async Task RefreshWithAdjustedImagesAsync()
     {
         if (_renderDocument == null) return;
-        if (AdjustedStore == null || !AdjustedStore.HasAny) return;
         await RenderCurrentPageAsync();
-        RefreshAdjustedThumbnails();
-    }
-
-    private void RefreshAdjustedThumbnails()
-    {
-        if (AdjustedStore == null) return;
-        for (int i = 0; i < _thumbItems.Count; i++)
-        {
-            var overrideImg = AdjustedStore.Get(i);
-            if (overrideImg != null)
-                _thumbItems[i].Img.Source = overrideImg;
-        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -454,7 +474,6 @@ public partial class PDFReaderPage : Page
         if (_imageFiles.Count == 0) return;
 
         CleanupTempImagePdf();
-        AdjustedStore?.Clear();
 
         string tmpPath = System.IO.Path.Combine(
             System.IO.Path.GetTempPath(),
@@ -604,7 +623,10 @@ public partial class PDFReaderPage : Page
 
             var cleanFile = await StorageFile.GetFileFromPathAsync(renderTmp);
             _renderDocument = await WinPdf.PdfDocument.LoadFromFileAsync(cleanFile);
-            try { File.Delete(renderTmp); } catch { /* temp file, non-critical */ }
+            // The page images are rendered from this annotation-free copy; keep it until
+            // the next load (the original would show our annotations twice).
+            SetRenderFile(renderTmp, isLoadCopy: true);
+            _images.InvalidateAll();
 
             _totalPages = _renderDocument.PageCount;
             // Same file with the same pages (e.g. reloaded after saving) keeps its page data.
@@ -714,6 +736,7 @@ public partial class PDFReaderPage : Page
             _editDocument.Dispose();
             _editDocument   = null;
             _renderDocument = null;
+            _images.SetDocument(null);
 
             if (hasOcr)
             {
@@ -746,7 +769,6 @@ public partial class PDFReaderPage : Page
             }
 
             _adjSettings.Clear();
-            AdjustedStore?.Clear();
 
             // The saved file's outline now holds every bookmark; drop the in-memory
             // copies so LoadPdfAsync re-imports them once instead of duplicating.
@@ -800,7 +822,7 @@ public partial class PDFReaderPage : Page
             catch { continue; }
 
             // Apply brightness / contrast / USM / etc.
-            using var adjusted = AdjApplySettingsFrom(raw, adjS);
+            using var adjusted = ImageProcessingService.ApplyAdjustments(raw, adjS);
             raw.Dispose();
 
             // Encode to JPEG at high quality to keep file size reasonable.
@@ -1015,11 +1037,13 @@ public partial class PDFReaderPage : Page
         {
             case RotateEdit r:
                 ApplyRotation(r.Pages, revert ? -r.Angle : r.Angle);
+                _session.MarkContentChanged(r.Pages);
                 break;
 
             case CropEdit c:
                 for (int i = 0; i < c.Pages.Length; i++)
                     SetCropRect(_editDocument.Pages[c.Pages[i]], revert ? c.Before[i] : c.After[i]);
+                _session.MarkContentChanged(c.Pages);
                 break;
 
             case ReorderEdit o:
@@ -1045,7 +1069,6 @@ public partial class PDFReaderPage : Page
         // Restore image adjustment settings for all pages.
         _session.Adjust.RestoreById(state.Adj);
         _adjUndoPushedForPage = -1;
-        AdjustedStore?.Clear();
 
         if (_currentFilePath == null) return;
 
@@ -1104,7 +1127,10 @@ public partial class PDFReaderPage : Page
             _totalPages = _renderDocument.PageCount;
             _currentPage = Math.Min(_currentPage, _totalPages > 0 ? _totalPages - 1 : 0);
 
+            // Page order first, then the file rendered with that order.
             RestoreState(snapshot.State);
+            SetRenderFile(tmpPath);
+            _images.InvalidateAll();   // a snapshot may differ from the current pages in content
 
             UpdateNavButtons();
             await RenderCurrentPageAsync();  // also calls LoadAdjSettingsForPage → updates sliders
@@ -1895,39 +1921,10 @@ public partial class PDFReaderPage : Page
         {
             BitmapSource displaySrc;
 
-            // PDF mode (includes images-as-temp-PDF)
-            using var pdfPage = _renderDocument!.GetPage(_currentPage);
-            using var stream  = new InMemoryRandomAccessStream();
-            var opts = new WinPdf.PdfPageRenderOptions
-            {
-                DestinationWidth = (uint)(RenderBaseWidth * _zoomLevel)
-            };
-            await pdfPage.RenderToStreamAsync(stream, opts);
-            stream.Seek(0);
-            var ms = new MemoryStream();
-            await stream.AsStream().CopyToAsync(ms);
-            ms.Position = 0;
-            var pdfBmp = new BitmapImage();
-            pdfBmp.BeginInit();
-            pdfBmp.StreamSource = ms;
-            pdfBmp.CacheOption  = BitmapCacheOption.OnLoad;
-            pdfBmp.EndInit();
-            pdfBmp.Freeze();
-            displaySrc = pdfBmp;
-
+            // PDF mode (includes images-as-temp-PDF); the page's adjustment is applied by the provider.
+            displaySrc = await _images.GetAsync((int)_currentPage, (int)(RenderBaseWidth * _zoomLevel))
+                         ?? throw new InvalidOperationException("Page could not be rendered.");
             BitmapSource finalSrc = displaySrc;
-            if (_adjSettings.TryGetValue((int)_currentPage, out var adjS))
-            {
-                using var drawBmp = BitmapSourceToDrawingBitmap(displaySrc);
-                var adjusted = AdjApplySettingsFrom(drawBmp, adjS);
-                finalSrc = BitmapToBitmapImage(adjusted);
-                adjusted.Dispose();
-                AdjustedStore?.Set((int)_currentPage, (BitmapImage)finalSrc);
-            }
-            else
-            {
-                AdjustedStore?.Remove((int)_currentPage);
-            }
 
             PdfPageImage.Source  = finalSrc;
             PdfPageImage.Width   = RenderBaseWidth * _zoomLevel;
@@ -2003,25 +2000,7 @@ public partial class PDFReaderPage : Page
     // Render a single page from the document into an Image element.
     private async Task<System.Windows.Controls.Image> RenderPageImageAsync(uint pageIndex)
     {
-        BitmapSource pageSrc;
-        using var pdfPage = _renderDocument!.GetPage(pageIndex);
-        using var stream  = new InMemoryRandomAccessStream();
-        var opts = new WinPdf.PdfPageRenderOptions { DestinationWidth = (uint)(RenderBaseWidth * _zoomLevel) };
-        await pdfPage.RenderToStreamAsync(stream, opts);
-        stream.Seek(0);
-        var ms = new MemoryStream();
-        await stream.AsStream().CopyToAsync(ms);
-        ms.Position = 0;
-        var bmp = new BitmapImage();
-        bmp.BeginInit();
-        bmp.StreamSource = ms;
-        bmp.CacheOption  = BitmapCacheOption.OnLoad;
-        bmp.EndInit();
-        bmp.Freeze();
-        pageSrc = bmp;
-
-        var overrideImg2 = AdjustedStore?.Get((int)pageIndex);
-        var finalSrc2    = overrideImg2 ?? pageSrc;
+        var finalSrc2 = await _images.GetAsync((int)pageIndex, (int)(RenderBaseWidth * _zoomLevel));
 
         var img = new System.Windows.Controls.Image
         {
@@ -3631,12 +3610,7 @@ public partial class PDFReaderPage : Page
     private async Task ApplyAdjustToCurrentAsync()
     {
         if (_renderDocument == null) return;
-        await RenderCurrentPageAsync(preserveScroll: true);
-        if ((int)_currentPage < _thumbItems.Count && AdjustedStore != null)
-        {
-            var img = AdjustedStore.Get((int)_currentPage);
-            if (img != null) _thumbItems[(int)_currentPage].Img.Source = img;
-        }
+        await RenderCurrentPageAsync(preserveScroll: true);   // thumbnail follows via PageImageChanged
 
     }
 
@@ -3644,7 +3618,6 @@ public partial class PDFReaderPage : Page
     {
         PushUndo();  // capture state before resetting adjustments
         _adjSettings.Remove((int)_currentPage);
-        AdjustedStore?.Remove((int)_currentPage);
 
         _suppressAdjSlider = true;
         SliderBrightness.Value   = 0;
@@ -3663,214 +3636,42 @@ public partial class PDFReaderPage : Page
         LblUsmThreshold.Text = "0";
 
         _ = RenderCurrentPageAsync();
-        _ = ResetThumbnailForPageAsync((int)_currentPage);
     }
 
+    // Applying to many pages only stores the settings; the provider renders adjusted
+    // images when a page is shown, thumbnailed, OCR'd or baked.
     private async void AdjApplyAll_Click(object sender, RoutedEventArgs e)
-    {
-        if (_renderDocument == null || AdjustedStore == null) return;
-        PushUndo();  // one undo entry covers the entire batch
-        var win = new ProgressWindow($"Applying to {_totalPages} pages…") { Owner = Window.GetWindow(this) };
-        win.Show();
-        bool cancelled = false;
-        try
-        {
-            for (int i = 0; i < (int)_totalPages; i++)
-            {
-                if (win.IsCancelled) { cancelled = true; break; }
-                win.Update(i + 1, (int)_totalPages, $"Page {i + 1} / {_totalPages}…");
-                var bmp = await RenderPageToBitmapAsync(i);
-                if (bmp == null) continue;
-                var adjusted = AdjApplySettings(bmp);
-                bmp.Dispose();
-                AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
-                adjusted.Dispose();
-                SaveCurrentAdjSettings(i, false);
-            }
-        }
-        finally { win.Close(); }
-        if (!cancelled)
-            await RefreshWithAdjustedImagesAsync();
-
-    }
+        => await AdjApplyToPagesAsync(Enumerable.Range(0, (int)_totalPages));
 
     private async void AdjApplyRange_Click(object sender, RoutedEventArgs e)
     {
-        if (_renderDocument == null || AdjustedStore == null) return;
+        if (_renderDocument == null) return;
         var indices = ParseAdjRange(TxtAdjRange.Text, (int)_totalPages);
         if (indices.Count == 0) { MessageBox.Show("유효한 페이지 범위를 입력하세요. 예: 1-3,5,7-9", "범위 오류"); return; }
-        PushUndo();  // one undo entry covers the entire batch
-        var win = new ProgressWindow($"Applying to {indices.Count} pages…") { Owner = Window.GetWindow(this) };
-        win.Show();
-        try
-        {
-            for (int n = 0; n < indices.Count; n++)
-            {
-                if (win.IsCancelled) break;
-                int i = indices[n];
-                win.Update(n + 1, indices.Count, $"Page {i + 1} / {_totalPages}…");
-                var bmp = await RenderPageToBitmapAsync(i);
-                if (bmp == null) continue;
-                var adjusted = AdjApplySettings(bmp);
-                bmp.Dispose();
-                AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
-                adjusted.Dispose();
-                SaveCurrentAdjSettings(i, false);
-            }
-        }
-        finally { win.Close(); }
-        await RefreshWithAdjustedImagesAsync();
-
+        await AdjApplyToPagesAsync(indices);
     }
 
     private async void AdjApplyOdd_Click(object sender, RoutedEventArgs e)
-        => await AdjApplyByParityAsync(odd: true);
+        => await AdjApplyToPagesAsync(Enumerable.Range(0, (int)_totalPages).Where(i => i % 2 == 0));   // pages 1, 3, 5…
 
     private async void AdjApplyEven_Click(object sender, RoutedEventArgs e)
-        => await AdjApplyByParityAsync(odd: false);
+        => await AdjApplyToPagesAsync(Enumerable.Range(0, (int)_totalPages).Where(i => i % 2 == 1));
 
-    private async Task AdjApplyByParityAsync(bool odd)
+    private async Task AdjApplyToPagesAsync(IEnumerable<int> pages)
     {
-        if (_renderDocument == null || AdjustedStore == null) return;
-        // Page indices are 0-based; odd pages = index 0,2,4… (page numbers 1,3,5…)
-        var indices = Enumerable.Range(0, (int)_totalPages)
-                                .Where(i => odd ? (i % 2 == 0) : (i % 2 == 1))
-                                .ToList();
+        if (_renderDocument == null) return;
         PushUndo();  // one undo entry covers the entire batch
-        string label = odd ? "홀수" : "짝수";
-        var win = new ProgressWindow($"{label} 페이지 ({indices.Count}장) 적용 중…") { Owner = Window.GetWindow(this) };
-        win.Show();
-        bool cancelled = false;
-        try
-        {
-            for (int n = 0; n < indices.Count; n++)
-            {
-                if (win.IsCancelled) { cancelled = true; break; }
-                int i = indices[n];
-                win.Update(n + 1, indices.Count, $"Page {i + 1} / {_totalPages}…");
-                var bmp = await RenderPageToBitmapAsync(i);
-                if (bmp == null) continue;
-                var adjusted = AdjApplySettings(bmp);
-                bmp.Dispose();
-                AdjustedStore.Set(i, BitmapToBitmapImage(adjusted));
-                adjusted.Dispose();
-                SaveCurrentAdjSettings(i, false);
-            }
-        }
-        finally { win.Close(); }
-        if (!cancelled)
-            await RefreshWithAdjustedImagesAsync();
-
-    }
-
-    private async Task ResetThumbnailForPageAsync(int pageIndex)
-    {
-        if (_renderDocument == null || pageIndex >= _thumbItems.Count) return;
-        try
-        {
-            using var pdfPage = _renderDocument.GetPage((uint)pageIndex);
-            using var stream  = new InMemoryRandomAccessStream();
-            await pdfPage.RenderToStreamAsync(stream,
-                new WinPdf.PdfPageRenderOptions { DestinationWidth = 160 });
-            stream.Seek(0);
-            var ms = new MemoryStream();
-            await stream.AsStream().CopyToAsync(ms);
-            ms.Position = 0;
-            var thumb = new BitmapImage();
-            thumb.BeginInit();
-            thumb.StreamSource = ms;
-            thumb.CacheOption  = BitmapCacheOption.OnLoad;
-            thumb.EndInit();
-            thumb.Freeze();
-            _thumbItems[pageIndex].Img.Source = thumb;
-        }
-        catch { }
+        foreach (int i in pages) SaveCurrentAdjSettings(i, false);
+        await RefreshWithAdjustedImagesAsync();
     }
 
     private void ResetAllAdjustments()
     {
-        _adjSettings.Clear();
-        AdjustedStore?.Clear();
+        _adjSettings.Clear();       // thumbnails follow via PageImageChanged
         LoadAdjSettingsForPage(-1); // resets sliders to 0
-
-        RefreshAdjustedThumbnails(); // will find nothing in store, so no-op; thumbnails reset by re-render
         _ = RenderCurrentPageAsync();
-        _ = RenderThumbnailsAsync(_thumbCts.Token);
     }
 
-
-    private async Task<System.Drawing.Bitmap?> RenderPageToBitmapAsync(int pageIndex)
-    {
-        if (_renderDocument == null) return null;
-        try
-        {
-            using var pdfPage = _renderDocument.GetPage((uint)pageIndex);
-            using var stream  = new InMemoryRandomAccessStream();
-            await pdfPage.RenderToStreamAsync(stream,
-                new WinPdf.PdfPageRenderOptions { DestinationWidth = 1200 });
-            stream.Seek(0);
-            var ms = new MemoryStream();
-            await stream.AsStream().CopyToAsync(ms);
-            ms.Position = 0;
-            return new System.Drawing.Bitmap(ms);
-        }
-        catch { return null; }
-    }
-
-    // Called during live-edit (reads from UI sliders).
-    private System.Drawing.Bitmap AdjApplySettings(System.Drawing.Bitmap src)
-    {
-        var s = new AdjSettings(
-            SliderBrightness.Value, SliderContrast.Value, SliderStroke.Value,
-            SliderUsmAmount.Value, SliderUsmRadius.Value, SliderUsmThreshold.Value,
-            ChkAutoLevel.IsChecked == true);
-        return AdjApplySettingsFrom(src, s);
-    }
-
-    // Called from RenderCurrentPageAsync (uses stored record, not UI sliders).
-    private static System.Drawing.Bitmap AdjApplySettingsFrom(System.Drawing.Bitmap src, AdjSettings s)
-    {
-        float brightness   = (float)s.Brightness / 100f;
-        float contrast     = (float)s.Contrast   / 100f;
-        bool  autoLevel    = s.AutoLevel;
-        float stroke       = (float)s.Stroke;
-        float usmAmount    = (float)s.UsmAmount;
-        int   usmRadius    = (int)s.UsmRadius;
-        int   usmThreshold = (int)s.UsmThreshold;
-
-        var result = src;
-        if (Math.Abs(brightness) > 0.001f)  { var t = ImageProcessingService.AdjustBrightness(result, brightness);                     if (result != src) result.Dispose(); result = t; }
-        if (Math.Abs(contrast)   > 0.001f)  { var t = ImageProcessingService.AdjustContrast(result, contrast);                         if (result != src) result.Dispose(); result = t; }
-        if (autoLevel)                       { var t = ImageProcessingService.AutoLevel(result);                                         if (result != src) result.Dispose(); result = t; }
-        if (stroke > 0.01f)                  { var t = ImageProcessingService.ThickenStrokes(result, stroke);                           if (result != src) result.Dispose(); result = t; }
-        if (usmAmount > 0.01f)               { var t = ImageProcessingService.UnsharpMask(result, usmAmount, usmRadius, usmThreshold);  if (result != src) result.Dispose(); result = t; }
-        if (result == src) return new System.Drawing.Bitmap(src);
-        return result;
-    }
-
-    private static System.Drawing.Bitmap BitmapSourceToDrawingBitmap(BitmapSource source)
-    {
-        using var ms = new MemoryStream();
-        var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
-        encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(source));
-        encoder.Save(ms);
-        ms.Position = 0;
-        return new System.Drawing.Bitmap(ms);
-    }
-
-    private static BitmapImage BitmapToBitmapImage(System.Drawing.Bitmap bmp)
-    {
-        using var ms = new MemoryStream();
-        bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
-        ms.Position = 0;
-        var bi = new BitmapImage();
-        bi.BeginInit();
-        bi.StreamSource = ms;
-        bi.CacheOption  = BitmapCacheOption.OnLoad;
-        bi.EndInit();
-        bi.Freeze();
-        return bi;
-    }
 
     private static List<int> ParseAdjRange(string text, int total)
     {
@@ -4870,6 +4671,7 @@ public partial class PDFReaderPage : Page
             // Clean up the previous temp edited file first.
             CleanupTempEditedPath();
             _tempEditedPath = tmpPath;
+            SetRenderFile(tmpPath);
 
             _totalPages = _renderDocument.PageCount;
             UpdateNavButtons();
@@ -4884,6 +4686,23 @@ public partial class PDFReaderPage : Page
         {
             _pageTransitioning = false;
         }
+    }
+
+    // The file _renderDocument was loaded from, which the page images are rendered from.
+    private string? _renderPath;
+    // The annotation-free copy made when loading; deleted when the next document is loaded.
+    private string? _loadRenderCopy;
+
+    private void SetRenderFile(string path, bool isLoadCopy = false)
+    {
+        if (isLoadCopy)
+        {
+            if (_loadRenderCopy != null && _loadRenderCopy != path)
+                try { File.Delete(_loadRenderCopy); } catch { /* temp file, non-critical */ }
+            _loadRenderCopy = path;
+        }
+        _renderPath = path;
+        _images.SetDocument(path, _renderDocument);
     }
 
     private void CleanupTempEditedPath()
@@ -4913,6 +4732,8 @@ public partial class PDFReaderPage : Page
 
         _thumbCts.Cancel();
         _thumbCts = new CancellationTokenSource();
+
+        _thumbIds = _session.CaptureOrder().ToList();
 
         if (pageFrom != null && _renderDocument != null && _thumbItems.Count == (int)_totalPages)
         {
@@ -5129,35 +4950,35 @@ public partial class PDFReaderPage : Page
         if (toRender.Count > 0) _ = RenderThumbnailsAsync(_thumbCts.Token, toRender);
     }
 
+    private const int ThumbWidth = 160;
+
+    // Page id shown in each thumbnail slot. During a page edit the session's order changes
+    // before the panel is rebuilt, so slots are matched by id, never by index alone.
+    private List<long> _thumbIds = new();
+
     private async Task RenderThumbnailsAsync(CancellationToken ct, IReadOnlyList<int>? pages = null)
     {
-        pages ??= Enumerable.Range(0, (int)_totalPages).ToList();
+        pages ??= Enumerable.Range(0, _thumbItems.Count).ToList();
+        var slotIds = _thumbIds;
         foreach (int i in pages)
         {
             if (ct.IsCancellationRequested) return;
+            if (i >= slotIds.Count) continue;
 
             try
             {
-                BitmapSource thumbSrc;
-
                 if (_renderDocument == null) return;
-                using var pdfPage = _renderDocument.GetPage((uint)i);
-                using var stream  = new InMemoryRandomAccessStream();
-                await pdfPage.RenderToStreamAsync(stream,
-                    new WinPdf.PdfPageRenderOptions { DestinationWidth = 160 });
-                stream.Seek(0);
-                var ms = new MemoryStream();
-                await stream.AsStream().CopyToAsync(ms);
-                ms.Position = 0;
-                var pdfThumb = new BitmapImage();
-                pdfThumb.BeginInit();
-                pdfThumb.StreamSource = ms;
-                pdfThumb.CacheOption  = BitmapCacheOption.OnLoad;
-                pdfThumb.EndInit();
-                pdfThumb.Freeze();
-                thumbSrc = pdfThumb;
-
-                if (!ct.IsCancellationRequested && i < _thumbItems.Count)
+                long id  = slotIds[i];
+                int  idx = _session.IndexOf(id);
+                if (idx < 0) continue;
+                var thumbSrc = await _images.GetAsync(idx, ThumbWidth);
+                if (thumbSrc == null)
+                {
+                    if (_images.IsStale) QueuePageImageRefresh(id);   // retry after the edit
+                    continue;
+                }
+                // Write only if the slot still shows that page.
+                if (!ct.IsCancellationRequested && ReferenceEquals(slotIds, _thumbIds) && i < _thumbItems.Count)
                     _thumbItems[i].Img.Source = thumbSrc;
             }
             catch { /* skip on render error */ }

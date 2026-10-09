@@ -189,13 +189,19 @@ public sealed class PageIndexed<T> : IDictionary<int, T>, DocumentSession.IPageS
 
     internal PageIndexed(DocumentSession session) => _session = session;
 
+    /// <summary>Raised with the page id whose value was set or removed.</summary>
+    public event Action<long>? Changed;
+
     public T this[int index]
     {
         get => TryGetValue(index, out var v) ? v : throw new KeyNotFoundException($"No data for page {index}.");
         set
         {
             if (index < 0 || !_session.EnsureCount(index + 1)) return;
-            _byId[_session.IdAt(index)] = value;
+            long id = _session.IdAt(index);
+            bool same = _byId.TryGetValue(id, out var old) && EqualityComparer<T>.Default.Equals(old, value);
+            _byId[id] = value;
+            if (!same) Changed?.Invoke(id);
         }
     }
 
@@ -209,11 +215,22 @@ public sealed class PageIndexed<T> : IDictionary<int, T>, DocumentSession.IPageS
 
     public bool ContainsKey(int index) => TryGetValue(index, out _);
 
-    public bool Remove(int index) =>
-        index >= 0 && index < _session.PageCount && _byId.Remove(_session.IdAt(index));
+    public bool Remove(int index)
+    {
+        if (index < 0 || index >= _session.PageCount) return false;
+        long id = _session.IdAt(index);
+        if (!_byId.Remove(id)) return false;
+        Changed?.Invoke(id);
+        return true;
+    }
 
     /// <summary>Removes the data of every page, including deleted ones.</summary>
-    public void Clear() => _byId.Clear();
+    public void Clear()
+    {
+        var ids = _byId.Keys.ToList();
+        _byId.Clear();
+        foreach (var id in ids) Changed?.Invoke(id);
+    }
     void DocumentSession.IPageStore.ClearAll() => _byId.Clear();
 
     public ICollection<int> Keys =>
@@ -247,9 +264,15 @@ public sealed class PageIndexed<T> : IDictionary<int, T>, DocumentSession.IPageS
     /// <summary>All data by page id (deleted pages included), for undo.</summary>
     public Dictionary<long, T> SnapshotById() => new(_byId);
 
+    /// <summary>Replaces all data; <see cref="Changed"/> fires only for pages whose value differs.</summary>
     public void RestoreById(IReadOnlyDictionary<long, T> data)
     {
+        var changed = _byId.Keys.Where(k => !data.ContainsKey(k))
+            .Concat(data.Where(kv => !_byId.TryGetValue(kv.Key, out var v) ||
+                                     !EqualityComparer<T>.Default.Equals(v, kv.Value)).Select(kv => kv.Key))
+            .ToList();
         _byId.Clear();
         foreach (var (k, v) in data) _byId[k] = v;
+        foreach (var id in changed) Changed?.Invoke(id);
     }
 }
