@@ -16,7 +16,6 @@ public partial class MainWindow : Window
         InitializeComponent();
         _pdfReaderPage.AdjustedStore      = _adjustedStore;
         _pdfReaderPage.OcrDataProvider    = path => _ocrPage.GetOcrData(path);
-        _pdfReaderPage.OnAdjustmentsBaked = () => _ocrPage.InvalidateOcrSessions();
         ContentFrame.Navigate(_pdfReaderPage);
 
         Loaded += async (_, _) =>
@@ -32,7 +31,7 @@ public partial class MainWindow : Window
     private void SetNavActive(Button active)
     {
         BtnNavPdfReader.Style     = (Style)FindResource("NavButton");
-        BtnNavImageAdjuster.Style = (Style)FindResource("NavButton");
+        BtnNavOcr.Style = (Style)FindResource("NavButton");
         active.Style              = (Style)FindResource("NavButtonActive");
     }
 
@@ -45,10 +44,10 @@ public partial class MainWindow : Window
 
     private void BtnNavPdfReader_Click(object sender, RoutedEventArgs e) => SwitchToPdfReader();
 
-    private async void BtnNavImageAdjuster_Click(object sender, RoutedEventArgs e)
+    private async void BtnNavOcr_Click(object sender, RoutedEventArgs e)
     {
         ContentFrame.Navigate(_ocrPage);
-        SetNavActive(BtnNavImageAdjuster);
+        SetNavActive(BtnNavOcr);
 
         if (_pdfReaderPage.EffectiveFilePath is string pdfPath)
         {

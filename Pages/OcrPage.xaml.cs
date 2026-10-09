@@ -115,10 +115,6 @@ public partial class OcrPage : Page
     /// Returns null when no results exist for that file or none have image dims
     /// (e.g. results loaded from an existing text layer rather than freshly run).
     /// </summary>
-    // Called after PDF save with baked adjustments to dispose stale DML sessions.
-    // The next OCR run will recreate fresh sessions; if DML is still broken it
-    // will fall back to CPU automatically.
-    public void InvalidateOcrSessions() => _ocrService.InvalidateSessions();
 
     public IReadOnlyDictionary<int, OcrPageData>? GetOcrData(string forFilePath)
     {
@@ -874,7 +870,8 @@ public partial class OcrPage : Page
     //  OCR
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static void SetOcrStatus(string msg) { }
+    // Load and OCR messages share one status line in the top toolbar.
+    private void SetOcrStatus(string msg) => SetStatus(msg);
 
     private OcrModelSize _lastModelSize        = OcrModelSize.Mobile;
     private int          _lastWorkers          = 0;   // 0 = auto (cpu count)
@@ -993,7 +990,7 @@ public partial class OcrPage : Page
 
             // Build a pool of PDF document instances — one per worker — for fully parallel lazy rendering.
             // A single serialized document (pdfSem=1) becomes the throughput bottleneck once pre-loaded
-            // pages are exhausted: serial render time >> GPU inference time → GPU starves.
+            // pages are exhausted: serial render time >> inference time → OCR workers starve.
             string? pdfPath = _sourcePdfPath;
             var pdfDocPool = new System.Collections.Concurrent.ConcurrentQueue<WinPdf.PdfDocument>();
             if (pdfPath != null)
@@ -1858,7 +1855,11 @@ public partial class OcrPage : Page
         return string.Concat(name.Select(c => invalid.Contains(c) ? '_' : c));
     }
 
-    private static void SetStatus(string msg) { }
+    private void SetStatus(string msg)
+    {
+        if (Dispatcher.CheckAccess()) { TxtOcrStatus.Text = msg; TxtOcrStatus.ToolTip = msg; }
+        else Dispatcher.BeginInvoke(() => SetStatus(msg));
+    }
 
     // ─── Existing text layer auto-load ────────────────────────────────────────
 

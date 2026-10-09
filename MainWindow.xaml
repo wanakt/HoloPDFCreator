@@ -72,9 +72,9 @@
                         </StackPanel>
                     </Button>
 
-                    <Button x:Name="BtnNavImageAdjuster"
+                    <Button x:Name="BtnNavOcr"
                             Style="{StaticResource NavButton}"
-                            Click="BtnNavImageAdjuster_Click">
+                            Click="BtnNavOcr_Click">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="&#x1F5BC;" FontSize="16" Margin="0,0,10,0"/>
                             <TextBlock Text="OCR" FontSize="14"/>

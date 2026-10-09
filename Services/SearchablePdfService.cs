@@ -120,8 +120,9 @@ public static class SearchablePdfService
         {
             if (pageIdx >= doc.PageCount || data.Regions.Count == 0) continue;
             var page = doc.Pages[pageIdx];
-            EnsureFontResource(doc, page);
-            byte[] bytes = BuildContentStream(data, page.Width.Point, page.Height.Point, page.Rotate);
+            var supp = new Dictionary<int, int>();
+            byte[] bytes = BuildContentStream(data, VisibleBox(page), page.Rotate, supp);
+            EnsureFontResource(doc, page, supp);
             AppendContentStream(doc, page, bytes);
         }
     }
@@ -150,14 +151,10 @@ public static class SearchablePdfService
         {
             if (pageIdx >= doc.PageCount || data.Regions.Count == 0) continue;
 
-            var page  = doc.Pages[pageIdx];
-            int rot   = page.Rotate;            // 0 / 90 / 180 / 270
-            double pW = page.Width.Point;
-            double pH = page.Height.Point;
-
-            EnsureFontResource(doc, page);
-
-            byte[] bytes = BuildContentStream(data, pW, pH, rot);
+            var page = doc.Pages[pageIdx];
+            var supp = new Dictionary<int, int>();
+            byte[] bytes = BuildContentStream(data, VisibleBox(page), page.Rotate, supp);
+            EnsureFontResource(doc, page, supp);
             AppendContentStream(doc, page, bytes);
         }
 
@@ -168,27 +165,50 @@ public static class SearchablePdfService
 
     private const string FontKey = "/HoloPdfOcrF";
 
-    // Identity ToUnicode CMap: maps every CID directly to the same Unicode code point.
-    // This lets the PDF viewer copy/search the correct Unicode text for any script.
-    private const string ToUnicodeCMap =
-        "/CIDInit /ProcSet findresource begin\n" +
-        "12 dict begin\n" +
-        "begincmap\n" +
-        "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n" +
-        "/CMapName /Adobe-Identity-UCS def\n" +
-        "/CMapType 2 def\n" +
-        "1 begincodespacerange\n" +
-        "<0000> <FFFF>\n" +
-        "endcodespacerange\n" +
-        "1 beginbfrange\n" +
-        "<0000> <FFFF> <0000>\n" +
-        "endbfrange\n" +
-        "endcmap\n" +
-        "CMapName currentdict /CMap defineresource pop\n" +
-        "end\n" +
-        "end\n";
+    // CIDs D800–DFFF never stand for a BMP character (that range is UTF-16
+    // surrogates), so characters outside the BMP borrow them, one CID each.
+    private const int SuppCidFirst = 0xD800;
+    private const int SuppCidCount = 0x800;
 
-    private static void EnsureFontResource(PdfDocument doc, PdfPage page)
+    /// <summary>
+    /// ToUnicode CMap: every BMP CID maps to the same code point; borrowed surrogate
+    /// CIDs map to the supplementary character in <paramref name="supp"/> (code point → CID).
+    /// This lets the PDF viewer copy/search the correct Unicode text for any script.
+    /// </summary>
+    private static string BuildToUnicodeCMap(IReadOnlyDictionary<int, int> supp)
+    {
+        var sb = new StringBuilder();
+        sb.Append("/CIDInit /ProcSet findresource begin\n");
+        sb.Append("12 dict begin\n");
+        sb.Append("begincmap\n");
+        sb.Append("/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n");
+        sb.Append("/CMapName /Adobe-Identity-UCS def\n");
+        sb.Append("/CMapType 2 def\n");
+        sb.Append("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n");
+        sb.Append("2 beginbfrange\n<0000> <D7FF> <0000>\n<E000> <FFFF> <E000>\nendbfrange\n");
+
+        // At most 100 entries per bfchar block (PDF spec limit).
+        var pairs = supp.OrderBy(kv => kv.Value).ToList();
+        for (int i = 0; i < pairs.Count; i += 100)
+        {
+            var chunk = pairs.Skip(i).Take(100).ToList();
+            sb.Append($"{chunk.Count} beginbfchar\n");
+            foreach (var (cp, cid) in chunk)
+            {
+                string utf16 = char.ConvertFromUtf32(cp);
+                sb.Append($"<{cid:X4}> <{(int)utf16[0]:X4}{(int)utf16[1]:X4}>\n");
+            }
+            sb.Append("endbfchar\n");
+        }
+
+        sb.Append("endcmap\n");
+        sb.Append("CMapName currentdict /CMap defineresource pop\n");
+        sb.Append("end\n");
+        sb.Append("end\n");
+        return sb.ToString();
+    }
+
+    private static void EnsureFontResource(PdfDocument doc, PdfPage page, IReadOnlyDictionary<int, int> supp)
     {
         var res = page.Elements.GetDictionary("/Resources");
         if (res == null)
@@ -204,11 +224,9 @@ public static class SearchablePdfService
             res.Elements["/Font"] = fonts;
         }
 
-        if (fonts.Elements.ContainsKey(FontKey)) return;
-
-        // ToUnicode CMap stream (identity mapping for entire Unicode BMP)
+        // Always (re)built: the ToUnicode map depends on this page's supplementary characters.
         var toUnicode = new PdfDictionary(doc);
-        toUnicode.CreateStream(Encoding.ASCII.GetBytes(ToUnicodeCMap));
+        toUnicode.CreateStream(Encoding.ASCII.GetBytes(BuildToUnicodeCMap(supp)));
         doc.Internals.AddObject(toUnicode);
 
         // FontDescriptor — Ascent=1000, Descent=0 so text fills box from baseline to top
@@ -269,7 +287,7 @@ public static class SearchablePdfService
     private const double TextHeightScale = 0.43;
 
     private static byte[] BuildContentStream(
-        OcrPageData data, double pW, double pH, int rotation)
+        OcrPageData data, PageBox box, int rotation, Dictionary<int, int> supp)
     {
         var sb = new StringBuilder();
         sb.Append("q\nBT\n3 Tr\n");   // save state, begin text, invisible rendering mode
@@ -278,8 +296,8 @@ public static class SearchablePdfService
         {
             if (string.IsNullOrWhiteSpace(r.Text) || r.Points.Length == 0) continue;
 
-            string textHex = EncodeTextHex(r.Text);
-            if (textHex.Length <= 2) continue; // "<>" = no printable characters
+            var (textHex, glyphs) = EncodeTextHex(r.Text, supp);
+            if (glyphs == 0) continue; // no printable characters
 
             double minXPx = r.Points.Min(p => p.X);
             double maxXPx = r.Points.Max(p => p.X);
@@ -295,7 +313,9 @@ public static class SearchablePdfService
 
             var (x, y, w, h, ta, tb, tc, td) = MapToPage(
                 blXPx, blYPx, vwPx, vhPx,
-                data.ImgWidth, data.ImgHeight, pW, pH, rotation);
+                data.ImgWidth, data.ImgHeight, box.Width, box.Height, rotation);
+            x += box.X;
+            y += box.Y;
 
             if (h < 0.5) continue;
 
@@ -310,7 +330,7 @@ public static class SearchablePdfService
 
             // With DW=1000, each character advances exactly 1 em = h points.
             // Tz scales the entire line to match the detected bounding-box width.
-            double nomW = r.Text.Length * h;
+            double nomW = glyphs * h;
             double hz = nomW > 0 ? Math.Clamp(w / nomW * 100.0, 10, 2000) : 100.0;
 
             sb.Append($"{FontKey} {h:F2} Tf\n");
@@ -326,61 +346,63 @@ public static class SearchablePdfService
 
     // ── Coordinate transform ──────────────────────────────────────────────────
 
+    /// <summary>Visible page area in unrotated user space (points).</summary>
+    private readonly record struct PageBox(double X, double Y, double Width, double Height);
+
     /// <summary>
-    /// Maps a region's bottom-left pixel + size to PDF page space.
+    /// The area a viewer shows (and the OCR image covers): CropBox clipped to
+    /// MediaBox, or MediaBox when there is no CropBox. Never rotation-adjusted.
+    /// </summary>
+    private static PageBox VisibleBox(PdfPage page)
+    {
+        var mb = page.MediaBox;
+        double x1 = Math.Min(mb.X1, mb.X2), y1 = Math.Min(mb.Y1, mb.Y2);
+        double x2 = Math.Max(mb.X1, mb.X2), y2 = Math.Max(mb.Y1, mb.Y2);
+        if (page.Elements.ContainsKey("/CropBox"))
+        {
+            var cb = page.CropBox;
+            double cx1 = Math.Max(x1, Math.Min(cb.X1, cb.X2)), cy1 = Math.Max(y1, Math.Min(cb.Y1, cb.Y2));
+            double cx2 = Math.Min(x2, Math.Max(cb.X1, cb.X2)), cy2 = Math.Min(y2, Math.Max(cb.Y1, cb.Y2));
+            if (cx2 > cx1 && cy2 > cy1) { x1 = cx1; y1 = cy1; x2 = cx2; y2 = cy2; }
+        }
+        return new PageBox(x1, y1, x2 - x1, y2 - y1);
+    }
+
+    /// <summary>
+    /// Maps a region's bottom-left pixel + size (in the rendered, rotated image) to
+    /// unrotated user space relative to the visible box of size <paramref name="bW"/> × <paramref name="bH"/>.
+    /// Returns the baseline origin (x, y), the run length w and glyph height h in points,
+    /// and the text direction (ta, tb) and ascent direction (tc, td).
+    /// /Rotate turns the page clockwise for display, so with u/v the unrotated
+    /// coordinates and nx/ny the normalized image coordinates (Y-down):
+    ///   0°: u = nx·W,      v = (1−ny)·H
+    ///  90°: u = ny·W,      v = nx·H
+    /// 180°: u = (1−nx)·W,  v = ny·H
+    /// 270°: u = (1−ny)·W,  v = (1−nx)·H
     /// The text baseline is placed at the bottom of the OCR bounding box.
     /// With Ascent=1000 and Descent=0, the text fills exactly the OCR box height.
     /// </summary>
     private static (double x, double y, double w, double h,
                     double ta, double tb, double tc, double td)
         MapToPage(double blXPx, double blYPx, double vwPx, double vhPx,
-                  int imgW, int imgH, double pW, double pH, int rotation)
+                  int imgW, int imgH, double bW, double bH, int rotation)
     {
-        double sX = (rotation is 90 or 270) ? pH / imgW : pW / imgW;
-        double sY = (rotation is 90 or 270) ? pW / imgH : pH / imgH;
+        double nx  = blXPx / imgW;   // left edge of the box
+        double ny  = blYPx / imgH;   // bottom edge of the box (largest Y)
+        double nvw = vwPx  / imgW;
+        double nvh = vhPx  / imgH;
 
-        double x, y, w, h;
-        double ta, tb, tc, td;
-
-        switch (rotation)
+        return (((rotation % 360) + 360) % 360) switch
         {
-            case 90:   // image vx→PDF -y, vy→PDF x
-                x  = pW * (1.0 - blYPx / imgH);
-                y  = pH * (1.0 - (blXPx + vwPx) / imgW);
-                w  = vhPx * sY;
-                h  = vwPx * sX;
-                ta = 0; tb = 1; tc = -1; td = 0;
-                break;
-
-            case 180:  // both axes flipped
-                x  = pW * (1.0 - (blXPx + vwPx) / imgW);
-                y  = pH * blYPx / imgH;
-                w  = vwPx * sX;
-                h  = vhPx * sY;
-                ta = -1; tb = 0; tc = 0; td = -1;
-                break;
-
-            case 270:  // image vx→PDF y, vy→PDF -x
-                x  = pW * blYPx / imgH;
-                y  = pH * blXPx / imgW;
-                w  = vhPx * sY;
-                h  = vwPx * sX;
-                ta = 0; tb = -1; tc = 1; td = 0;
-                break;
-
-            default:   // 0° (standard orientation)
-                // x = left edge of box; y = bottom of box in PDF coords (Y-up)
-                // With Ascent=1000/Descent=0 the glyph box extends from y to y+h,
-                // which exactly matches the OCR bounding box in PDF space.
-                x  = blXPx * sX;
-                y  = pH - blYPx * sY;
-                w  = vwPx * sX;
-                h  = vhPx * sY;
-                ta = 1; tb = 0; tc = 0; td = 1;
-                break;
-        }
-
-        return (x, y, w, h, ta, tb, tc, td);
+            // visual right = +v, visual up = −u
+            90  => (ny * bW, nx * bH, nvw * bH, nvh * bW, 0, 1, -1, 0),
+            // visual right = −u, visual up = −v
+            180 => ((1 - nx) * bW, ny * bH, nvw * bW, nvh * bH, -1, 0, 0, -1),
+            // visual right = −v, visual up = +u
+            270 => ((1 - ny) * bW, (1 - nx) * bH, nvw * bH, nvh * bW, 0, -1, 1, 0),
+            // visual right = +u, visual up = +v
+            _   => (nx * bW, (1 - ny) * bH, nvw * bW, nvh * bH, 1, 0, 0, 1),
+        };
     }
 
     // ── Append stream to page ─────────────────────────────────────────────────
@@ -418,19 +440,33 @@ public static class SearchablePdfService
     // ── String helpers ────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Encodes text as a PDF hex string using UTF-16BE (2 bytes per BMP code point).
-    /// Compatible with Identity-H Type0 fonts — each 2-byte value is the CID,
-    /// which equals the Unicode code point via the identity ToUnicode CMap.
+    /// Encodes text as a PDF hex string of 2-byte CIDs for the Identity-H Type0 font.
+    /// BMP characters use their code point as CID; characters outside the BMP get a
+    /// CID from the surrogate range, recorded in <paramref name="supp"/> for the ToUnicode map.
+    /// Returns the hex string and the number of glyphs (CIDs) written.
     /// </summary>
-    private static string EncodeTextHex(string text)
+    private static (string Hex, int Glyphs) EncodeTextHex(string text, Dictionary<int, int> supp)
     {
         var sb = new StringBuilder("<");
-        foreach (char c in text)
+        int glyphs = 0;
+        foreach (var rune in text.EnumerateRunes())
         {
-            if (c < 0x20 && c != '\t') continue;  // skip control characters
-            sb.Append(((int)c).ToString("X4"));
+            int cp = rune.Value;
+            if (cp < 0x20 && cp != '\t') continue;  // skip control characters
+
+            int cid;
+            if (rune.IsBmp)
+                cid = cp;
+            else if (!supp.TryGetValue(cp, out cid))
+            {
+                cid = supp.Count < SuppCidCount ? SuppCidFirst + supp.Count : 0xFFFD;
+                if (cid != 0xFFFD) supp[cp] = cid;
+            }
+
+            sb.Append(cid.ToString("X4"));
+            glyphs++;
         }
         sb.Append(">");
-        return sb.ToString();
+        return (sb.ToString(), glyphs);
     }
 }

@@ -19,9 +19,10 @@
     <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
   </ItemGroup>
 
-  <!-- Additional language models (Korean/Chinese v5, Japanese v4) -->
+  <!-- Additional language models (Korean/Chinese v5, Japanese v4).
+       Only the version folders: Models\*.cs are source files, not content. -->
   <ItemGroup>
-    <Content Include="models\**\*.*">
+    <Content Include="models\v*\**\*.*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>

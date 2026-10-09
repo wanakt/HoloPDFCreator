@@ -282,8 +282,8 @@ public class OcrService : IDisposable
             var regions = await Task.Run(() =>
             {
                 var result = ocr!.Detect(input, options);
-                // If Detect returns null instead of throwing (some DML failures are silent),
-                // throw explicitly so the GPU-fallback catch in the caller can handle it.
+                // Treat a null result as a failure so the caller reports it instead of
+                // silently showing an empty page.
                 if (result is null || result.TextBlocks is null)
                     throw new InvalidOperationException("Detect returned null result.");
                 return MapResult(result, input.Width, input.Height, insertSpaces);
@@ -756,8 +756,6 @@ public class OcrService : IDisposable
         _hanjaEnabled = false;
         while (_hanjaPool.TryDequeue(out var ocr)) ocr.Dispose();
     }
-
-    public void InvalidateSessions() => DisposePool();
 
     public void Dispose() => DisposePool();
 }

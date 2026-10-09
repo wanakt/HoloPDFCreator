@@ -110,7 +110,8 @@ public partial class PDFReaderPage : Page
     // ─── Undo / Redo ─────────────────────────────────────────────────────────
     private record DrawingShapeData(DrawingShapeType Type, Color Stroke, Color Fill, bool HasFill,
                                      string FilePath, uint Page, double X1, double Y1, double X2, double Y2);
-    private record UndoSnapshot(byte[] Pdf, Dictionary<int, AdjSettings> Adj, List<DrawingShapeData> Shapes);
+    private record UndoSnapshot(byte[] Pdf, Dictionary<int, AdjSettings> Adj, List<DrawingShapeData> Shapes,
+                                Dictionary<int, uint> BmPages);
     private readonly List<UndoSnapshot> _undoStack = new();
     private readonly List<UndoSnapshot> _redoStack = new();
     private const int UndoMaxLevels = 15;
@@ -229,9 +230,6 @@ public partial class PDFReaderPage : Page
     /// current file and embed them as an invisible text layer before writing to disk.
     /// </summary>
     public Func<string, IReadOnlyDictionary<int, OcrPageData>?>? OcrDataProvider { get; set; }
-
-    // Invoked after a save that baked image adjustments, so callers can reset GPU sessions.
-    public Action? OnAdjustmentsBaked { get; set; }
 
     // Renders the current page at high resolution for OCR (≈300 DPI for letter paper).
     public async Task<BitmapSource?> RenderPageForOcrAsync(uint page, uint width = 1600)
@@ -594,10 +592,10 @@ public partial class PDFReaderPage : Page
                             $"이미지 조정 적용 중… ({done} / {pageTotal} 페이지)");
                     });
                 step += adjCount;
-                // WinRT baking may have invalidated DML sessions — reset them now so
-                // the next OCR run gets fresh sessions instead of a corrupted device.
-                OnAdjustmentsBaked?.Invoke();
             }
+
+            if (BookmarkService.Instance.IsDirty(_currentFilePath))
+                WriteBookmarksToOutlines(_editDocument, _currentFilePath);
 
             progress.Update(++step, total, "PDF 파일 저장 중…");
             tmpPath = System.IO.Path.Combine(
@@ -645,6 +643,10 @@ public partial class PDFReaderPage : Page
 
             _adjSettings.Clear();
             AdjustedStore?.Clear();
+
+            // The saved file's outline now holds every bookmark; drop the in-memory
+            // copies so LoadPdfAsync re-imports them once instead of duplicating.
+            BookmarkService.Instance.RemoveForFile(outputPath);
 
             progress.Close();
             await LoadPdfAsync(outputPath);
@@ -749,7 +751,12 @@ public partial class PDFReaderPage : Page
                                                s.FilePath, s.PageNumber, s.X1, s.Y1, s.X2, s.Y2))
             .ToList();
 
-    // Captures PDF bytes, image adjustment settings, and drawing shapes.
+    // Page edits remap bookmark pages, so undo has to put them back as well.
+    private Dictionary<int, uint> SnapshotBookmarkPages() =>
+        _currentFilePath is null ? new() :
+        BookmarkService.Instance.ForFile(_currentFilePath).ToDictionary(b => b.Id, b => b.PageNumber);
+
+    // Captures PDF bytes, image adjustment settings, drawing shapes and bookmark pages.
     public void PushUndo()
     {
         byte[]? pdfSnap = _editPdfBytes;
@@ -761,7 +768,7 @@ public partial class PDFReaderPage : Page
         }
         var adjSnap   = _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value);
         var shapeSnap = SnapshotDrawings();
-        _undoStack.Add(new UndoSnapshot(pdfSnap, adjSnap, shapeSnap));
+        _undoStack.Add(new UndoSnapshot(pdfSnap, adjSnap, shapeSnap, SnapshotBookmarkPages()));
         if (_undoStack.Count > UndoMaxLevels) _undoStack.RemoveAt(0);
         _redoStack.Clear();
         _adjUndoPushedForPage = -1;  // reset: next adj change on any page triggers a new push
@@ -775,7 +782,7 @@ public partial class PDFReaderPage : Page
         {
             var curAdj    = _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value);
             var curShapes = SnapshotDrawings();
-            _redoStack.Add(new UndoSnapshot(_editPdfBytes, curAdj, curShapes));
+            _redoStack.Add(new UndoSnapshot(_editPdfBytes, curAdj, curShapes, SnapshotBookmarkPages()));
         }
         var prev = _undoStack[^1]; _undoStack.RemoveAt(_undoStack.Count - 1);
         await RestoreSnapshotAsync(prev);
@@ -789,7 +796,7 @@ public partial class PDFReaderPage : Page
         {
             var curAdj    = _adjSettings.ToDictionary(kv => kv.Key, kv => kv.Value);
             var curShapes = SnapshotDrawings();
-            _undoStack.Add(new UndoSnapshot(_editPdfBytes, curAdj, curShapes));
+            _undoStack.Add(new UndoSnapshot(_editPdfBytes, curAdj, curShapes, SnapshotBookmarkPages()));
             if (_undoStack.Count > UndoMaxLevels) _undoStack.RemoveAt(0);
         }
         var next = _redoStack[^1]; _redoStack.RemoveAt(_redoStack.Count - 1);
@@ -841,6 +848,22 @@ public partial class PDFReaderPage : Page
                         PageNumber = sd.Page,
                         X1 = sd.X1, Y1 = sd.Y1, X2 = sd.X2, Y2 = sd.Y2,
                     });
+
+                // Restore bookmark pages (bookmarks added or removed since stay as they are).
+                bool bmChanged = false;
+                foreach (var bm in BookmarkService.Instance.ForFile(_currentFilePath))
+                {
+                    if (snapshot.BmPages.TryGetValue(bm.Id, out uint pg) && pg != bm.PageNumber)
+                    {
+                        bm.PageNumber = pg;
+                        bmChanged = true;
+                    }
+                }
+                if (bmChanged)
+                {
+                    BookmarkService.Instance.MarkDirty(_currentFilePath);
+                    BookmarkService.Instance.RaiseChanged();
+                }
             }
 
             UpdateNavButtons();
@@ -915,33 +938,31 @@ public partial class PDFReaderPage : Page
         if (_editDocument == null) return;
         try
         {
-            if (_editDocument.Outlines.Count == 0) return;
             var list = new List<Bookmark>();
-            ImportOutlinesRecursive(_editDocument.Outlines, filePath, null, list);
-            BookmarkService.Instance.AddPdfOutlines(list);
+            ImportOutlinesRecursive(PdfOutlineReader.Read(_editDocument), filePath, null, list);
+            if (list.Count > 0) BookmarkService.Instance.AddPdfOutlines(list);
         }
         catch { /* non-critical */ }
     }
 
-    private void ImportOutlinesRecursive(PdfOutlineCollection outlines, string filePath,
-                                         int? parentId, List<Bookmark> result)
+    private static void ImportOutlinesRecursive(List<OutlineNode> nodes, string filePath,
+                                                int? parentId, List<Bookmark> result)
     {
         int sort = 0;
-        foreach (var outline in outlines)
+        foreach (var node in nodes)
         {
-            int pageIdx = GetOutlinePageIndex(outline);
             var bm = new Bookmark
             {
                 FilePath   = filePath,
-                PageNumber = pageIdx >= 0 ? (uint)pageIdx : 0,
-                Title      = outline.Title ?? "(untitled)",
+                PageNumber = node.PageIndex >= 0 ? (uint)node.PageIndex : 0,
+                Title      = node.Title,
                 ParentId   = parentId,
                 SortOrder  = sort++,
+                IsExpanded = node.Open || node.Children.Count == 0,
                 IsFromPdf  = true,
             };
             result.Add(bm);
-            if (outline.Outlines.Count > 0)
-                ImportOutlinesRecursive(outline.Outlines, filePath, bm.Id, result);
+            ImportOutlinesRecursive(node.Children, filePath, bm.Id, result);
         }
     }
 
@@ -1060,7 +1081,11 @@ public partial class PDFReaderPage : Page
         void CommitEdit()
         {
             var t = titleBox.Text.Trim();
-            if (!string.IsNullOrEmpty(t)) bm.Title = t;
+            if (!string.IsNullOrEmpty(t) && t != bm.Title)
+            {
+                bm.Title = t;
+                BookmarkService.Instance.MarkDirty(bm.FilePath);
+            }
             titleBlock.Text = bm.Title; titleBlock.ToolTip = bm.Title;
             titleBox.Visibility = Visibility.Collapsed; titleBlock.Visibility = Visibility.Visible;
         }
@@ -1357,12 +1382,25 @@ public partial class PDFReaderPage : Page
 
 
 
-    private int GetOutlinePageIndex(PdfOutline outline)
+    /// <summary>Replaces the document outline with the bookmark tree of <paramref name="filePath"/>.</summary>
+    private static void WriteBookmarksToOutlines(PdfDocument doc, string filePath)
     {
-        if (_editDocument is null || outline.DestinationPage is null) return -1;
-        for (int i = 0; i < _editDocument.PageCount; i++)
-            if (ReferenceEquals(_editDocument.Pages[i], outline.DestinationPage)) return i;
-        return -1;
+        var outlines = PdfOutlineReader.ResetOutlines(doc);
+        if (doc.PageCount == 0) return;
+
+        void WriteLevel(PdfOutlineCollection target, IEnumerable<Bookmark> items)
+        {
+            foreach (var bm in items)
+            {
+                int pi = (int)Math.Min(bm.PageNumber, (uint)(doc.PageCount - 1));
+                var outline = target.Add(bm.Title, doc.Pages[pi], bm.IsExpanded);
+                WriteLevel(outline.Outlines, BookmarkService.Instance.GetChildren(bm.Id));
+            }
+        }
+
+        WriteLevel(outlines,
+            BookmarkService.Instance.GetRoots()
+                .Where(b => b.FilePath.Equals(filePath, StringComparison.OrdinalIgnoreCase)));
     }
 
     private async Task NavigateToPageAsync(int pageIdx)
@@ -1841,13 +1879,13 @@ public partial class PDFReaderPage : Page
                 {
                     var page = doc.GetPage(pageIndex + 1);
 
-                    // PdfPig word coordinates are in the ORIGINAL (pre-rotation) PDF user space:
-                    //   origin at bottom-left of the unrotated page, Y increases upward.
-                    // W / H = raw MediaBox dimensions (never rotation-adjusted, always the same).
-                    // The rotation-specific formulas below map these original coords to canvas
+                    // PdfPig word coordinates are relative to the CropBox corner, Y increases upward.
+                    // W / H = the displayed (cropped) page size, which is what WinPdf renders;
+                    // the MediaBox would misplace words on cropped pages.
+                    // The rotation-specific formulas below map these coords to canvas
                     // (Y-down, origin at top-left of the rendered bitmap).
-                    double W = page.MediaBox.Bounds.Width;   // original page width  (e.g. 612 for portrait)
-                    double H = page.MediaBox.Bounds.Height;  // original page height (e.g. 792 for portrait)
+                    double W = page.Width;
+                    double H = page.Height;
                     rotDeg = page.Rotation.Value;            // 0 / 90 / 180 / 270
                     if (rotDeg != 0) return (result, rotDeg); // text selection disabled for rotated pages
 
@@ -5042,6 +5080,15 @@ public partial class PDFReaderPage : Page
             "페이지 삭제", MessageBoxButton.YesNo, MessageBoxImage.Warning);
         if (result != MessageBoxResult.Yes) return;
 
+        // Old → new page index for bookmarks: a bookmark on a deleted page moves to
+        // the next surviving page (or the last page when nothing follows).
+        int oldCount = _editDocument.Pages.Count;
+        var deleted  = new HashSet<int>(_thumbSelectedPages);
+        var pageMap  = new int[oldCount];
+        for (int i = 0, n = 0; i < oldCount; i++)
+            pageMap[i] = deleted.Contains(i) ? n : n++;
+        int newLast = oldCount - deleted.Count - 1;
+
         // Remove in reverse index order so earlier indices stay valid.
         foreach (int pi in _thumbSelectedPages.OrderByDescending(x => x))
         {
@@ -5057,6 +5104,9 @@ public partial class PDFReaderPage : Page
 
         SetStatus("페이지 삭제 중…");
         await ReloadRenderDocumentAsync();
+        if (_currentFilePath != null)
+            BookmarkService.Instance.RemapPages(_currentFilePath,
+                p => p < oldCount ? Math.Min(pageMap[p], newLast) : newLast);
         StartThumbnailGeneration();
         SetStatus($"삭제 완료. 남은 페이지: {_editDocument.Pages.Count}");
     }
@@ -5140,6 +5190,9 @@ public partial class PDFReaderPage : Page
         _currentPage = (uint)Math.Min((int)_currentPage, _editDocument.Pages.Count - 1);
         SetStatus("이미지 삽입 중…");
         await ReloadRenderDocumentAsync();   // _editDocument.Save() runs here — resources alive
+        if (_currentFilePath != null)
+            BookmarkService.Instance.RemapPages(_currentFilePath,
+                p => p >= insertAt ? p + insertedCount : p);
         foreach (var (ms, x) in resources) { x.Dispose(); ms.Dispose(); }
         StartThumbnailGeneration();
         SetStatus($"이미지 삽입 완료. 총 {_editDocument.Pages.Count}페이지");
@@ -5425,6 +5478,13 @@ public partial class PDFReaderPage : Page
 
         SetStatus("페이지 순서 변경 중…");
         await ReloadRenderDocumentAsync();
+        if (_currentFilePath != null)
+        {
+            var newIndex = new Dictionary<int, int>();
+            for (int i = 0; i < newOrder.Count; i++) newIndex[newOrder[i]] = i;
+            BookmarkService.Instance.RemapPages(_currentFilePath,
+                p => newIndex.TryGetValue(p, out int np) ? np : p);
+        }
         StartThumbnailGeneration();
         SetStatus("페이지 순서 변경 완료.");
     }
